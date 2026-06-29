@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build & Release
+    needs: [ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (pinned — CVE-21)
+
+      - name: Verify version consistency
+        # VERSION is the single source of truth; cyrius.cyml derives it
+        # via version = "${file:VERSION}". Both must equal the pushed tag
+        # (matches patra / sigil).
+        run: |
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          CYML_RAW=$(grep '^version = ' cyrius.cyml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CYML_RAW" = "\${file:VERSION}" ]; then
+              CYML_VERSION="$FILE_VERSION"
+          else
+              CYML_VERSION="$CYML_RAW"
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          [ "$FILE_VERSION" = "$TAG" ] || { echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          [ "$CYML_VERSION" = "$TAG" ] || { echo "cyrius.cyml ($CYML_RAW) != tag ($TAG)"; exit 1; }
+          echo "Version verified: $TAG (cyml: $CYML_RAW)"
+
+      - name: Install Cyrius toolchain
+        # Canonical installer — see ci.yml for rationale.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        run: cyrius deps
+
+      - name: Build
+        run: |
+          mkdir -p build
+          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+
+      - name: Extract changelog
+        # Pull the tagged section out of CHANGELOG.md for the release body.
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          BODY=$(awk "/^## \\[$TAG\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          [ -n "$BODY" ] || BODY="No changelog entry for $TAG."
+          echo "$BODY" > /tmp/release-body.md
+
+      - name: Source tarball + checksums
+        # The source tarball + SHA256SUMS are what `cyrius deps` fetches and
+        # sha256-verifies downstream — without them this project cannot be
+        # consumed as a dependency. This is the release artifact, not just
+        # the built binary.
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NAME="${{ github.event.repository.name }}"
+          git archive --format=tar.gz --prefix="$NAME-$TAG/" -o "$NAME-$TAG.tar.gz" HEAD
+          sha256sum "$NAME-$TAG.tar.gz" build/"$NAME" > SHA256SUMS 2>/dev/null \
+            || sha256sum "$NAME-$TAG.tar.gz" > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (pinned — CVE-21)
+        with:
+          name: "${{ github.event.repository.name }} ${{ github.ref_name }}"
+          body_path: /tmp/release-body.md
+          files: |
+            ${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz
+            SHA256SUMS
+            build/${{ github.event.repository.name }}

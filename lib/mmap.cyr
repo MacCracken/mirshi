@@ -1,0 +1,84 @@
+# mmap.cyr — memory-mapped I/O via direct syscalls
+# Usage: include "lib/mmap.cyr"
+# Requires: syscalls.cyr
+#
+# Wraps SYS_MMAP (9) and SYS_MUNMAP (11) for:
+# - Dynamic library loading (dynlib.cyr)
+# - Zero-copy file access
+# - Shared memory with drivers/GPU
+
+# cyr_mmap(addr, length, prot, flags, fd, offset) → mapped address or -1
+# prot: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+# flags: MAP_PRIVATE=2, MAP_SHARED=1, MAP_ANONYMOUS=32, MAP_FIXED=16
+# Prefixed cyr_ to avoid symbol clashes when linking .o files with libc.
+# v6.2.43: agnos has no host mmap — it's static-only and its heap is the
+# kernel's #27 allocator (alloc_agnos.cyr), not mmap. The raw Linux syscall
+# numbers 9/11/10 mis-dispatch to mkdir/mount/mprotect-class calls on agnos, so
+# guard them: fail clearly (cyr_mmap → -1; callers' `< 0` paths return 0) rather
+# than silently invoke the wrong kernel call. Defensive — no agnos consumer
+# reaches these (issue 2026-06-23-agnos-portability-sweep-residuals, part 2).
+fn cyr_mmap(addr, length, prot, flags, fd, offset): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 1;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(9, addr, length, prot, flags, fd, offset);
+    #endif
+}
+
+# cyr_munmap(addr, length) → 0 on success
+fn cyr_munmap(addr, length): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(11, addr, length);
+    #endif
+}
+
+# cyr_mprotect(addr, length, prot) → 0 on success
+fn cyr_mprotect(addr, length, prot): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(10, addr, length, prot);
+    #endif
+}
+
+# Constants
+enum MmapProt {
+    PROT_NONE  = 0;
+    PROT_READ  = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC  = 4;
+}
+
+enum MmapFlags {
+    MAP_SHARED    = 1;
+    MAP_PRIVATE   = 2;
+    MAP_FIXED     = 16;
+    MAP_ANONYMOUS = 32;
+}
+
+# Convenience: map a file read-only
+# Returns mapped address or 0 on failure
+fn mmap_file_ro(fd, length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}
+
+# Convenience: map a file read-write (private copy)
+fn mmap_file_rw(fd, length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}
+
+# Convenience: anonymous mapping (like malloc but page-aligned)
+fn mmap_anon(length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}

@@ -1,0 +1,223 @@
+# protobuf.cyr — minimal proto3 wire-format encode/decode.
+# Usage: include "lib/protobuf.cyr"
+# Requires (include BEFORE this file): string.cyr + str.cyr (str_builder_* + strlen).
+#
+# Pure Cyrius — no syscalls, no allocation beyond what str_builder already does.
+# Encode appends to a str_builder; decode is load8 + pointer math over a raw buffer.
+# Covers the proto3 wire subset OTLP / gRPC / proto3 messages use:
+#   wire 0 VARINT  — int32/64, uint32/64, sint (zigzag), bool, enum
+#   wire 1 I64     — fixed64 / sfixed64 / double (little-endian)
+#   wire 2 LEN     — string, bytes, embedded message, packed repeated
+#   wire 5 I32     — fixed32 / sfixed32 / float (little-endian)
+# No `.proto` codegen — build/parse messages by hand. Nested messages are just a
+# length-delimited field whose bytes are another encoded message.
+# Wire spec: https://protobuf.dev/programming-guides/encoding/
+#
+# NOTE on shifts: cyrius `>>` is LOGICAL (zero-fill), so the varint loop on a
+# negative i64 walks the full 64-bit (u64) value and emits the canonical 10-byte
+# form proto3 uses for negative int64 — no masking needed. Zigzag, which needs an
+# ARITHMETIC shift, is done via an explicit sign value instead.
+
+# Wire types
+var PB_WIRE_VARINT = 0;
+var PB_WIRE_I64    = 1;
+var PB_WIRE_LEN    = 2;
+var PB_WIRE_I32    = 5;
+
+# Field tag = (field_no << 3) | wire_type
+fn pb_tag(field_no, wire_type): i64 {
+    return (field_no << 3) | wire_type;
+}
+
+# ================================================================
+# Varint (base-128, little-endian, high bit = continuation)
+# ================================================================
+
+# Append the base-128 varint of v (low 64 bits as u64) to sb. Returns bytes written.
+fn pb_write_varint(sb, v): i64 {
+    var n = 0;
+    var go = 1;
+    while (go == 1) {
+        var b = v & 0x7F;
+        v = v >> 7;                          # logical shift — terminates for any u64
+        if (v != 0) {
+            str_builder_add_byte(sb, b | 0x80);
+        } else {
+            str_builder_add_byte(sb, b);
+            go = 0;
+        }
+        n = n + 1;
+    }
+    return n;
+}
+
+# Read a base-128 varint from buf at pos (must be < end). Stores the value to
+# *out; returns the position AFTER the varint, or -1 on truncation / overlong
+# (>10 byte) encoding.
+fn pb_read_varint(buf, pos, end, out): i64 {
+    var result = 0;
+    var shift = 0;
+    var p = pos;
+    var go = 1;
+    while (go == 1) {
+        if (p >= end) { return 0 - 1; }      # truncated
+        if (shift >= 64) { return 0 - 1; }   # overlong / malformed
+        var byte = load8(buf + p);
+        result = result | ((byte & 0x7F) << shift);
+        p = p + 1;
+        shift = shift + 7;
+        if ((byte & 0x80) == 0) { go = 0; }
+    }
+    store64(out, result);
+    return p;
+}
+
+# Zigzag map for sint32/sint64: maps small-magnitude signed ints to small
+# varints. (n << 1) ^ (n >> 63 arithmetic) — the arithmetic shift is emulated
+# with an explicit all-ones/zero sign value since cyrius `>>` is logical.
+fn pb_zigzag(n): i64 {
+    var sign = 0;
+    if (n < 0) { sign = 0 - 1; }             # all-ones if negative, else 0
+    return (n << 1) ^ sign;
+}
+
+# Inverse zigzag: (z >> 1) ^ -(z & 1). `z >> 1` is logical (z is the u64-encoded
+# zigzag value), and -(low bit) gives the sign mask.
+fn pb_unzigzag(z): i64 {
+    var neg = 0;
+    if ((z & 1) != 0) { neg = 0 - 1; }
+    return (z >> 1) ^ neg;
+}
+
+# ================================================================
+# Field writers
+# ================================================================
+
+# wire-0 varint field (int32/64, uint32/64, enum): tag + varint(v)
+fn pb_write_int(sb, field_no, v): i64 {
+    pb_write_varint(sb, pb_tag(field_no, PB_WIRE_VARINT));
+    pb_write_varint(sb, v);
+    return 0;
+}
+
+# bool field — proto3 bool is a varint 0/1
+fn pb_write_bool(sb, field_no, b): i64 {
+    return pb_write_int(sb, field_no, b);
+}
+
+# sint32/sint64 field — zigzag then varint
+fn pb_write_sint(sb, field_no, v): i64 {
+    pb_write_varint(sb, pb_tag(field_no, PB_WIRE_VARINT));
+    pb_write_varint(sb, pb_zigzag(v));
+    return 0;
+}
+
+# fixed64 / sfixed64 field (wire 1) — 8 little-endian bytes
+fn pb_write_fixed64(sb, field_no, v): i64 {
+    pb_write_varint(sb, pb_tag(field_no, PB_WIRE_I64));
+    var i = 0;
+    while (i < 8) {
+        str_builder_add_byte(sb, (v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# fixed32 / sfixed32 field (wire 5) — 4 little-endian bytes
+fn pb_write_fixed32(sb, field_no, v): i64 {
+    pb_write_varint(sb, pb_tag(field_no, PB_WIRE_I32));
+    var i = 0;
+    while (i < 4) {
+        str_builder_add_byte(sb, (v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# length-delimited field (wire 2): tag + varint(len) + raw bytes from ptr.
+fn pb_write_bytes(sb, field_no, ptr, len): i64 {
+    pb_write_varint(sb, pb_tag(field_no, PB_WIRE_LEN));
+    pb_write_varint(sb, len);
+    var i = 0;
+    while (i < len) {
+        str_builder_add_byte(sb, load8(ptr + i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# string field — length-delimited over a NUL-terminated C string.
+fn pb_write_string(sb, field_no, cstr): i64 {
+    return pb_write_bytes(sb, field_no, cstr, strlen(cstr));
+}
+
+# embedded message field — `msg_sb` is a str_builder holding the encoded
+# sub-message; emit it as a length-delimited field. (sb+0 = buf, sb+8 = len.)
+fn pb_write_message(sb, field_no, msg_sb): i64 {
+    return pb_write_bytes(sb, field_no, load64(msg_sb), load64(msg_sb + 8));
+}
+
+# ================================================================
+# Decode
+# ================================================================
+
+# Read a field tag at pos. Stores field number to *fld_out, wire type to
+# *wt_out; returns next pos, or -1 on truncation.
+fn pb_read_tag(buf, pos, end, fld_out, wt_out): i64 {
+    var tagv = 0;
+    var np = pb_read_varint(buf, pos, end, &tagv);
+    if (np < 0) { return 0 - 1; }
+    store64(fld_out, tagv >> 3);
+    store64(wt_out, tagv & 0x7);
+    return np;
+}
+
+# Read an `nbytes` (4 or 8) little-endian fixed value at pos. Stores to *out;
+# returns next pos, or -1 if it would run past end.
+fn pb_read_fixed(buf, pos, end, nbytes, out): i64 {
+    if (pos + nbytes > end) { return 0 - 1; }
+    var v = 0;
+    var i = 0;
+    while (i < nbytes) {
+        v = v | (load8(buf + pos + i) << (i * 8));
+        i = i + 1;
+    }
+    store64(out, v);
+    return pos + nbytes;
+}
+
+# Read a length-delimited field at pos. Stores the data pointer (buf + data_pos)
+# to *ptr_out and its length to *len_out (the bytes are NOT copied — they point
+# into buf); returns the position AFTER the field, or -1 on truncation.
+fn pb_read_bytes(buf, pos, end, ptr_out, len_out): i64 {
+    var len = 0;
+    var dp = pb_read_varint(buf, pos, end, &len);
+    if (dp < 0) { return 0 - 1; }
+    if (dp + len > end) { return 0 - 1; }
+    store64(ptr_out, buf + dp);
+    store64(len_out, len);
+    return dp + len;
+}
+
+# Skip an unknown field of the given wire type at pos (for forward-compat
+# parsing). Returns next pos, or -1 on bad/truncated wire type.
+fn pb_skip(buf, pos, end, wire_type): i64 {
+    if (wire_type == PB_WIRE_VARINT) {
+        var t = 0;
+        return pb_read_varint(buf, pos, end, &t);
+    }
+    if (wire_type == PB_WIRE_I64) {
+        if (pos + 8 > end) { return 0 - 1; }
+        return pos + 8;
+    }
+    if (wire_type == PB_WIRE_I32) {
+        if (pos + 4 > end) { return 0 - 1; }
+        return pos + 4;
+    }
+    if (wire_type == PB_WIRE_LEN) {
+        var p = 0;
+        var q = 0;
+        return pb_read_bytes(buf, pos, end, &p, &q);
+    }
+    return 0 - 1;
+}
