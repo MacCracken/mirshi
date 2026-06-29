@@ -1,11 +1,69 @@
 # mirshi test suite
 # Stdlib auto-included via cyrius.cyml
+#
+# The M0 decode/format logic (src/decode.cyr) is pure — no syscalls, no ptrace —
+# so it is fully exercised here under `cyrius test`, hermetically, on any runner.
+# The real fork+ptrace trap path is proven separately in scripts/it/m0_trap.sh
+# (it needs an actual traced child, which a pure-cyrius .tcyr cannot express).
+
+include "src/decode.cyr"
 
 fn main() {
     alloc_init();
+
     test_group("smoke");
     assert(1, "true is true");
     assert_eq(1 + 1, 2, "math works");
+
+    # --- agnos number -> name decode ---------------------------------------
+    test_group("decode-name");
+    assert_streq(agnos_nr_name(0), "exit", "nr 0 = exit");
+    assert_streq(agnos_nr_name(1), "write", "nr 1 = write");
+    assert_streq(agnos_nr_name(2), "getpid", "nr 2 = getpid");
+    assert_streq(agnos_nr_name(27), "mmap", "nr 27 = mmap");
+    assert_streq(agnos_nr_name(60), "winsize", "nr 60 = winsize (NOT exit)");
+    assert_streq(agnos_nr_name(61), "net_config", "nr 61 = net_config");
+    assert_streq(agnos_nr_name(36), "unknown", "nr 36 = unknown (unmirrored)");
+    assert_streq(agnos_nr_name(99), "unknown", "nr 99 = unknown (out of surface)");
+
+    # --- register extraction from a synthetic user_regs_struct -------------
+    # Catches the two classic ptrace bugs: reading rax (not orig_rax) for the
+    # number, and reading rcx (not r10) for arg4.
+    test_group("decode-regs");
+    var regs = alloc(USER_REGS_SIZE);
+    store64(regs + 120, 1);        # orig_rax = write#1
+    store64(regs + 80, 0 - 38);    # rax = -ENOSYS (must be ignored)
+    store64(regs + 112, 1);        # rdi  = a0 (fd 1)
+    store64(regs + 104, 0x4000);   # rsi  = a1 (buf ptr)
+    store64(regs + 96, 2);         # rdx  = a2 (count)
+    store64(regs + 56, 7);         # r10  = a3
+    assert_eq(decode_nr(regs), 1, "decode_nr reads orig_rax not rax");
+    assert_eq(decode_arg(regs, 0), 1, "arg0 = rdi");
+    assert_eq(decode_arg(regs, 1), 0x4000, "arg1 = rsi");
+    assert_eq(decode_arg(regs, 2), 2, "arg2 = rdx");
+    assert_eq(decode_arg(regs, 3), 7, "arg3 = r10 not rcx");
+
+    # --- arity + pointer-arg tables ----------------------------------------
+    test_group("decode-shape");
+    assert_eq(agnos_argc(2), 0, "getpid arity 0");
+    assert_eq(agnos_argc(1), 3, "write arity 3");
+    assert_eq(agnos_argc(31), 4, "rename arity 4 (a4=r10)");
+    assert_eq(agnos_ptrmask(1), 2, "write buf is arg1");
+    assert_eq(agnos_ptrmask(33), 5, "stat path+statbuf are arg0+arg2");
+    assert_eq(agnos_ptrmask(2), 0, "getpid has no pointer args");
+
+    # --- full event formatting (the same lines the golden IT asserts) ------
+    test_group("format");
+    var line = alloc(256);
+    format_event(line, 2, 0, 0, 0, 0);
+    assert_streq(line, "getpid#2()", "format getpid");
+    format_event(line, 1, 1, 0x4000, 2, 0);
+    assert_streq(line, "write#1(1, <ptr>, 2)", "format write (buf hermetic)");
+    format_event(line, 0, 0, 0, 0, 0);
+    assert_streq(line, "exit#0(0)", "format exit");
+    format_event(line, 99, 0, 0, 0, 0);
+    assert_streq(line, "unknown#99()", "format unknown number");
+
     return assert_summary();
 }
 

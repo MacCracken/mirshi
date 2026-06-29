@@ -1,53 +1,61 @@
 # mirshi (mirror + shim) — bidirectional AGNOS↔Linux syscall-ABI translation.
 #
-# WHAT mirshi IS
-# -------------
-# A userland syscall-translation supervisor (the WSL1 / Wine / gVisor "pico-process"
-# model — NOT kernel emulation, NOT a VM). One translation core, run from either side:
+# A userland syscall-translation supervisor (the WSL1 / Wine / gVisor
+# "pico-process" model — NOT kernel emulation, NOT a VM). One translation core,
+# run from either side:
+#   Direction 1 — AGNOS→Linux (v1): supervise an agnos-compiled static ELF as a
+#     NATIVE Linux process; intercept its agnos-ABI syscalls and map them onto
+#     host Linux syscalls. No QEMU, shared host kernel → agnos userland runs in
+#     a plain Docker container (multi-container test fan-out + cloud deploy).
+#   Direction 2 — Linux→AGNOS (v2+, the "swallow"): run Linux binaries ON the
+#     agnos kernel. The permanent compat layer.
 #
-#   Direction 1 — AGNOS→Linux  (v1, build-first): supervise an agnos-compiled static
-#     ELF running as a NATIVE Linux process; intercept its agnos-ABI syscalls and map
-#     them onto host Linux syscalls. **No QEMU, shared host kernel.** Lets agnos
-#     userland run in a plain Docker container → multi-container test fan-out at scale
-#     + cloud-deployability (agnos presents as an ordinary Linux-ABI container).
-#   Direction 2 — Linux→AGNOS  (v2+, the "swallow" stage): run Linux binaries ON the
-#     agnos kernel by translating Linux syscalls → agnos-native. The permanent compat
-#     layer ([[project_agnos_empire_defense_layers]]); Linux was always the first
-#     swallow target.
-#
-# WHY IT'S NEEDED (not a number remap)
-# ------------------------------------
-# agnos redefines the `Sys` enum to its OWN numbers — `exit`=0 on agnos vs 60 on Linux,
-# the net band #45-#57 is a sovereign sock_*/udp_*/icmp ABI, mmap#27 is 2 MB-granular,
-# sock_recv has inverted EOF semantics, execwait#37 is run-to-completion. So an agnos
-# static ELF doing `syscall(0,…)` hits Linux `read` without translation. Each agnos
-# syscall needs a per-number HANDLER that either (a) maps to a Linux syscall with arg
-# translation, (b) EMULATES it in userspace (sovereign VFS/net semantics over Linux
-# primitives), or (c) returns ENOSYS. agnos bins are static (no libc) → LD_PRELOAD
-# won't work; interception must be supervisor-side.
-#
-# WHAT mirshi IS NOT (the discipline — see [[feedback_qemu_test_agnos_userland]])
-# -----------------------------------------------------------------------------
-# mirshi-in-Docker runs agnos userland on the HOST Linux kernel → it tests userland
-# concurrency/threading on real multi-core hardware + Linux-app compat. It does NOT
-# exercise the agnos kernel's own SMP scheduler or net stack — that's QEMU+KVM (real
-# kernel) + iron (hardware truth). mirshi COMPLEMENTS, never replaces, them; each
-# surface owns a distinct bug class. Don't let mirshi's convenience erode that discipline.
+# Why it is not a number remap: agnos redefines the syscall numbers (exit=0 vs
+# Linux 60, the net band #45-#57 is a sovereign ABI, mmap#27 is 2 MB-granular,
+# execwait#37 run-to-completion). agnos bins are static (no libc) → no
+# LD_PRELOAD; interception must be supervisor-side.
 #
 #   concern                    →  module               →  mechanism
 #   --------------------------    -------------------     -------------------------------
-#   trap the child's syscalls  →  src/intercept.cyr     →  ptrace (M0 bring-up) →
-#                                                          seccomp-user-notify (scale)
-#   agnos# → Linux# + args     →  src/translate.cyr     →  per-Sys-number handler table
-#   no-Linux-peer syscalls     →  src/emulate.cyr       →  sovereign VFS/net/etc. in userspace
-#   supervisor lifecycle       →  src/main.cyr          →  fork+exec the agnos ELF, run the loop
+#   trap the child's syscalls  →  src/intercept.cyr     →  ptrace(PTRACE_SYSEMU)  (M0)
+#                                                          → seccomp-user-notify (M4)
+#   decode agnos# + args       →  src/decode.cyr        →  pure number→name/arity table
+#   agnos# → Linux# + args     →  src/translate.cyr     →  per-Sys-number handler (M1+)
+#   no-Linux-peer syscalls     →  src/emulate.cyr       →  sovereign VFS/net (M1+)
+#   supervisor lifecycle       →  src/main.cyr          →  argv → intercept_run
 #
-# v1 = AGNOS + mirshi runs in a plain Docker container, no QEMU. See docs/development/roadmap.md.
+# STATUS: M0 — trap loop. mirshi fork+execs an agnos ELF and traps + logs its
+# full syscall stream via PTRACE_SYSEMU (interception proven before any
+# translation). See docs/development/roadmap.md + docs/adr/0001-ptrace-sysemu.md.
+#
+# v1 = AGNOS + mirshi runs in a plain Docker container, no QEMU.
 
-fn main() {
+include "src/intercept.cyr"
+
+fn usage(): i64 {
+    _emit(2, "mirshi — AGNOS↔Linux mirror-shim (M0 trap loop)\n");
+    _emit(2, "usage: mirshi [--selftest-trace] <agnos-elf>\n");
+    _emit(2, "  traps + logs the agnos syscall stream of <agnos-elf> via ptrace.\n");
+    _emit(2, "  --selftest-trace  emit only the bare event stream to stdout (for tests);\n");
+    _emit(2, "                    must precede <agnos-elf> if given.\n");
+    return 2;
+}
+
+fn main(): i64 {
     alloc_init();
-    println("mirshi — AGNOS↔Linux mirror-shim (scaffold; see docs/development/roadmap.md)");
-    return 0;
+    args_init();
+    var n = argc();
+    if (n < 2) { return usage(); }
+
+    var selftest = 0;
+    var target = argv(1);
+    if (streq(target, "--selftest-trace") == 1) {
+        if (n < 3) { return usage(); }
+        selftest = 1;
+        target = argv(2);
+    }
+
+    return intercept_run(target, selftest);
 }
 
 var r = main();

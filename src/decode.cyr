@@ -1,0 +1,261 @@
+# src/decode.cyr — pure syscall decode + log formatting for the M0 trap loop.
+#
+# Every function here is SIDE-EFFECT-FREE: a pure transform over an integer or
+# a caller-owned buffer, no syscalls and no I/O. That is deliberate — it lets
+# the whole decode contract be unit-tested under `cyrius test` with synthetic
+# register buffers, with zero ptrace/fork dependency (see tests/mirshi.tcyr).
+# The impure trap mechanism (fork / ptrace / wait) lives in src/intercept.cyr.
+#
+# mirshi is a LINUX-target supervisor that reads the FOREIGN agnos syscall
+# numbers of a traced child. We therefore hardcode a PRIVATE agnos number ->
+# name / arity / pointer-arg table here rather than `include`ing
+# lib/syscalls_x86_64_agnos.cyr — that file's `enum SysNrAgnos` (exit=0,
+# write=1, ...) would collide with the Linux `enum SysNr` (read=0, write=1,
+# ...) mirshi already links. Source of truth for the names/arity/pointer-args
+# is lib/syscalls_x86_64_agnos.cyr (the agnos 1.41.x–1.46.x ABI mirror).
+#
+# x86_64 ONLY: the register offsets below are the x86_64 user_regs_struct
+# layout (ptrace PTRACE_GETREGS). aarch64 uses a different struct + GETREGSET.
+
+# ----------------------------------------------------------------------------
+# x86_64 user_regs_struct byte offsets (the subset the trap loop reads).
+# The agnos syscall NUMBER is in orig_rax, NOT rax: at a syscall-entry stop the
+# kernel has already overwritten rax with -ENOSYS (-38). Args follow the
+# x86_64 *kernel* ABI: a1=rdi a2=rsi a3=rdx a4=r10 (NOT rcx — the `syscall`
+# instruction clobbers rcx with the return RIP, so the kernel takes a4 in r10).
+# Constants live in an enum (not top-level `var`s) to stay under the gvar slot
+# budget the stdlib warns about.
+# ----------------------------------------------------------------------------
+enum MirshiRegOff {
+    REG_R10 = 56;        # a4
+    REG_RAX = 80;        # return value at exit / -ENOSYS at entry (never the nr)
+    REG_RDX = 96;        # a3
+    REG_RSI = 104;       # a2
+    REG_RDI = 112;       # a1
+    REG_ORIG_RAX = 120;  # the agnos syscall number at a syscall-entry stop
+    USER_REGS_SIZE = 216;
+}
+
+# The agnos syscall number captured at the trap (orig_rax).
+fn decode_nr(regs): i64 {
+    return load64(regs + REG_ORIG_RAX);
+}
+
+# The i-th agnos syscall argument (0..3) by the x86_64 kernel register order
+# rdi/rsi/rdx/r10. agnos uses at most 4 args, so i>=4 is never meaningful.
+fn decode_arg(regs, i): i64 {
+    if (i == 0) { return load64(regs + REG_RDI); }
+    if (i == 1) { return load64(regs + REG_RSI); }
+    if (i == 2) { return load64(regs + REG_RDX); }
+    if (i == 3) { return load64(regs + REG_R10); }
+    return 0;
+}
+
+# ----------------------------------------------------------------------------
+# agnos syscall number -> short name. Covers every number defined in
+# lib/syscalls_x86_64_agnos.cyr (0-35, 40-41, 45-61); every other number
+# (incl. the agnos-but-unmirrored 36-39/42-44 and anything > 61) decodes to
+# "unknown" — the M0 contract for an out-of-surface number.
+# ----------------------------------------------------------------------------
+fn agnos_nr_name(nr): cstring {
+    if (nr == 0) { return "exit"; }
+    if (nr == 1) { return "write"; }
+    if (nr == 2) { return "getpid"; }
+    if (nr == 3) { return "spawn"; }
+    if (nr == 4) { return "waitpid"; }
+    if (nr == 5) { return "read"; }
+    if (nr == 6) { return "close"; }
+    if (nr == 7) { return "open"; }
+    if (nr == 8) { return "dup"; }
+    if (nr == 9) { return "mkdir"; }
+    if (nr == 10) { return "rmdir"; }
+    if (nr == 11) { return "mount"; }
+    if (nr == 12) { return "sync"; }
+    if (nr == 13) { return "reboot"; }
+    if (nr == 14) { return "pause"; }
+    if (nr == 15) { return "getuid"; }
+    if (nr == 16) { return "kill"; }
+    if (nr == 17) { return "sigprocmask"; }
+    if (nr == 18) { return "signalfd"; }
+    if (nr == 19) { return "epoll_create"; }
+    if (nr == 20) { return "epoll_ctl"; }
+    if (nr == 21) { return "epoll_wait"; }
+    if (nr == 22) { return "timerfd_create"; }
+    if (nr == 23) { return "timerfd_settime"; }
+    if (nr == 24) { return "umount"; }
+    if (nr == 25) { return "pipe"; }
+    if (nr == 26) { return "write_boot_checkpoint"; }
+    if (nr == 27) { return "mmap"; }
+    if (nr == 28) { return "munmap"; }
+    if (nr == 29) { return "getdents"; }
+    if (nr == 30) { return "unlink"; }
+    if (nr == 31) { return "rename"; }
+    if (nr == 32) { return "link"; }
+    if (nr == 33) { return "stat"; }
+    if (nr == 34) { return "uname"; }
+    if (nr == 35) { return "sysinfo"; }
+    if (nr == 40) { return "uptime_ms"; }
+    if (nr == 41) { return "sleep_ms"; }
+    if (nr == 45) { return "getrandom"; }
+    if (nr == 46) { return "time_unix"; }
+    if (nr == 47) { return "sock_connect"; }
+    if (nr == 48) { return "sock_send"; }
+    if (nr == 49) { return "sock_recv"; }
+    if (nr == 50) { return "sock_close"; }
+    if (nr == 51) { return "udp_bind"; }
+    if (nr == 52) { return "udp_send"; }
+    if (nr == 53) { return "udp_recv"; }
+    if (nr == 54) { return "udp_unbind"; }
+    if (nr == 55) { return "icmp_echo"; }
+    if (nr == 56) { return "sock_listen"; }
+    if (nr == 57) { return "sock_accept"; }
+    if (nr == 58) { return "lseek"; }
+    if (nr == 59) { return "flock"; }
+    if (nr == 60) { return "winsize"; }
+    if (nr == 61) { return "net_config"; }
+    return "unknown";
+}
+
+# Number of meaningful arguments for an agnos syscall (per the ABI mirror).
+# Used so the formatter prints the right arity. Unknown numbers -> 0.
+fn agnos_argc(nr): i64 {
+    if (nr == 0) { return 1; }    # exit(code)
+    if (nr == 1) { return 3; }    # write(fd, buf, len)
+    if (nr == 2) { return 0; }    # getpid()
+    if (nr == 3) { return 2; }    # spawn(elf_addr, elf_size)
+    if (nr == 4) { return 1; }    # waitpid(pid)
+    if (nr == 5) { return 3; }    # read(fd, buf, len)
+    if (nr == 6) { return 1; }    # close(fd)
+    if (nr == 7) { return 3; }    # open(name, namelen, flags)
+    if (nr == 8) { return 1; }    # dup(fd)
+    if (nr == 9) { return 2; }    # mkdir(path, pathlen)
+    if (nr == 10) { return 2; }   # rmdir(path, pathlen)
+    if (nr == 11) { return 0; }   # mount() stub
+    if (nr == 12) { return 0; }   # sync()
+    if (nr == 13) { return 0; }   # reboot()
+    if (nr == 14) { return 0; }   # pause()
+    if (nr == 15) { return 0; }   # getuid()
+    if (nr == 16) { return 2; }   # kill(pid, sig)
+    if (nr == 17) { return 3; }   # sigprocmask(how, set, oldset)
+    if (nr == 18) { return 3; }   # signalfd(fd, mask, flags)
+    if (nr == 19) { return 0; }   # epoll_create()
+    if (nr == 20) { return 3; }   # epoll_ctl(epfd, op, fd)
+    if (nr == 21) { return 3; }   # epoll_wait(epfd, events, max)
+    if (nr == 22) { return 0; }   # timerfd_create()
+    if (nr == 23) { return 3; }   # timerfd_settime(fd, flags, val)
+    if (nr == 24) { return 0; }   # umount() stub
+    if (nr == 25) { return 1; }   # pipe(fds)
+    if (nr == 26) { return 1; }   # write_boot_checkpoint(byte)
+    if (nr == 27) { return 1; }   # mmap(length)
+    if (nr == 28) { return 2; }   # munmap(addr, length)
+    if (nr == 29) { return 3; }   # getdents(dir_fd, buf, bufsize)
+    if (nr == 30) { return 2; }   # unlink(path, pathlen)
+    if (nr == 31) { return 4; }   # rename(old, oldlen, new, newlen)  -- a4=r10
+    if (nr == 32) { return 4; }   # link(target, targetlen, link, linklen) -- a4=r10
+    if (nr == 33) { return 3; }   # stat(path, pathlen, statbuf)
+    if (nr == 34) { return 2; }   # uname(buf, len)
+    if (nr == 35) { return 2; }   # sysinfo(buf, len)
+    if (nr == 40) { return 0; }   # uptime_ms()
+    if (nr == 41) { return 1; }   # sleep_ms(ms)
+    if (nr == 45) { return 3; }   # getrandom(buf, len, flags)
+    if (nr == 46) { return 0; }   # time_unix()
+    if (nr == 47) { return 3; }   # sock_connect(dst_ip, dst_port, src_port)
+    if (nr == 48) { return 3; }   # sock_send(conn_id, buf, len)
+    if (nr == 49) { return 3; }   # sock_recv(conn_id, buf, maxlen)
+    if (nr == 50) { return 1; }   # sock_close(conn_id)
+    if (nr == 51) { return 1; }   # udp_bind(port)
+    if (nr == 52) { return 4; }   # udp_send(dst_ip, ports, buf, len)  -- a4=r10
+    if (nr == 53) { return 4; }   # udp_recv(listener, buf, maxlen, addr_out) -- a4=r10
+    if (nr == 54) { return 1; }   # udp_unbind(listener_id)
+    if (nr == 55) { return 1; }   # icmp_echo(dst_ip)
+    if (nr == 56) { return 1; }   # sock_listen(port)
+    if (nr == 57) { return 1; }   # sock_accept(listen_id)
+    if (nr == 58) { return 3; }   # lseek(fd, offset, whence)
+    if (nr == 59) { return 2; }   # flock(fd, op)
+    if (nr == 60) { return 0; }   # winsize()
+    if (nr == 61) { return 1; }   # net_config(field)
+    return 0;
+}
+
+# Bitmask of which args are POINTERS into the child's memory (bit i = arg i).
+# This is the load-bearing encoding M1 translation + the 0.7.0 TOCTOU audit
+# need (every such arg must be read via a bounds-checked process_vm_readv, never
+# dereferenced in the host). For M0 the formatter renders these as "<ptr>" so
+# the log is hermetic (no nondeterministic child addresses leak into output).
+fn agnos_ptrmask(nr): i64 {
+    if (nr == 1) { return 2; }    # write: buf (arg1)
+    if (nr == 3) { return 1; }    # spawn: elf_addr (arg0)
+    if (nr == 5) { return 2; }    # read: buf (arg1)
+    if (nr == 7) { return 1; }    # open: name (arg0)
+    if (nr == 9) { return 1; }    # mkdir: path (arg0)
+    if (nr == 10) { return 1; }   # rmdir: path (arg0)
+    if (nr == 17) { return 6; }   # sigprocmask: set (arg1) + oldset (arg2)
+    if (nr == 18) { return 2; }   # signalfd: mask (arg1)
+    if (nr == 21) { return 2; }   # epoll_wait: events (arg1)
+    if (nr == 23) { return 4; }   # timerfd_settime: val (arg2)
+    if (nr == 25) { return 1; }   # pipe: fds (arg0)
+    if (nr == 29) { return 2; }   # getdents: buf (arg1)
+    if (nr == 30) { return 1; }   # unlink: path (arg0)
+    if (nr == 31) { return 5; }   # rename: old (arg0) + new (arg2)
+    if (nr == 32) { return 5; }   # link: target (arg0) + linkpath (arg2)
+    if (nr == 33) { return 5; }   # stat: path (arg0) + statbuf (arg2)
+    if (nr == 34) { return 1; }   # uname: buf (arg0)
+    if (nr == 35) { return 1; }   # sysinfo: buf (arg0)
+    if (nr == 45) { return 1; }   # getrandom: buf (arg0)
+    if (nr == 48) { return 2; }   # sock_send: buf (arg1)
+    if (nr == 49) { return 2; }   # sock_recv: buf (arg1)
+    if (nr == 52) { return 4; }   # udp_send: buf (arg2)
+    if (nr == 53) { return 10; }  # udp_recv: buf (arg1) + addr_out (arg3)
+    return 0;
+}
+
+# --- tiny pure string-builder helpers (append into a caller-owned buffer) ---
+# Return the new write offset. No bounds check: callers size the buffer for the
+# longest possible event line (a few dozen bytes); see format_event's caller.
+
+# Append the NUL-terminated cstr `src` at `buf+off`; return off + len.
+fn _de_put_cstr(buf, off, src): i64 {
+    var n = strlen(src);
+    memcpy(buf + off, src, n);
+    return off + n;
+}
+
+# Append the decimal rendering of `val` at `buf+off`; return off + len.
+fn _de_put_int(buf, off, val): i64 {
+    var tmp[24];
+    var n = fmt_int_buf(val, &tmp);
+    memcpy(buf + off, &tmp, n);
+    return off + n;
+}
+
+# Render one trapped syscall event as a deterministic, NUL-terminated log line
+# into `buf`, e.g. "getpid#2()", "write#1(1, <ptr>, 2)", "exit#0(0)". Pointer
+# args are rendered "<ptr>" (hermetic — no child address); scalar/length args in
+# decimal. Returns the line length (excluding the NUL). Pure: same inputs ->
+# same bytes, which is exactly what the unit tests and the golden IT assert.
+fn format_event(buf, nr, a0, a1, a2, a3): i64 {
+    var off = 0;
+    off = _de_put_cstr(buf, off, agnos_nr_name(nr));
+    off = _de_put_cstr(buf, off, "#");
+    off = _de_put_int(buf, off, nr);
+    off = _de_put_cstr(buf, off, "(");
+    var n = agnos_argc(nr);
+    var mask = agnos_ptrmask(nr);
+    var i = 0;
+    while (i < n) {
+        if (i > 0) { off = _de_put_cstr(buf, off, ", "); }
+        var v = a0;
+        if (i == 1) { v = a1; }
+        if (i == 2) { v = a2; }
+        if (i == 3) { v = a3; }
+        if ((mask & (1 << i)) != 0) {
+            off = _de_put_cstr(buf, off, "<ptr>");
+        } else {
+            off = _de_put_int(buf, off, v);
+        }
+        i = i + 1;
+    }
+    off = _de_put_cstr(buf, off, ")");
+    store8(buf + off, 0);
+    return off;
+}

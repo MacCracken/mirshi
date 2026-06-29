@@ -19,4 +19,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 
 ## Index
 
-_No ADRs yet. Add the first as `0001-kebab-case-title.md`._
+- [0001 — ptrace(PTRACE_SYSEMU) as the M0 syscall-intercept mechanism](0001-ptrace-sysemu-intercept.md) — *Accepted*

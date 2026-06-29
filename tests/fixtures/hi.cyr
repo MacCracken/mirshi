@@ -1,0 +1,26 @@
+# tests/fixtures/hi.cyr — the minimal agnos-target fixture for the M0 trap loop.
+#
+# Build (agnos target — emits agnos syscall NUMBERS, not Linux):
+#   cyrius build --agnos tests/fixtures/hi.cyr build/fixtures/hi
+#
+# Under CYRIUS_TARGET_AGNOS the stdlib selector picks lib/syscalls_x86_64_agnos.cyr,
+# so SYS_GETPID=2, SYS_WRITE=1, SYS_EXIT=0. The program does exactly three agnos
+# syscalls and nothing else — NO alloc_init / println / heap setup — so no hidden
+# runtime syscalls dilute the trapped stream. It ends on agnos exit#0 (NOT Linux
+# 60, which is agnos winsize), which is mirshi's unambiguous end-of-stream marker.
+#
+# Expected trapped stream under `mirshi --selftest-trace`:
+#   getpid#2()
+#   write#1(1, <ptr>, 2)
+#   exit#0(0)
+
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    syscall(SYS_GETPID);            # agnos #2
+    syscall(SYS_WRITE, 1, "hi", 2); # agnos #1 — fd 1, 2 bytes
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);               # agnos #0 — end of stream

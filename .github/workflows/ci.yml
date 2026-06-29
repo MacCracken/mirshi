@@ -46,5 +46,16 @@ jobs:
         # AND auto-discovers tests/*.tcyr — avoids the previous
         # `cyrius test src/test.cyr` form that hard-failed when the
         # stub didn't exist (Issue 1) and also wouldn't ever exercise
-        # tests/${proj}.tcyr.
+        # tests/${proj}.tcyr. This is the hermetic floor: the pure
+        # decode/format logic (src/decode.cyr) with no ptrace dependency.
         run: cyrius test
+
+      - name: M0 trap integration test
+        # The REAL fork+execve+PTRACE_SYSEMU path — the M0 acceptance gate —
+        # which a pure-cyrius .tcyr cannot express. Kept SEPARATE from `cyrius
+        # test` so a ptrace/Yama/seccomp environment failure is diagnosable and
+        # never masquerades as a unit-test failure. ubuntu-latest is x86_64 and
+        # a full VM at Yama ptrace_scope=1; mirshi traces its OWN direct child,
+        # permitted with no CAP_SYS_PTRACE. A future container/Docker job (M3)
+        # must add: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined.
+        run: bash scripts/it/m0_trap.sh

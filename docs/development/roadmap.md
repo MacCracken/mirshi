@@ -26,7 +26,7 @@ must be supervisor-side (ptrace or seccomp-user-notify).
 
 ### M0 — Scaffold + the trap loop (v0.1.0) — ✅ shipped 2026-06-29
 - `cyrius init --bin` scaffold (mirshi is a **Linux-target** Cyrius binary supervising **agnos-target** ELFs).
-- **Next bite (the real M0 work):** a supervisor that `fork`+`exec`s an agnos static ELF and **traps every syscall** via `ptrace(PTRACE_SYSEMU)` (fastest bring-up — full register read/rewrite), logging the agnos syscall number + args. Acceptance: launch a trivial agnos binary, see its complete syscall stream trapped + logged — interception proven *before* any translation.
+- **✅ The real M0 work — the trap loop:** a supervisor that `fork`+`exec`s an agnos static ELF and **traps every syscall** via `ptrace(PTRACE_SYSEMU)` (fastest bring-up — full register read/rewrite), logging the agnos syscall number + args. **Acceptance met:** `mirshi --selftest-trace <agnos-elf>` traps + logs a trivial agnos binary's complete stream (`getpid#2`, `write#1`, `exit#0`) — interception proven *before* any translation. Mechanism: `src/intercept.cyr` (SYSEMU loop) + `src/decode.cyr` (pure agnos#→name/arity/ptr-arg decode), proven by `scripts/it/m0_trap.sh`. Why SYSEMU not SYSCALL: [`../adr/0001-ptrace-sysemu-intercept.md`](../adr/0001-ptrace-sysemu-intercept.md).
 
 ### M1 — Core translation: process + console (hello-world runs) (v0.2.0)
 `src/translate.cyr` handler table for the minimal runnable set: `exit#0`, `write#1` (stdout/stderr),
