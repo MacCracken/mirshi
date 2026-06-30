@@ -4,6 +4,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+0.6.0 — Hardening (in progress): the supervisor against a misbehaving / hostile child.
+
+### Added
+- **Host-resource bounds** (`src/limits.cyr`): kernel-enforced rlimits set on the
+  child before `execve` cap the two exhaustion vectors reachable through the
+  translated surface — `RLIMIT_AS` = 1 GiB bounds an `mmap#27` storm, `RLIMIT_NOFILE`
+  = 256 bounds an `open#7` / `dup#8` storm. A storm degrades to the agnos failure
+  sentinel (`mmap#27` → 0, `open#7`/`dup#8` → -1), never a supervisor crash or host
+  OOM. Set after `PTRACE_TRACEME`, before the seccomp filter (so `prlimit64` needs no
+  allowlist entry and the child can't raise its own limits); always on, independent
+  of `--no-seccomp`. The PID/process vector needs no rlimit — the seccomp allowlist
+  has no `clone`/`fork` and `spawn#3` is `ENOSYS`, so a process storm is structurally
+  impossible. [ADR 0006](docs/adr/0006-host-resource-bounds-child-rlimits.md).
+- **Fault-injection harness wired into CI** (`scripts/it/fault_inject.sh`): the 0.6.0
+  hardening gate now runs in CI (after the M2 step). Adds a memory-exhaustion
+  (`mmap#27` storm) and an fd-exhaustion (`open#7` storm) case to the existing
+  bad-pointer / SIGSEGV / unknown-syscall / syscall-storm / spawn cases; all assert
+  the supervisor stays stable and the host is untouched.
+
 ## [0.5.0] — 2026-06-29
 
 M4 — seccomp-notify feasibility + benchmark baseline (the full migration reframed).

@@ -76,6 +76,19 @@ jobs:
         # Same ptrace requirements as the M0/M1 steps.
         run: bash scripts/it/m2_fs.sh
 
+      - name: Fault-injection hardening gate
+        # The 0.6.0 hardening gate: throw misbehaving / hostile agnos children at
+        # mirshi (bad pointers, child SIGSEGV, unknown syscalls, a syscall storm,
+        # spawn#3 fork-bomb attempts, and mmap#27 / open#7 resource-exhaustion
+        # storms) and assert the SUPERVISOR stays stable — no crash, no hang (each
+        # run is under a 15s timeout), a known-good canary still passes after each
+        # fault, and the HOST is untouched (no zombies, kernel-enforced rlimits cap
+        # the storms). Same ptrace requirements as the M0/M1/M2 steps (mirshi traces
+        # its own direct child; no CAP_SYS_PTRACE on ubuntu-latest); kept separate so
+        # a hardening regression is diagnosable and never masquerades as a unit-test
+        # failure.
+        run: bash scripts/it/fault_inject.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

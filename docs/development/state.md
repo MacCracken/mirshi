@@ -35,6 +35,9 @@ trap-log mode.
   rewrites (M1) + the 13 fs handlers incl. the stat/getdents exit-stop repack (M2).
 - `src/seccomp.cyr` — M3 bounding seccomp: a classic-BPF allowlist of the
   translation's output syscalls, installed on the child (default-on in run mode).
+- `src/limits.cyr` — 0.6.0 host-resource bounds: kernel-enforced child rlimits
+  (`RLIMIT_AS` 1 GiB / `RLIMIT_NOFILE` 256) set before the seccomp filter, capping
+  the `mmap#27` / `open#7` exhaustion vectors ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md)).
 - `docker/` — the v1 vehicle: a `FROM scratch` image (mirshi + agnos tools, no
   QEMU), `build.sh`/`fanout.sh`/`smoke.sh`, and `tools/*.cyr`.
 
@@ -59,10 +62,14 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/m2_fs.sh` — M2 fs integration test: agnos open/read/write/close/cp/
   mkdir/rename/link/unlink/stat/getdents against a sandboxed temp rootfs (HOST EFFECTS).
 - `docker/smoke.sh` — M3 docker gate: build the `agnos-mirshi` image, `docker run`
-  agnos tools (correct output, no qemu in image), and a fan-out. The three `scripts/it/*`
+  agnos tools (correct output, no qemu in image), and a fan-out. The four `scripts/it/*`
   + `docker/smoke.sh` are CI steps after `cyrius test`; the ptrace ITs need a same-uid
   child (no extra privilege on ubuntu-latest;
   `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` in a container).
+- `scripts/it/fault_inject.sh` — 0.6.0 hardening gate (CI step, after M2): throws
+  misbehaving/hostile children (bad pointers, SIGSEGV, unknown syscalls, syscall
+  storm, spawn fork-bomb, and `mmap#27` / `open#7` resource-exhaustion storms) and
+  asserts the supervisor stays stable + the host is untouched (9 cases).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -89,7 +96,15 @@ swallow** layer. None wired yet (scaffold).
 
 See [`roadmap.md`](roadmap.md) — M0–M3 (functional v1 surface) + M4 (seccomp-notify
 feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
-**0.6.0 hardening** (in progress) — supervisor robustness against a misbehaving/hostile
-child: bad pointers, syscall storms, child crash/hang/zombie reaping, partial
-`process_vm` transfers, host-resource bounds; a fault-injection harness. Then 0.7.0
-security sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
+**0.6.0 hardening** (in progress). Landed so far (in `[Unreleased]`):
+- **Host-resource bounds** ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md))
+  — kernel-enforced child rlimits cap the `mmap#27` / `open#7` exhaustion vectors;
+  PID vector already closed by the seccomp allowlist. Verified firing on an unlimited
+  host (mmap storm bounds at ~1 GiB, open storm at 253 fds).
+- **Fault-injection harness** wired into CI as the hardening gate (9 cases).
+
+Remaining for 0.6.0: **group-stop signal handling** (the trace loops still
+blind-re-inject any non-syscall signal — a `SIGSTOP`/`SIGTSTP` group-stop must be
+discriminated via `PTRACE_GETSIGINFO` and never re-injected, the code's own deferred
+TODO); **child hang reaping** (no internal watchdog); then the version bump to 0.6.0.
+Then 0.7.0 security sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.

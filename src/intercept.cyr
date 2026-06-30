@@ -110,6 +110,7 @@ include "src/translate.cyr"
 include "src/scratch.cyr"
 include "src/dispatch.cyr"
 include "src/seccomp.cyr"
+include "src/limits.cyr"
 
 # The traced child. Runs the ABSOLUTE MINIMUM between fork and execve — mark
 # self as tracee, then replace the image. No alloc, no print: anything that
@@ -117,6 +118,11 @@ include "src/seccomp.cyr"
 # set up to trace it). execve only returns on failure.
 fn _child_exec(path, bound): i64 {
     pt(PTRACE_TRACEME, 0, 0, 0);
+    # 0.6.0 host-resource bounds: kernel-enforced rlimits (address space + fds) so a
+    # runaway/hostile child can't exhaust the host through the translated surface.
+    # ALWAYS on (independent of --no-seccomp) and FIRST — set before any seccomp
+    # filter so prlimit64 needs no allowlist entry and the child can't raise them.
+    apply_child_rlimits();
     # M3 bounding seccomp: restrict the child to the agnos syscall surface before
     # exec (the filter persists across execve). Installed here, after TRACEME and
     # before execve, so the agnos image runs under it. Non-fatal if it fails.

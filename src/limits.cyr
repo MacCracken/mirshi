@@ -1,0 +1,61 @@
+# src/limits.cyr — host-resource bounds on the agnos child (0.6.0 hardening).
+#
+# A misbehaving or hostile agnos child must not exhaust the HOST through the
+# translated syscall surface. Two vectors are reachable: memory via an mmap#27
+# storm (each call reserves >= 2 MB of the child's address space) and file
+# descriptors via an open#7 / dup#8 storm. mirshi caps both with KERNEL-ENFORCED
+# rlimits set on the child BEFORE execve (they persist across it); the kernel then
+# returns -ENOMEM / -EMFILE in-child when a storm hits the cap, and the translation
+# (src/translate.cyr linux_ret_to_agnos) maps that to the agnos failure sentinel
+# (mmap#27 -> 0, open#7/dup#8 -> -1) — a clean IN-ABI failure the agnos allocator
+# already handles, never a supervisor crash or host harm.
+#
+# The PID / process vector needs NO rlimit here: the bounding seccomp allowlist
+# (src/seccomp.cyr) carries no clone/fork/vfork and agnos spawn#3 dispatches ENOSYS
+# (src/translate.cyr agnos_to_linux_nr returns -1), so a process storm is
+# structurally impossible through the translated surface. RLIMIT_NPROC is a
+# per-real-uid ceiling (false-EAGAIN risk if the uid is shared in a container), so
+# it is deliberately OMITTED — see docs/adr/0006.
+#
+# Why kernel rlimits and not per-syscall accounting in the dispatcher: the bound is
+# enforced by the kernel in the child's own address space with ZERO supervisor hot-
+# path cost and no TOCTOU (the supervisor never has to count/decrement mmap/munmap/
+# open/close). See docs/adr/0006.
+#
+# Set BEFORE any seccomp filter, so prlimit64 itself need NOT be in the bounding
+# allowlist — and the child can never raise these limits afterward (prlimit64 is
+# not allowlisted, so a post-seccomp attempt is SIGSYS-killed). The caps are
+# GENEROUS for any legit agnos CLI tool (whole-run footprint is low tens of MB) yet
+# hard-bound a runaway. x86_64 Linux only. INCLUDE ORDER: src/intercept.cyr
+# includes this before _child_exec (needs only the alloc/store64/syscall builtins).
+
+enum MirshiLimits {
+    SYS_PRLIMIT64 = 302;            # set the child's rlimits (pid=0 = self); the modern path
+    RLIMIT_NOFILE = 7;             # max open fds (highest fd + 1) — caps an open#7/dup#8 storm
+    RLIMIT_AS = 9;                 # max virtual address space (bytes) — caps an mmap#27 storm
+    AS_CAP_BYTES = 1073741824;     # 1 GiB address space: ~4x the worst legit run, hard-stops a storm
+    NOFILE_CAP = 256;             # 256 fds: huge headroom for a CLI tool, caps a descriptor storm
+}
+
+# prlimit64(pid=0 self, resource, &{rlim_cur, rlim_max}, NULL). Sets BOTH soft and
+# hard to `cap` so the child cannot raise the soft limit back up. Lowering the hard
+# limit needs no privilege; the only failure is the rare case where the host's hard
+# limit is already below `cap` (a raise -> -EPERM), which is non-fatal. Returns the
+# syscall result (0 ok, -errno fail); a failure leaves the child running under the
+# host's own default rlimits (degraded, not aborted).
+fn _set_limit(resource, cap): i64 {
+    var rl = alloc(16);            # struct rlimit { u64 rlim_cur; u64 rlim_max }
+    store64(rl, cap);             # rlim_cur @ +0  (u64 LE)
+    store64(rl + 8, cap);         # rlim_max @ +8  (u64 LE)
+    return syscall(SYS_PRLIMIT64, 0, resource, rl, 0);
+}
+
+# Apply the host-resource bounds on the calling (child) process, before execve.
+# ALWAYS on (independent of --no-seccomp): a generous safety floor that never
+# affects a legit tool, only a runaway. Best-effort — a failed prlimit64 does not
+# abort the run (the seccomp bound + the host defaults still apply).
+fn apply_child_rlimits(): i64 {
+    _set_limit(RLIMIT_AS, AS_CAP_BYTES);
+    _set_limit(RLIMIT_NOFILE, NOFILE_CAP);
+    return 0;
+}
