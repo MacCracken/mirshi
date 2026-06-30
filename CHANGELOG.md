@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+0.7.1 — Supervisor rootfs confinement (the path-escape blocker fix), bite 1: `open`.
+
+### Security
+- **`--root <dir>` rootfs confinement** ([ADR 0009](docs/adr/0009-rootfs-confinement-openat2-in-child.md)):
+  with `--root`, `open#7` is rewritten to **`openat2` with `RESOLVE_IN_ROOT`** anchored at
+  a per-child rootfd (opened `O_PATH|O_DIRECTORY`, `dup3`'d to a fixed fd, fail-closed if
+  it won't open), so the kernel **clamps** absolute paths, `..` traversal, and symlink
+  targets inside the root — kernel-enforced, unprivileged, TOCTOU-safe. Every fd-based op
+  (`read`/`write`/`lseek`/`dup`/`close`/`getdents`) is transitively confined (its fd came
+  from a confined open). The not-yet-confined path-mutation/metadata ops
+  (`mkdir`/`rmdir`/`unlink`/`rename`/`link`/`stat`) are **denied** fail-closed under
+  `--root` (their `*at` forms land in bite 2) so `--root` is never a false-confidence
+  footgun. Without `--root`, transparent pass-through is unchanged (a loud warning prints
+  in run mode); the container mount namespace remains the boundary for the v1 vehicle.
+  New gate `scripts/it/confine.sh` (self-validating: proves the escape leaks without
+  `--root`, then that `--root` clamps abs/traversal/symlink and denies mutation).
+
 ## [0.7.0] — 2026-06-30
 
 Security CVE / 0-day sweep — audit + hardening (phased: the path-escape confinement is

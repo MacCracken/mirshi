@@ -34,10 +34,11 @@ include "src/intercept.cyr"
 
 fn usage(): i64 {
     _emit(2, "mirshi — AGNOS↔Linux mirror-shim\n");
-    _emit(2, "usage: mirshi [--selftest-trace] [--no-seccomp] <agnos-elf>\n");
+    _emit(2, "usage: mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] <agnos-elf>\n");
     _emit(2, "  runs <agnos-elf> by translating + executing its agnos syscalls (no QEMU).\n");
     _emit(2, "  --selftest-trace  trap-log mode: emit the bare agnos syscall stream, no translation.\n");
     _emit(2, "  --no-seccomp      disable the bounding seccomp policy on the child (default: on).\n");
+    _emit(2, "  --root <dir>      confine the child's filesystem to <dir> (openat2 RESOLVE_IN_ROOT).\n");
     _emit(2, "  flags, if given, must precede <agnos-elf>.\n");
     return 2;
 }
@@ -49,6 +50,7 @@ fn main(): i64 {
 
     var selftest = 0;
     var bound = 1;                 # bounding seccomp policy on the child — default ON
+    var rootpath = 0;             # 0 = no path confinement (transparent pass-through)
     var i = 1;
     # Consume leading flags; stop (break) at the first non-flag = the target.
     while (i < n) {
@@ -61,14 +63,28 @@ fn main(): i64 {
                 bound = 0;
                 i = i + 1;
             } else {
-                break;
+                if (streq(a, "--root") == 1) {
+                    if (i + 1 >= n) { return usage(); }   # --root needs a <dir> argument
+                    rootpath = argv(i + 1);
+                    i = i + 2;
+                } else {
+                    break;
+                }
             }
         }
     }
     if (i >= n) { return usage(); }   # no <agnos-elf> after the flags
 
+    # Loud warning: without --root a run-mode child has UNCONFINED host filesystem access
+    # (bounded only by an external container mount namespace, if any). See docs/audit.
+    if (selftest == 0) {
+        if (rootpath == 0) {
+            _emit(2, "mirshi: WARNING — no --root: child has UNCONFINED host filesystem access\n");
+        }
+    }
+
     var target = argv(i);
-    return intercept_run(target, selftest, bound);
+    return intercept_run(target, selftest, bound, rootpath);
 }
 
 var r = main();

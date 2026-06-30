@@ -107,6 +107,15 @@ jobs:
         # no watchdog needed). Same ptrace requirements as the M0/M1/M2 steps.
         run: bash scripts/it/supervisor_hardening.sh
 
+      - name: Path confinement (--root rootfs jail)
+        # 0.7.1 path-escape containment (the audit class-c blocker fix): under
+        # --root <dir>, open#7 is rewritten to openat2 with RESOLVE_IN_ROOT anchored
+        # at a per-child rootfd, so absolute paths, .. traversal, and symlink targets
+        # are clamped INSIDE the root while in-root paths resolve. Self-validating
+        # (proves the escape leaks WITHOUT --root first). Same ptrace requirements as
+        # the M0/M1/M2 steps.
+        run: bash scripts/it/confine.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

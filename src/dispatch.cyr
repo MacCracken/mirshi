@@ -29,6 +29,36 @@ enum MirshiXlatNr {
     SLEEP_MS_CAP = 3600000;     # mirror agnos's 1 h sleep cap
 }
 
+# 0.7.1 rootfs confinement (docs/audit/2026-06-30-audit.md class-c fix). When a
+# --root is configured, every path-RESOLVING open#7 is rewritten to openat2 anchored
+# at a per-child rootfd with RESOLVE_IN_ROOT, so the kernel clamps absolute paths,
+# `..` traversal, AND symlink targets to the root (verified: all escape forms return
+# ENOENT, the host file is unreadable). x86_64 + Linux 5.6+ only.
+enum MirshiConfine {
+    SYS_OPENAT2 = 437;          # openat2(dirfd, path, &open_how, size) — the only RESOLVE_* op
+    OPEN_HOW_SIZE = 24;         # sizeof(struct open_how) {u64 flags; u64 mode; u64 resolve}
+    RESOLVE_IN_ROOT = 0x10;     # clamp resolution within the anchor dirfd (abs + .. + symlink)
+    O_PATH = 0x200000;          # rootfd open: an inert dirfd anchor (read/getdents -> EBADF)
+    O_DIRECTORY = 0x10000;      # assert the root is a directory at open time (fail-fast)
+    O_CREAT = 0x40;             # openat2 rejects a nonzero how.mode UNLESS O_CREAT is set
+    ROOTFD = 100;               # the child's rootfs anchor fd (dup3'd here in _child_exec)
+    HOST_OPEN = 2;              # Linux open(2)  — used pre-execve in the child to get rootfd
+    HOST_CLOSE = 3;             # Linux close(2) — close the temporary low rootfd after dup3
+    HOST_DUP3 = 292;            # Linux dup3(2)  — pin rootfd at ROOTFD (flags=0, survives execve)
+}
+
+# Whether path confinement is active (a --root was configured). Set by intercept_run
+# in the supervisor BEFORE fork; read by the dispatcher to choose openat2 vs open(2).
+var _confine_active = 0;
+
+# A supervisor-side 24-byte struct open_how staging buffer (lazily allocated once —
+# never per call, same discipline as _emu_ts_buf), filled then staged into the child.
+var _how_buf = 0;
+fn _how_buf_get(): i64 {
+    if (_how_buf == 0) { _how_buf = alloc(OPEN_HOW_SIZE); }
+    return _how_buf;
+}
+
 # The supervisor-computed return for the current EMULATE/ENOSYS call, carried
 # from the enter stop (where it is computed + the syscall skipped) to the exit
 # stop (where the loop writes it into the child's rax). Single in-flight call per
@@ -179,18 +209,58 @@ fn translate_dispatch(pid, regs): i64 {
     # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
     #     path(s) into the child red zone (NUL-terminated) before executing. ---
     if (nr == 7) {
-        # open(name,namelen,flags) -> Linux open(path, O_flags, mode 0644).
+        # open(name,namelen,flags). Unconfined: Linux open(path, O_flags, mode).
+        # Confined (--root): openat2(ROOTFD, path, &open_how{O_flags, mode, RESOLVE_IN_ROOT},
+        # 24) so the kernel clamps the path within the rootfs (absolute / .. / symlink all
+        # contained). Every fd-producing path op MUST be confined this way — the dispatcher
+        # never lets a raw dirfd or AT_FDCWD reach the kernel (see docs/adr/0009).
         var aflags = decode_arg(regs, 2);
+        var oflags = ao_to_o(aflags);                  # AO_* -> O_*
         var sc7 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
                            load64(regs + REG_RSP) - RED_ZONE);
         if (sc7 < 0) { return _m2_fail(pid, regs); }
-        store64(regs + REG_RDI, sc7);                  # path (NUL-terminated scratch)
-        store64(regs + REG_RSI, ao_to_o(aflags));      # AO_* -> O_*
-        store64(regs + REG_RDX, open_create_mode());   # mode 0644 (consulted only on O_CREAT)
-        store64(regs + REG_ORIG_RAX, 2);
+        if (_confine_active == 1) {
+            # openat2 is STRICTER than open(2): it rejects a nonzero how.mode without
+            # O_CREAT, and rejects any unknown how.flags bit. Both are safe here only
+            # because mode is zeroed unless O_CREAT and ao_to_o emits a fixed O_* whitelist
+            # (no stray bits) — keep ao_to_o a whitelist or confined opens start EINVAL-ing.
+            var howmode = 0;
+            if ((oflags & O_CREAT) != 0) { howmode = open_create_mode(); }
+            var hb = _how_buf_get();
+            store64(hb + 0, oflags);                   # how.flags
+            store64(hb + 8, howmode);                  # how.mode  (0 unless O_CREAT)
+            store64(hb + 16, RESOLVE_IN_ROOT);         # how.resolve
+            var howsc = stage_bytes(pid, hb, OPEN_HOW_SIZE, sc7);   # struct BELOW the path
+            if (howsc < 0) { return _m2_fail(pid, regs); }
+            store64(regs + REG_RDI, ROOTFD);           # dirfd = the child's rootfs anchor
+            store64(regs + REG_RSI, sc7);              # path (clamped within rootfd)
+            store64(regs + REG_RDX, howsc);            # &open_how
+            store64(regs + REG_R10, OPEN_HOW_SIZE);    # how.size = 24 (exact)
+            store64(regs + REG_ORIG_RAX, SYS_OPENAT2);
+        } else {
+            store64(regs + REG_RDI, sc7);              # path (NUL-terminated scratch)
+            store64(regs + REG_RSI, oflags);
+            store64(regs + REG_RDX, open_create_mode());   # mode (consulted only on O_CREAT)
+            store64(regs + REG_ORIG_RAX, 2);
+        }
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EXECUTE;
     }
+    # 0.7.1 bite 1: open#7 (above) is confined via openat2 RESOLVE_IN_ROOT, and the
+    # fd-based ops (read/write/lseek/dup/close/getdents) ride already-confined fds. The
+    # path-MUTATION + metadata ops (mkdir#9 / rmdir#10 / unlink#30 / rename#31 / link#32 /
+    # stat#33) are NOT yet confined — under --root they are DENIED fail-closed (agnos -1)
+    # rather than reaching arbitrary host paths. --root must never be a false-confidence
+    # footgun. Their parent-anchored *at forms land in bite 2 (docs/adr/0009).
+    if (_confine_active == 1) {
+        if (nr == 9) { return _m2_fail(pid, regs); }
+        if (nr == 10) { return _m2_fail(pid, regs); }
+        if (nr == 30) { return _m2_fail(pid, regs); }
+        if (nr == 31) { return _m2_fail(pid, regs); }
+        if (nr == 32) { return _m2_fail(pid, regs); }
+        if (nr == 33) { return _m2_fail(pid, regs); }
+    }
+
     if (nr == 9) {
         # mkdir(path,pathlen) -> Linux mkdir(path, mode 0777).
         var sc9 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),

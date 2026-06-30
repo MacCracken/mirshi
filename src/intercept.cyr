@@ -123,13 +123,38 @@ include "src/limits.cyr"
 # self as tracee, then replace the image. No alloc, no print: anything that
 # syscalls here would show up as a spurious pre-image trap (and we are not yet
 # set up to trace it). execve only returns on failure.
-fn _child_exec(path, bound): i64 {
+fn _child_exec(path, bound, rootpath): i64 {
     pt(PTRACE_TRACEME, 0, 0, 0);
     # 0.6.0 host-resource bounds: kernel-enforced rlimits (address space + fds) so a
     # runaway/hostile child can't exhaust the host through the translated surface.
     # ALWAYS on (independent of --no-seccomp) and FIRST — set before any seccomp
     # filter so prlimit64 needs no allowlist entry and the child can't raise them.
     apply_child_rlimits();
+    # 0.7.1 rootfs confinement: open the configured root as the child's anchor fd, pinned
+    # at the fixed number ROOTFD that the dispatcher anchors every confined open#7 at.
+    # BEFORE the seccomp filter (dup3 is not allowlisted) and WITHOUT O_CLOEXEC (it must
+    # survive execve). O_PATH makes the fd inert as a data handle (read/getdents -> EBADF)
+    # yet valid as an openat2 anchor. FAIL-CLOSED: if the root won't open, abort rather
+    # than run the child with confinement silently disabled. See docs/adr/0009.
+    if (rootpath != 0) {
+        var rfd = syscall(HOST_OPEN, rootpath, O_PATH | O_DIRECTORY, 0);
+        if (rfd < 0) {
+            _emit(2, "mirshi: --root open failed — refusing to run child unconfined\n");
+            syscall(SYS_EXIT, BOUND_FAILED);
+            return BOUND_FAILED;
+        }
+        if (rfd != ROOTFD) {
+            # dup3 returns the new fd on success — fail-closed if it does NOT land at
+            # ROOTFD, else the child would run with the anchor fd missing/wrong (the
+            # dispatcher's openat2 would resolve against the wrong fd = broken confinement).
+            if (syscall(HOST_DUP3, rfd, ROOTFD, 0) != ROOTFD) {
+                _emit(2, "mirshi: --root dup3 failed — refusing to run child unconfined\n");
+                syscall(SYS_EXIT, BOUND_FAILED);
+                return BOUND_FAILED;
+            }
+            syscall(HOST_CLOSE, rfd);
+        }
+    }
     # M3 bounding seccomp: restrict the child to the agnos syscall surface before
     # exec (the filter persists across execve). Installed here, after TRACEME and
     # before execve, so the agnos image runs under it. FAIL-CLOSED (0.7.0 audit b1):
@@ -328,7 +353,12 @@ fn _trace_run(pid): i64 {
 }
 
 # Public entry: fork the agnos child, trace it to completion, return its code.
-fn intercept_run(path, selftest, bound): i64 {
+fn intercept_run(path, selftest, bound, rootpath): i64 {
+    # Confinement (and the child rootfd setup) applies only in RUN mode — selftest
+    # (SYSEMU) executes nothing, so the child's paths never reach the kernel.
+    var rp = rootpath;
+    if (selftest == 1) { rp = 0; }
+    if (rp != 0) { _confine_active = 1; }
     var pid = sys_fork();
     if (pid < 0) {
         _emit(2, "mirshi: fork failed\n");
@@ -340,7 +370,7 @@ fn intercept_run(path, selftest, bound): i64 {
         # only bound in run mode.
         var b = bound;
         if (selftest == 1) { b = 0; }
-        _child_exec(path, b);       # never returns on success
+        _child_exec(path, b, rp);   # never returns on success
         return EXECVE_FAILED;
     }
     if (selftest == 1) { return _trace_log(pid); }

@@ -82,6 +82,9 @@ paths in the child red zone + repack output structs at the exit stop
   groupstop): the supervisor's own robustness — mirshi's RSS stays flat under an
   emulated-timer (`uptime_ms#40`) storm (no per-call heap leak), and terminating
   mirshi mid-hang leaves no orphan / no zombie (`PTRACE_O_EXITKILL`).
+- `scripts/it/confine.sh` — 0.7.1 path-confinement gate (CI step, after supervisor):
+  under `--root`, `open#7` escapes (abs / `..` / symlink) are clamped to the root and
+  path-mutation ops denied; self-validating (proves the escape leaks without `--root`).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -131,6 +134,12 @@ path-escape** (no in-supervisor path confinement; bare-CLI child reaches arbitra
 paths, PoC-confirmed) — bounded by the container mount NS in the v1 vehicle, fixed
 properly by the **0.7.1** supervisor rootfs confinement.
 
-Next: **0.7.1 — supervisor rootfs confinement** (`--root` + `openat2`/`*at` bounded
-resolution for the 7 path handlers; escape-attempt fault tests) → 0.8.0 optimize →
-0.9.0 freeze+docs → v1.0.0.
+**0.7.1 rootfs confinement** — ⚙ in progress. Bite 1 done (in `[Unreleased]`):
+`--root <dir>` confines `open#7` via `openat2 RESOLVE_IN_ROOT` anchored at a per-child
+rootfd ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) — abs/traversal/
+symlink clamped, all fd-based ops transitively confined; the not-yet-confined
+path-mutation/metadata ops are denied fail-closed under `--root` (gate
+`scripts/it/confine.sh`). Bite 2: confine `mkdir`/`rmdir`/`unlink`/`rename`/`link`/`stat`
+via parent-anchored `*at` + lexical sanitization; in-container escape-attempt assertion.
+
+Then 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.

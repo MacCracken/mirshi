@@ -27,3 +27,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0006 — Host-resource bounds via kernel-enforced child rlimits](0006-host-resource-bounds-child-rlimits.md) — *Accepted*
 - [0007 — Group-stop signal handling: discriminate and suppress, don't re-inject](0007-group-stop-signal-handling.md) — *Accepted*
 - [0008 — Child-hang robustness: no watchdog; fix the supervisor-emulate heap leak](0008-child-hang-supervisor-robustness.md) — *Accepted*
+- [0009 — Rootfs confinement via openat2 RESOLVE_IN_ROOT in the child](0009-rootfs-confinement-openat2-in-child.md) — *Accepted*
