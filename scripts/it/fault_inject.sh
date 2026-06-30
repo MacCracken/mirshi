@@ -205,10 +205,19 @@ syscall(SYS_EXIT, r);
 EOF
 build_fix fdstorm; ck_bounded "fd exhaustion (open storm)" fdstorm fds 200 256
 
-# Host-untouched checks: no zombies left by mirshi, no stray fixtures escaped sbox.
-zombies="$(ps -o stat= --ppid $$ 2>/dev/null | grep -c Z || true)"
+# Host-untouched check: the supervisor must leave no zombie agnos child behind.
+# The actual guarantee lives in src/intercept.cyr (PTRACE_O_EXITKILL + the _wait
+# reaping loop); this is the host-side cross-check. mirshi forks the agnos child
+# (intercept_run -> sys_fork), so it is a GRANDCHILD of this script, not a direct
+# child — `--ppid $$` would never see it, and a child mirshi orphaned by failing
+# to reap reparents to PID 1, not to us. So scan ALL defunct processes and match
+# the fixture command names, anchored so unrelated zombies that merely share a
+# substring on a shared CI runner do not trip a false positive.
+fixt_re='canary|badwrite|badstat|bigpath|segv|unknown|storm|memstorm|fdstorm|spawn'
+zombies="$(ps -eo stat=,comm= 2>/dev/null \
+    | awk -v re="^(${fixt_re})\$" '$1 ~ /^Z/ && $2 ~ re {c++} END {print c+0}')"
 if [ "${zombies:-0}" -ne 0 ]; then echo "FAIL: $zombies zombie(s) left behind" >&2; fail=1
-else echo "OK: no zombie processes left by the supervisor"; fi
+else echo "OK: no zombie agnos children left by the supervisor"; fi
 
 if [ "$fail" -ne 0 ]; then echo "fault-injection: FAILED" >&2; exit 1; fi
 echo "OK: fault-injection — supervisor stable + host untouched across all hostile children"
