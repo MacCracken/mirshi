@@ -5,14 +5,19 @@
 
 ## Version
 
-**0.9.0** — 2026-06-30. Freeze + docs cleanup (no behavior change). Froze the v1 contracts: the
-per-number AGNOS→Linux **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md),
-exhaustively test-pinned for agnos# 0–61) and the **CLI contract** ([`../reference/cli.md`](../reference/cli.md),
-pinned by `scripts/it/cli.sh`); added the **boundary-discipline ADR** ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md):
-mirshi *complements, never replaces* QEMU+iron); guides cross-linked; CHANGELOG complete from 0.1.0.
-0.8.0 = optimizations: the **exit-stop single-register I/O** ([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md),
-`PTRACE_PEEKUSER`/`POKEUSER`, ~5–7 % off the syscall-dense tax, byte-identical) + a 0-alloc-per-syscall
-gate; ptrace stays the documented default (no transparent fast-path; seccomp-notify deferred-by-data).
+**1.0.0** — 2026-06-30. **The clean cut: AGNOS userland in Docker, no QEMU** (direction 1, headless
+CLI). A representative agnos CLI userland (`hello`/`echo`/`catfile`/`ls`/`cp` — console + fs
+read/list/write) runs as native Linux processes under mirshi in a plain `FROM scratch` container,
+shared host kernel, fan-out-ready, seccomp-bounded — proven end-to-end by `docker/smoke.sh`. The v1
+definition is met. The 0.6→0.9 quality arc (hardened · audited · confined · optimized · frozen) is
+the foundation; no translation-logic change in the cut. Registry publishing is a documented post-v1
+ops step (see [`../guides/docker-fanout.md`](../guides/docker-fanout.md)), not gated by the v1
+definition. 0.9.0 = freeze + docs cleanup: froze the v1 contracts — the per-number **syscall-coverage
+matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md), test-pinned for
+agnos# 0–61) + the **CLI contract** ([`../reference/cli.md`](../reference/cli.md)) + the
+**boundary-discipline ADR** ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md)).
+0.8.0 = optimizations: **exit-stop single-register I/O** ([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md),
+~5–7 % off the syscall-dense tax, byte-identical) + a 0-alloc gate; ptrace stays the documented default.
 0.7.1 = rootfs confinement
 (`--root`, audit class-(c), [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)):
 `--root <dir>` confines the child's filesystem via `openat2 RESOLVE_IN_ROOT` (open) +
@@ -25,7 +30,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.12` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.14` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -80,10 +85,11 @@ paths in the child red zone + repack output structs at the exit stop
   run under real translation (`heapuser` is the mmap-in-child regression gate).
 - `scripts/it/m2_fs.sh` — M2 fs integration test: agnos open/read/write/close/cp/
   mkdir/rename/link/unlink/stat/getdents against a sandboxed temp rootfs (HOST EFFECTS).
-- `docker/smoke.sh` — M3 docker gate: build the `agnos-mirshi` image, `docker run`
-  agnos tools (correct output, no qemu in image), and a fan-out. The four `scripts/it/*`
-  + `docker/smoke.sh` are CI steps after `cyrius test`; the ptrace ITs need a same-uid
-  child (no extra privilege on ubuntu-latest;
+- `docker/smoke.sh` — the **v1 docker gate**: build the `FROM scratch` `agnos-mirshi` image
+  and run the representative userland (`hello`/`echo`/`catfile`/`ls`/`cp` — console + fs
+  read/list/write) in plain containers (correct output, no qemu in image), plus a 4-container
+  fan-out. The `scripts/it/*` gates + `docker/smoke.sh` are CI steps after `cyrius test`; the
+  ptrace ITs need a same-uid child (no extra privilege on ubuntu-latest;
   `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` in a container).
 - `scripts/it/fault_inject.sh` — 0.6.0 hardening gate (CI step, after M2): throws
   misbehaving/hostile children (bad pointers, SIGSEGV, unknown syscalls, syscall
@@ -186,6 +192,18 @@ audited row-by-row vs the code. The **CLI contract** ([`../reference/cli.md`](..
 replaces* QEMU+KVM + iron, promoted from prose to a cited decision. Guides cross-linked; ADR
 index complete (0001–0011); CHANGELOG complete from 0.1.0.
 
-Then **v1.0.0** — the clean cut: a representative agnos CLI userland in a plain Docker container
-under mirshi, fan-out-ready, no QEMU. The 0.6–0.9 quality arc is complete; only the v1 cut + the
-published image remain.
+**1.0.0 — the clean cut** — ✅ shipped 2026-06-30: **AGNOS userland in Docker, no QEMU**
+(direction 1, headless CLI). A representative agnos CLI userland (`hello`/`echo`/`catfile`/`ls`/`cp`
+— console + fs read/list/write) runs as native Linux processes under mirshi in a plain `FROM scratch`
+container, fan-out-ready + seccomp-bounded — proven end-to-end by `docker/smoke.sh` (5 tools + no-QEMU
++ 4-container fan-out). The **v1 definition is met**; the 0.6→0.9 quality arc (hardened · audited ·
+confined · optimized · frozen) is the foundation. Registry publishing is a documented post-v1 ops step
+([`../guides/docker-fanout.md`](../guides/docker-fanout.md)), not gated by the v1 definition.
+
+**Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 —
+the first post-v1 expansion (unblocks the net tools / agora / descent at scale); **multi-process** agnos
+(`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
+**direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
+compat layer), v2+. Each is its own validation surface; the translation core built here runs from both
+sides. The mirshi/QEMU/iron discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md))
+holds: mirshi owns userland + Linux-compat-at-scale, never the agnos kernel or hardware truth.

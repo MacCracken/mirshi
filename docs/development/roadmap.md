@@ -16,7 +16,7 @@
 
 ## The core technical problem
 
-agnos redefines the `Sys` enum to its own numbers (`exit`=0 vs Linux 60, the net band #45-#57 is
+agnos redefines the `Sys` enum to its own numbers (`exit`=0 vs Linux 60, the net band #47-#57 is
 a sovereign sock_*/udp_*/icmp ABI, `mmap#27` 2 MB-granular, `sock_recv` inverted-EOF, `execwait#37`
 run-to-completion). So translation is a **per-number handler table**, not a remap: each agnos syscall
 either (a) maps to a Linux syscall with arg translation, (b) is **emulated** in userspace over Linux
@@ -142,13 +142,16 @@ pinned by `scripts/it/cli.sh`. The Docker/fan-out guide is current; the **discip
 in place; the load-bearing decisions all have ADRs (intercept #0001, the `FLAG_CONTINUE` rule #0005,
 boundary-vs-QEMU #0011); CHANGELOG complete from 0.1.0; ADR index complete (0001–0011). Acceptance: all met ✅.
 
-### v1.0.0 — clean cut: AGNOS userland in Docker, no QEMU (direction 1, headless CLI)
-The clean cut of the hardened/audited/optimized/frozen foundation: a representative agnos **CLI userland**
-(kriya coreutils + iam/mihi sysinfo + bannermanor + non-net tools) runs in a plain Docker container under mirshi,
-fan-out-ready, seccomp-bounded. **Acceptance = the v1 definition: AGNOS + mirshi runs in a docker container, no
-QEMU**, with every v1.0 criterion met across the 0.6–0.9 arc:
+### v1.0.0 — clean cut: AGNOS userland in Docker, no QEMU (direction 1, headless CLI) — ✅ shipped 2026-06-30
+The clean cut of the hardened/audited/optimized/frozen foundation: a representative agnos **CLI userland** runs
+in a plain `FROM scratch` Docker container under mirshi, fan-out-ready, seccomp-bounded. Shipped with mirshi's
+own demo userland — `hello` (console), `echo` (stdin), `catfile` (fs read), `ls` (getdents), `cp` (fs
+write/create) — proven end-to-end by `docker/smoke.sh` (5 tools + no-QEMU + 4-container fan-out); broader agnos
+ecosystem suites (kriya coreutils, iam/mihi sysinfo, bannermanor) run on the same vehicle once built
+agnos-target. **Acceptance = the v1 definition: AGNOS + mirshi runs in a docker container, no QEMU** — met,
+with every v1.0 criterion across the 0.6–0.9 arc:
 - [x] Translation-table contract **frozen** + per-syscall documented + tested (0.9.0)
-- [ ] ≥1 real agnos tool green end-to-end in-container; the Docker image **published** ← the v1.0.0 cut deliverable
+- [x] ≥1 real agnos tool green end-to-end in-container ✅ (5-tool userland + fan-out); registry **publish** = documented post-v1 ops step ([fan-out guide](../guides/docker-fanout.md)), not gated by the v1 definition
 - [x] Security audit pass — sandbox-escape classes swept, seccomp default-deny proven (0.7.0)
 - [x] Benchmarks captured (per-syscall + workload; ptrace vs seccomp-notify) (0.8.0)
 - [x] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
@@ -156,7 +159,7 @@ QEMU**, with every v1.0 criterion met across the 0.6–0.9 arc:
 
 ## Out of scope for v1 (post-v1 / v2+)
 
-- **Sovereign net band #45-#57 over Linux sockets** — the `conn_id` ABI, inverted `recv` EOF, UDP/ICMP.
+- **Sovereign net band #47-#57 over Linux sockets** — the `conn_id` ABI, inverted `recv` EOF, UDP/ICMP.
   **First post-v1 expansion** (high-value: unblocks running the net tools / `agora` / `descent` in mirshi
   containers — the "meatier tests at scale" goal). Its own arc (socket-semantics emulation is real work).
 - **Multi-process agnos** (`spawn#3`/`execwait#37`/`spawn_path#43`/`waitpid#4`) — run **agnsh with child

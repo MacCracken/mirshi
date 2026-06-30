@@ -11,7 +11,7 @@
 #     agnos kernel. The permanent compat layer.
 #
 # Why it is not a number remap: agnos redefines the syscall numbers (exit=0 vs
-# Linux 60, the net band #45-#57 is a sovereign ABI, mmap#27 is 2 MB-granular,
+# Linux 60, the net band #47-#57 is a sovereign ABI, mmap#27 is 2 MB-granular,
 # execwait#37 run-to-completion). agnos bins are static (no libc) → no
 # LD_PRELOAD; interception must be supervisor-side.
 #

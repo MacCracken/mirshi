@@ -69,7 +69,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 42–44 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
-| 47 | sock_connect | ENOSYS | — | sovereign net band #45–57 — **first post-v1 expansion** |
+| 47 | sock_connect | ENOSYS | — | sovereign net band #47–57 (+ #61) — **first post-v1 expansion** |
 | 48 | sock_send | ENOSYS | — | net band — post-v1 |
 | 49 | sock_recv | ENOSYS | — | net band — post-v1 (inverted-EOF) |
 | 50 | sock_close | ENOSYS | — | net band — post-v1 |

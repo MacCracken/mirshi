@@ -64,6 +64,23 @@ gives you a heterogeneous agnos-userland test fleet with no emulation overhead.
 
 ## CI
 
-`docker/smoke.sh` is the CI gate: it builds the image, runs agnos tools, asserts
-correct output, **proves there is no qemu binary in the image**, and runs a small
-fan-out. It needs Docker + the ptrace recipe above.
+`docker/smoke.sh` is the CI gate: it builds the image, runs the representative agnos
+userland (`hello`/`echo`/`catfile`/`ls`/`cp` — console, stdin, fs read/list/write),
+asserts correct output, **proves there is no qemu binary in the image**, and runs a
+small fan-out. It needs Docker + the ptrace recipe above.
+
+## Publishing the image (post-v1 ops)
+
+The image is **reproducibly buildable** from this repo (`docker/build.sh` → a
+`FROM scratch` `agnos-mirshi`), which is what the v1 definition requires. Pushing it to
+a registry is an **operator step**, decoupled from the v1 cut (it needs registry
+credentials + a chosen name/tag — outward, environment-specific):
+
+```sh
+docker/build.sh ghcr.io/<you>/agnos-mirshi:1.0.0   # build + tag
+docker push        ghcr.io/<you>/agnos-mirshi:1.0.0   # operator runs this
+```
+
+Consumers then `docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+ghcr.io/<you>/agnos-mirshi:1.0.0 /bin/hello` (the ptrace recipe above), or fan it out
+across a CI matrix / cluster for a heterogeneous agnos-userland test fleet.

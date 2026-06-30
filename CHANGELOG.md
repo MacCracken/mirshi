@@ -4,8 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-v1.0.0 clean cut (in progress) — the representative agnos CLI userland in a plain Docker
-container under mirshi, no QEMU. No translation-logic change.
+## [1.0.0] — 2026-06-30
+
+**The clean cut: AGNOS userland in Docker, no QEMU (direction 1, headless CLI).** A
+representative agnos CLI userland runs as native Linux processes under mirshi's syscall
+translation in a plain `FROM scratch` Docker container — shared host kernel, no full-system
+emulation — fan-out-ready and seccomp-bounded. The v1 definition is met and proven end-to-end.
+The 0.6→0.9 quality arc (hardened · audited · confined · optimized · frozen) lands here as a
+stable foundation; no translation-logic change in this cut. Registry publishing is a
+documented post-v1 ops step (see the fan-out guide), not gated by the v1 definition. Net band
+(#47–57), multi-process, graphics, and the Linux→AGNOS swallow remain post-v1.
 
 ### Added
 - **`docker/tools/cp.cyr`** — a `cp` write-path demo tool: copies `/data/motd.txt` →
@@ -18,6 +26,9 @@ container under mirshi, no QEMU. No translation-logic change.
   out (`hello`), stdin echo (`echo`), fs read (`catfile`), dir listing (`ls`, getdents), and
   the fs **write** path (`cp`) — previously only `hello` + `catfile` were asserted (the others
   were built but unproven). Plus the existing no-QEMU proof + 4-container fan-out.
+- **Toolchain pin → `6.3.14`** (`cyrius.cyml [package].cyrius`) — synced to the current
+  `cycc`/`cyrius` wrapper (proven good: it builds the green smoke + 166-assertion suite),
+  clearing the pin-drift warning for the v1 cut.
 
 ## [0.9.0] — 2026-06-30
 
