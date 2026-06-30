@@ -125,6 +125,14 @@ jobs:
         # the M0/M1/M2 steps.
         run: bash scripts/it/confine.sh
 
+      - name: CLI contract (frozen surface + exit codes)
+        # 0.9.0 CLI freeze: pin the command-line contract (docs/reference/cli.md) —
+        # usage on misuse (no args / --root without a dir -> exit 2) and the
+        # EXECVE_FAILED exit code (127). Complements the mode-specific ITs (m0_trap =
+        # --selftest-trace, m1_run = exit propagation, confine = --root). Same ptrace
+        # requirements as the M0/M1/M2 steps (one assertion forks a child).
+        run: bash scripts/it/cli.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

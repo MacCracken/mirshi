@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+0.9.0 freeze + docs cleanup (in progress) — no behavior change; freeze the v1 contracts +
+consolidate the docs before the v1.0.0 cut.
+
+### Docs
+- **Frozen translation-table contract** — [`docs/reference/syscall-coverage.md`](docs/reference/syscall-coverage.md):
+  the canonical, exhaustive per-number (agnos 0–61) AGNOS→Linux matrix — disposition
+  (EXECUTE / EMULATE / EXIT / ENOSYS), the Linux peer, the `--root` re-anchored peers, the
+  arg/return notes, the runnable v1 surface, and the carried-forward gaps. Mirrors the code
+  and is **pinned by tests** (`tests/mirshi.tcyr` `xlat-coverage`: every number's disposition
+  asserted, +38 assertions → 161 total). Adversarially audited row-by-row against the code.
+- **Frozen CLI contract** — [`docs/reference/cli.md`](docs/reference/cli.md): the synopsis,
+  flags (`--selftest-trace` / `--no-seccomp` / `--root <dir>`), modes, streams, and the
+  exit-code map (child code / `128+sig` / `2` usage / `125` wait / `126` bound / `127` execve).
+  Pinned by `scripts/it/cli.sh` (usage on misuse + `EXECVE_FAILED`), wired into CI.
+- New `docs/reference/` section (frozen contracts); indexed in `CLAUDE.md`.
+
 ## [0.8.0] — 2026-06-30
 
 Optimizations — measure-first hot-path work. The per-syscall cost model is dominated by the
