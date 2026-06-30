@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-29
+
+M4 — seccomp-notify feasibility + benchmark baseline (the full migration reframed).
+
+### Added
+- **Benchmark baseline** — `scripts/bench/bench_syscall.sh` (mechanism-agnostic:
+  a `seccomp-notify` row slots in unchanged later) + `docs/benchmarks.md`. The
+  ptrace path measures **~30 µs per trapped+translated syscall** (~100× native on
+  a `getpid` storm, but only ~5× native on a realistic `cat` of a 4 MB file — the
+  per-syscall tax dominates only syscall-dense work). Wired as a non-gating CI step.
+- [ADR 0005](docs/adr/0005-seccomp-notify-feasibility.md) — the durable finding
+  that seccomp-notify **cannot renumber a syscall** (its response is
+  `{id,val,error,flags}`) and therefore cannot do `mmap`-in-child, so a *full*
+  replacement of the ptrace loop (M4-as-written) is impossible. The realistic M4
+  is a **hybrid** (notify for the emulatable hot path, ptrace for the
+  `mmap`/renumber residue) — documented and **deferred by data** (realistic
+  workloads are ~5× native, so the hybrid's complexity is not yet justified).
+  Also records the `FLAG_CONTINUE` TOCTOU rule (emulate every pointer/buffer
+  syscall from one supervisor-side copy; never read-decide-then-CONTINUE).
+
 ## [0.4.0] — 2026-06-29
 
 M3 — the Docker vehicle. agnos userland runs in a plain container, no QEMU.

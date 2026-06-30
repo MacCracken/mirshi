@@ -61,11 +61,16 @@ present), correct output/exit; N-container fan-out demonstrated (`docker/fanout.
 mechanism + the seccomp-after-ptrace finding: [`../adr/0004-docker-vehicle-bounding-seccomp.md`](../adr/0004-docker-vehicle-bounding-seccomp.md).
 The container mount namespace is also where M2's transparent path pass-through gets its rootfs boundary.
 
-### M4 — seccomp-user-notify migration (scale) (v0.5.0)
-Replace the ptrace trap loop with `SECCOMP_RET_USER_NOTIF`: read child memory via `process_vm_readv`,
-return results on the notify fd, `FLAG_CONTINUE` for pass-through numbers — the low-overhead path the
-fan-out-at-scale goal wants (gVisor-class). Acceptance: the M1–M3 suite passes under seccomp-notify with
-materially lower per-syscall overhead (`docs/benchmarks.md`).
+### M4 — seccomp-user-notify migration (scale) (v0.5.0) — ⚖ reframed (feasibility + benchmark shipped 2026-06-29; full hybrid deferred-by-data)
+**Finding:** a *full* replacement of the ptrace loop with `SECCOMP_RET_USER_NOTIF` is **architecturally
+impossible** — the kernel's `seccomp_notif_resp` (`{id,val,error,flags}`) cannot **renumber** a syscall, and
+`mmap` must execute in the child's address space (only ptrace's renumber can do that). See
+[`../adr/0005-seccomp-notify-feasibility.md`](../adr/0005-seccomp-notify-feasibility.md). The realistic M4 is a
+**hybrid** (notify for the emulatable hot path; ptrace `SECCOMP_RET_TRACE` for the `mmap`/renumber residue).
+**Shipped (v0.5.0):** the ptrace **benchmark baseline** (`docs/benchmarks.md`, `scripts/bench/`) + the
+feasibility ADR + the documented hybrid design. **Deferred by data:** the benchmark shows realistic workloads
+are ~5× native (only `getpid`-dense microbenchmarks are ~100×), so the dual-mechanism hybrid is **not yet
+justified** — build it when a real workload proves syscall-bound. `FLAG_CONTINUE` is the 0.7.0 TOCTOU 0-day class.
 
 > **Feature scope freezes here.** 0.1.0–0.5.0 above land the functional v1 surface (direction-1
 > headless CLI). 0.6.0–0.9.0 below are the **pure-quality closing arc** (the ecosystem's canonical

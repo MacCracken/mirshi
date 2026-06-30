@@ -82,3 +82,8 @@ jobs:
         # NO qemu in the image), and a multi-container fan-out. ubuntu-latest
         # ships Docker; the child runs under mirshi's bounding seccomp allowlist.
         run: bash docker/smoke.sh
+
+      - name: Syscall benchmark (informational, non-gating)
+        # Per-syscall translation overhead — reported, not gated (absolute µs
+        # drifts with the runner). A reduced N keeps CI fast; see docs/benchmarks.md.
+        run: N=20000 REPS=2 bash scripts/bench/bench_syscall.sh || true

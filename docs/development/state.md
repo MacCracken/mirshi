@@ -5,9 +5,9 @@
 
 ## Version
 
-**0.4.0** — 2026-06-29. M3 = the Docker vehicle (agnos userland in a plain container, no QEMU) +
-bounding seccomp. **Completes the functional v1 surface (M0–M3).** 0.3.0 = M2 fs; 0.2.0 = M1 core
-translation; 0.1.0 = M0 scaffold + trap loop.
+**0.5.0** — 2026-06-29. M4 = seccomp-notify feasibility + benchmark baseline (full migration reframed
+to a hybrid, deferred by data — [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)). 0.4.0 = M3 Docker
+vehicle (functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1 translation; 0.1.0 = M0 trap loop.
 
 ## Toolchain
 
@@ -87,11 +87,9 @@ swallow** layer. None wired yet (scaffold).
 
 ## Next
 
-See [`roadmap.md`](roadmap.md) — M0–M3 done (the functional v1 surface is in).
-Next is **M4** (v0.5.0): replace the ptrace trap loop with `SECCOMP_RET_USER_NOTIF`
-(read child memory via `process_vm_readv`, return results on the notify fd,
-`FLAG_CONTINUE` for pass-through numbers) — the low-overhead path for fan-out at
-scale, benchmarked against ptrace. ⚠ The documented `FLAG_CONTINUE` TOCTOU is the
-headline 0-day class (0.7.0): never `FLAG_CONTINUE` a security-relevant syscall.
-After M4, the **0.6.0–0.9.0 quality arc** (harden → security sweep → optimize →
-freeze + docs) closes v1.
+See [`roadmap.md`](roadmap.md) — M0–M3 (functional v1 surface) + M4 (seccomp-notify
+feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
+**0.6.0 hardening** (in progress) — supervisor robustness against a misbehaving/hostile
+child: bad pointers, syscall storms, child crash/hang/zombie reaping, partial
+`process_vm` transfers, host-resource bounds; a fault-injection harness. Then 0.7.0
+security sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
