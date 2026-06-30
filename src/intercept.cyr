@@ -47,10 +47,16 @@ enum MirshiPtrace {
     PTRACE_GETREGS = 12;
     PTRACE_SETREGS = 13;              # M1: write the rewritten/return regs back
     PTRACE_SYSEMU = 31;
+    PTRACE_GETSIGINFO = 0x4202;       # 0.6.0: probe a non-syscall stop — fails -EINVAL at a group-stop
     PTRACE_SETOPTIONS = 0x4200;
     PTRACE_O_TRACESYSGOOD = 0x1;      # syscall-stops report SIGTRAP|0x80
     PTRACE_O_EXITKILL = 0x100000;     # SIGKILL the child if the tracer dies
     SIG_KILL = 9;
+    SIGSTOP = 19;                     # the four stopping signals that yield a ptrace group-stop;
+    SIGTSTP = 20;                     # at a group-stop the supervisor suppresses them (resume with
+    SIGTTIN = 21;                     # no signal) instead of re-injecting a stop it never originated
+    SIGTTOU = 22;
+    SIGINFO_SIZE = 128;              # siginfo_t size on x86_64 (PTRACE_GETSIGINFO output buffer)
     SYSCALL_STOP_SIG = 0x85;          # SIGTRAP(5) | 0x80 — the TRACESYSGOOD marker
     EXECVE_FAILED = 127;
     WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
@@ -166,6 +172,32 @@ fn _attach(pid, status): i64 {
     return 0 - 1;
 }
 
+# True (1) iff a non-syscall signal stop is a ptrace GROUP-STOP — the child hit a
+# stopping signal (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) and the kernel stopped it —
+# rather than an ordinary signal-delivery stop. Only those four signals can produce
+# a group-stop, so PTRACE_GETSIGINFO is probed only for them: it FAILS with -EINVAL
+# at a group-stop and SUCCEEDS at a signal-delivery stop (ptrace(2), "Group-stop").
+# The trace loops use this to SUPPRESS a group-stop (resume with no signal, the
+# ptrace-correct restart of a group-stopped tracee) instead of re-injecting the stop
+# signal — re-injection delivers a stop the supervisor never originated. (Linux runs
+# the child either way, so this is protocol correctness / cross-kernel robustness,
+# not a fix for an observed wedge.) `si` is a caller-owned siginfo_t buffer
+# (SIGINFO_SIZE). See docs/adr/0007.
+fn _is_group_stop(pid, sig, si): i64 {
+    var stopping = 0;
+    if (sig == SIGSTOP) { stopping = 1; }
+    if (sig == SIGTSTP) { stopping = 1; }
+    if (sig == SIGTTIN) { stopping = 1; }
+    if (sig == SIGTTOU) { stopping = 1; }
+    if (stopping == 0) { return 0; }                            # not a stopping signal -> delivery stop
+    # PTRACE_GETSIGINFO returns 0 at a signal-delivery stop and FAILS with exactly
+    # -EINVAL at a group-stop. Test for -EINVAL precisely (not any < 0): a different
+    # error — e.g. -ESRCH if the child raced to exit — is NOT a group-stop, so fall
+    # through and let it be forwarded / reaped by the next wait.
+    if (pt(PTRACE_GETSIGINFO, pid, 0, si) == 0 - 22) { return 1; }   # -EINVAL -> group-stop
+    return 0;
+}
+
 # M0 trap-log mode (--selftest-trace). PTRACE_SYSEMU traps every syscall at entry
 # — ONE stop per call, kernel executes NOTHING — logs the bare agnos event line,
 # and tears the child down on agnos exit#0. Translates nothing. See docs/adr/0001.
@@ -173,6 +205,7 @@ fn _trace_log(pid): i64 {
     var regs = alloc(USER_REGS_SIZE);
     var status = alloc(8);
     var line = alloc(256);
+    var siginfo = alloc(SIGINFO_SIZE);   # group-stop discrimination buffer (PTRACE_GETSIGINFO)
 
     var a = _attach(pid, status);
     if (a >= 0) { return a; }
@@ -203,9 +236,14 @@ fn _trace_log(pid): i64 {
                     return ecode;
                 }
             } else {
-                # Real signal-delivery stop: forward it. (Group-stop inject-0
-                # discrimination is M1+ robustness; the trace fixture never trips it.)
-                pending_sig = sig;
+                # Non-syscall signal stop. For a group-stop (the child hit a stopping
+                # signal) the ptrace-correct restart carries NO signal, so SUPPRESS it
+                # (pending_sig stays 0 -> the top-of-loop resume passes data=0 and the
+                # child continues) rather than re-injecting a stop the supervisor never
+                # originated. A genuine signal-delivery stop is forwarded as before.
+                # See _is_group_stop / docs/adr/0007.
+                if (_is_group_stop(pid, sig, siginfo) == 1) { pending_sig = 0; }
+                else { pending_sig = sig; }
             }
         }
     }
@@ -222,6 +260,7 @@ fn _trace_log(pid): i64 {
 fn _trace_run(pid): i64 {
     var regs = alloc(USER_REGS_SIZE);
     var status = alloc(8);
+    var siginfo = alloc(SIGINFO_SIZE);   # group-stop discrimination buffer (PTRACE_GETSIGINFO)
 
     var a = _attach(pid, status);
     if (a >= 0) { return a; }
@@ -265,12 +304,14 @@ fn _trace_run(pid): i64 {
                     at_entry = 1;
                 }
             } else {
-                # Real signal-delivery stop: forward it; the enter/exit phase is
-                # unchanged (a signal stop is not a syscall boundary). NOTE (M1+
-                # robustness, same as _trace_log): a stopping-signal group-stop
-                # needs inject-0 / PTRACE_LISTEN, not blind re-injection — the M1
-                # fixtures never trigger one, so the discriminator is deferred.
-                pending_sig = sig;
+                # Non-syscall signal stop; the enter/exit phase is unchanged (a signal
+                # stop is not a syscall boundary). For a group-stop (the child hit a
+                # stopping signal) the ptrace-correct restart carries NO signal, so
+                # SUPPRESS it (pending_sig stays 0 -> resume with data=0) rather than
+                # re-injecting a stop the supervisor never originated. A genuine
+                # signal-delivery stop is forwarded. See _is_group_stop / docs/adr/0007.
+                if (_is_group_stop(pid, sig, siginfo) == 1) { pending_sig = 0; }
+                else { pending_sig = sig; }
             }
         }
     }

@@ -25,3 +25,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0004 — The Docker vehicle (FROM scratch) + child bounding seccomp](0004-docker-vehicle-bounding-seccomp.md) — *Accepted*
 - [0005 — seccomp-notify cannot replace the ptrace renumber loop; M4 is a hybrid](0005-seccomp-notify-feasibility.md) — *Accepted*
 - [0006 — Host-resource bounds via kernel-enforced child rlimits](0006-host-resource-bounds-child-rlimits.md) — *Accepted*
+- [0007 — Group-stop signal handling: discriminate and suppress, don't re-inject](0007-group-stop-signal-handling.md) — *Accepted*

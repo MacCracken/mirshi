@@ -89,6 +89,15 @@ jobs:
         # failure.
         run: bash scripts/it/fault_inject.sh
 
+      - name: Group-stop signal handling
+        # 0.6.0 hardening (supervisor signal handling): an external SIGSTOP to the
+        # agnos child surfaces as a ptrace group-stop; mirshi must discriminate it
+        # (PTRACE_GETSIGINFO) and resume the child (no signal) so it runs to completion
+        # and the supervisor never dies with the child stuck. Same ptrace requirements
+        # as the M0/M1/M2 steps; kept separate (it drives an async external signal with
+        # timing) so a regression is diagnosable.
+        run: bash scripts/it/groupstop.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

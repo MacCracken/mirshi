@@ -70,6 +70,9 @@ paths in the child red zone + repack output structs at the exit stop
   misbehaving/hostile children (bad pointers, SIGSEGV, unknown syscalls, syscall
   storm, spawn fork-bomb, and `mmap#27` / `open#7` resource-exhaustion storms) and
   asserts the supervisor stays stable + the host is untouched (9 cases).
+- `scripts/it/groupstop.sh` — 0.6.0 hardening gate (CI step, after fault_inject): an
+  external `SIGSTOP` to the agnos child (a ptrace group-stop) must leave the child
+  runnable — mirshi resumes it and it runs to completion, no hang.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -101,10 +104,15 @@ feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
   — kernel-enforced child rlimits cap the `mmap#27` / `open#7` exhaustion vectors;
   PID vector already closed by the seccomp allowlist. Verified firing on an unlimited
   host (mmap storm bounds at ~1 GiB, open storm at 253 fds).
-- **Fault-injection harness** wired into CI as the hardening gate (9 cases).
+- **Fault-injection harness** wired into CI as the hardening gate (9 cases), with the
+  zombie check rewritten to find mirshi's grandchild agnos zombies (not `--ppid $$`).
+- **Group-stop signal handling** ([ADR 0007](../adr/0007-group-stop-signal-handling.md))
+  — both trace loops discriminate a ptrace group-stop via `PTRACE_GETSIGINFO` and
+  suppress it (resume with no signal) instead of blindly re-injecting the stop.
+  Correctness/robustness, not a hang fix (verified: on Linux the child completes
+  either way). Regression gate `scripts/it/groupstop.sh`.
 
-Remaining for 0.6.0: **group-stop signal handling** (the trace loops still
-blind-re-inject any non-syscall signal — a `SIGSTOP`/`SIGTSTP` group-stop must be
-discriminated via `PTRACE_GETSIGINFO` and never re-injected, the code's own deferred
-TODO); **child hang reaping** (no internal watchdog); then the version bump to 0.6.0.
-Then 0.7.0 security sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
+Remaining for 0.6.0: **child hang reaping** (no internal watchdog for a child that
+blocks indefinitely) — to be scoped/validated (like group-stop, confirm a real
+failure mode before building); then the version bump to 0.6.0. Then 0.7.0 security
+sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.

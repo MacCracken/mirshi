@@ -22,6 +22,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`mmap#27` storm) and an fd-exhaustion (`open#7` storm) case to the existing
   bad-pointer / SIGSEGV / unknown-syscall / syscall-storm / spawn cases; all assert
   the supervisor stays stable and the host is untouched.
+- **Group-stop signal handling** (`src/intercept.cyr`): both trace loops now
+  discriminate a ptrace **group-stop** (a stopping signal — `SIGSTOP`/`SIGTSTP`/
+  `SIGTTIN`/`SIGTTOU`) via `PTRACE_GETSIGINFO` and **suppress** it (resume the child
+  with no signal) instead of blindly re-injecting the stop — the ptrace-correct
+  restart of a group-stopped tracee. Genuine signal-delivery stops are still
+  forwarded. This is protocol-correctness + cross-kernel robustness, not a fix for an
+  observed hang: on Linux the child runs whether the stop is suppressed or
+  re-injected. New regression gate `scripts/it/groupstop.sh` (external `SIGSTOP` →
+  child must run to completion, mirshi must not die with it stuck).
+  [ADR 0007](docs/adr/0007-group-stop-signal-handling.md).
+
+### Changed
+- **Fault-harness zombie check** (`scripts/it/fault_inject.sh`): scans all defunct
+  processes by fixture command name (anchored) instead of `--ppid $$`, which could
+  never see mirshi's agnos child — a *grandchild* of the harness reparented to PID 1
+  if orphaned.
 
 ## [0.5.0] — 2026-06-29
 
