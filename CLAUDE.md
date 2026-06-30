@@ -65,6 +65,7 @@ cyrius test                          # run [build].test + tests/*.tcyr
 
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records (*why X over Y?*)
 - [`docs/architecture/`](docs/architecture/) — Non-obvious constraints (*what's true about the code?*)
+- [`docs/reference/`](docs/reference/) — Frozen contracts (the syscall-coverage matrix, the CLI)
 - [`docs/guides/`](docs/guides/) — Task-oriented how-tos
 - [`docs/examples/`](docs/examples/) — Runnable examples
 - [`docs/development/state.md`](docs/development/state.md) — Live state snapshot

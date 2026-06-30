@@ -1,0 +1,117 @@
+# mirshi — syscall coverage matrix (the frozen translation contract)
+
+> **Frozen at v0.9.0.** This is the canonical, per-number contract for direction 1
+> (AGNOS→Linux): every agnos syscall is either **mapped** to a Linux peer (executed in
+> the child), **emulated** in the supervisor, rewritten as the special **exit**, or
+> returns **ENOSYS**. The source of truth is the code (`src/translate.cyr` +
+> `src/dispatch.cyr` + `src/decode.cyr`); this table mirrors it and is **pinned by
+> tests** (`tests/mirshi.tcyr`: `xlat-nr`, `fs-nr`, `xlat-coverage` assert
+> `agnos_to_linux_nr` for every number 0–61 + boundaries). Changing a row is a
+> deliberate contract change — update the code, this doc, **and** the freeze test together.
+
+## Dispositions
+
+| code | meaning |
+|---|---|
+| **EXECUTE** | renumber `orig_rax` to the Linux peer (+ arg synth / path staging) and run it **in the child** (execute-in-child, [ADR 0002](../adr/0002-execute-in-child-translation.md)); the exit stop maps the return. |
+| **EMULATE** | skip the kernel syscall (`orig_rax = -1`) and inject a supervisor-computed return; no Linux peer. |
+| **EXIT** | agnos `exit#0` is rewritten to Linux `exit_group(231)`; the child terminates, `waitpid` carries the status out (no exit stop). |
+| **ENOSYS** | out of the v1 surface — skip the foreign call and inject the agnos error sentinel `-1` + a logged diagnostic; never run a wrong Linux syscall. |
+
+agnos uses the x86_64 kernel register ABI (a1..a6 = `rdi/rsi/rdx/r10/r8/r9`; **a4 = r10**,
+not `rcx`). The agnos error convention is a **bare `-1`** for most calls (mmap#27 and
+time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
+([`linux_ret_to_agnos`](../src/translate.cyr)).
+
+## Matrix (agnos# 0–61)
+
+| # | name | disp. | Linux peer | notes |
+|--:|------|:-----:|-----------:|-------|
+| 0 | exit | EXIT | `exit_group` (231) | code in a1; terminates, no exit stop |
+| 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
+| 2 | getpid | EXECUTE | `getpid` (39) | number differs |
+| 3 | spawn | ENOSYS | — | multi-process — post-v1 |
+| 4 | waitpid | ENOSYS | — | multi-process — post-v1 |
+| 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
+| 6 | close | EXECUTE | `close` (3) | |
+| 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../src/translate.cyr)); mode 0600 on `O_CREAT` |
+| 8 | dup | EXECUTE | `dup` (32) | |
+| 9 | mkdir | EXECUTE | `mkdir` (83) ¹ | path staged; mode 0700 |
+| 10 | rmdir | EXECUTE | `rmdir` (84) ¹ | path staged |
+| 11 | mount | ENOSYS | — | stub |
+| 12 | sync | EXECUTE | `sync` (162) | |
+| 13 | reboot | ENOSYS | — | |
+| 14 | pause | ENOSYS | — | signals — post-v1 |
+| 15 | getuid | ENOSYS | — | |
+| 16 | kill | ENOSYS | — | signals — post-v1 |
+| 17 | sigprocmask | ENOSYS | — | signals — post-v1 |
+| 18 | signalfd | ENOSYS | — | signals — post-v1 |
+| 19 | epoll_create | ENOSYS | — | epoll — post-v1 |
+| 20 | epoll_ctl | ENOSYS | — | epoll — post-v1 |
+| 21 | epoll_wait | ENOSYS | — | epoll — post-v1 |
+| 22 | timerfd_create | ENOSYS | — | post-v1 |
+| 23 | timerfd_settime | ENOSYS | — | post-v1 |
+| 24 | umount | ENOSYS | — | stub |
+| 25 | pipe | ENOSYS | — | post-v1 |
+| 26 | write_boot_checkpoint | ENOSYS | — | agnos-kernel-only |
+| 27 | mmap | EXECUTE | `mmap` (9) | a1=length → 6-arg synth: anon/private, `PROT_READ\|WRITE`, fd=-1, 2 MB round-up; fail→`0` |
+| 28 | munmap | EXECUTE | `munmap` (11) | length 2 MB round-up (matches mmap granularity) |
+| 29 | getdents | EXECUTE | `getdents64` (217) | one-page scratch staged; Linux→agnos dirent repack at exit (cap 4096) |
+| 30 | unlink | EXECUTE | `unlink` (87) ¹ | path staged |
+| 31 | rename | EXECUTE | `rename` (82) ¹ | two paths staged; a4=r10 |
+| 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; **HARDLINK** (agnos has no symlink syscall) |
+| 33 | stat | EXECUTE | `stat` (4) ¹ | path staged; Linux 144 B → agnos 48 B repack at exit |
+| 34 | uname | ENOSYS | — | |
+| 35 | sysinfo | ENOSYS | — | |
+| 36–39 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
+| 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
+| 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
+| 42–44 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
+| 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
+| 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
+| 47 | sock_connect | ENOSYS | — | sovereign net band #45–57 — **first post-v1 expansion** |
+| 48 | sock_send | ENOSYS | — | net band — post-v1 |
+| 49 | sock_recv | ENOSYS | — | net band — post-v1 (inverted-EOF) |
+| 50 | sock_close | ENOSYS | — | net band — post-v1 |
+| 51 | udp_bind | ENOSYS | — | net band — post-v1 |
+| 52 | udp_send | ENOSYS | — | net band — post-v1 |
+| 53 | udp_recv | ENOSYS | — | net band — post-v1 |
+| 54 | udp_unbind | ENOSYS | — | net band — post-v1 |
+| 55 | icmp_echo | ENOSYS | — | net band — post-v1 |
+| 56 | sock_listen | ENOSYS | — | net band — post-v1 |
+| 57 | sock_accept | ENOSYS | — | net band — post-v1 |
+| 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
+| 59 | flock | ENOSYS | — | |
+| 60 | winsize | ENOSYS | — | graphics — post-v1 |
+| 61 | net_config | ENOSYS | — | net band — post-v1 |
+
+Any number > 61 (and the undefined gaps) → **ENOSYS**.
+
+¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) the
+filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLVE_IN_ROOT`),
+`mkdir`→`mkdirat` (258), `rmdir`→`unlinkat` (263, `AT_REMOVEDIR`), `unlink`→`unlinkat` (263),
+`rename`→`renameat2` (316), `link`→`linkat` (265), `stat`→`newfstatat` (262), with the path
+lexically sanitized (`sanitize_rootrel`). The fd-based ops (`read`/`write`/`lseek`/`dup`/
+`close`/`getdents`) ride a fd from a confined `open`, so they are transitively confined.
+Without `--root`, the peers in the table above apply (transparent pass-through).
+
+## The runnable surface (v1)
+
+- **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
+  `sync#12`, `getrandom#45`, `time_unix#46`, `uptime_ms#40`, `sleep_ms#41`.
+- **M2 — filesystem**: `open#7`, `close#6`, `lseek#58`, `dup#8`, `mkdir#9`, `rmdir#10`,
+  `unlink#30`, `rename#31`, `link#32`, `stat#33`, `getdents#29`.
+
+Everything else is **ENOSYS** by design for v1 — the net band (#47–57, #61), multi-process
+(#3/#4), signals (#14, #16–18), epoll/timerfd/pipe (#19–25), and graphics (#60) are post-v1
+(see [roadmap "Out of scope"](../development/roadmap.md)).
+
+## Known gaps (carried forward, documented not fixed)
+
+- **`getdents#29`**: records overflowing the agnos buffer are **dropped** (the agnos call
+  re-reads from the saved fd offset on the next call); `d_ino` u64 is **truncated to u32**
+  in the agnos dirent. Bounded to a 4096-byte scratch page per call.
+- **`link#32`**: hardlink only — agnos has **no symlink syscall**, so mirshi follows that
+  surface (mirrors the ark-v2 finding).
+- **`stat#33`**: the agnos 48 B struct carries mode/nlink/size/ino/blocks/mtime; sub-second
+  mtime nsec is dropped (agnos has no nsec field).

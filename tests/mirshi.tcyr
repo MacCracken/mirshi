@@ -140,6 +140,53 @@ fn main() {
     assert_eq(agnos_to_linux_nr(30), 87, "unlink 30->87");
     assert_eq(agnos_to_linux_nr(29), 217, "getdents 29->217");
 
+    # --- FROZEN CONTRACT (0.9.0): exhaustive disposition of every agnos# 0-61. The
+    #     mapped (EXECUTE) numbers are pinned above (xlat-nr + fs-nr); here every
+    #     remaining number is pinned to -1 ("no direct peer"), which is what
+    #     agnos_to_linux_nr returns for exit#0 (EXIT, special-cased to exit_group),
+    #     the emulated timers #40/#41 (EMULATE), and the whole out-of-surface set
+    #     (ENOSYS). Adding a mapping is then a DELIBERATE contract change that must
+    #     update this freeze + docs/reference/syscall-coverage.md.
+    test_group("xlat-coverage");
+    assert_eq(agnos_to_linux_nr(0), 0 - 1, "exit#0 -> no peer (EXIT: exit_group, special)");
+    assert_eq(agnos_to_linux_nr(3), 0 - 1, "spawn#3 -> ENOSYS (multi-proc)");
+    assert_eq(agnos_to_linux_nr(4), 0 - 1, "waitpid#4 -> ENOSYS (multi-proc)");
+    assert_eq(agnos_to_linux_nr(11), 0 - 1, "mount#11 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(13), 0 - 1, "reboot#13 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(14), 0 - 1, "pause#14 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(15), 0 - 1, "getuid#15 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(16), 0 - 1, "kill#16 -> ENOSYS (signals)");
+    assert_eq(agnos_to_linux_nr(17), 0 - 1, "sigprocmask#17 -> ENOSYS (signals)");
+    assert_eq(agnos_to_linux_nr(18), 0 - 1, "signalfd#18 -> ENOSYS (signals)");
+    assert_eq(agnos_to_linux_nr(19), 0 - 1, "epoll_create#19 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(20), 0 - 1, "epoll_ctl#20 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(21), 0 - 1, "epoll_wait#21 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(22), 0 - 1, "timerfd_create#22 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(23), 0 - 1, "timerfd_settime#23 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(24), 0 - 1, "umount#24 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(25), 0 - 1, "pipe#25 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(26), 0 - 1, "write_boot_checkpoint#26 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(35), 0 - 1, "sysinfo#35 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(37), 0 - 1, "undefined#37 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(43), 0 - 1, "undefined#43 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(47), 0 - 1, "sock_connect#47 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(48), 0 - 1, "sock_send#48 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(49), 0 - 1, "sock_recv#49 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(50), 0 - 1, "sock_close#50 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(51), 0 - 1, "udp_bind#51 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(52), 0 - 1, "udp_send#52 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(53), 0 - 1, "udp_recv#53 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(54), 0 - 1, "udp_unbind#54 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(55), 0 - 1, "icmp_echo#55 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(56), 0 - 1, "sock_listen#56 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(57), 0 - 1, "sock_accept#57 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(59), 0 - 1, "flock#59 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(60), 0 - 1, "winsize#60 -> ENOSYS (graphics)");
+    assert_eq(agnos_to_linux_nr(61), 0 - 1, "net_config#61 -> ENOSYS (net band)");
+    assert_eq(agnos_to_linux_nr(62), 0 - 1, "out-of-range#62 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
+
     test_group("fs-ao-to-o");
     assert_eq(ao_to_o(0), 0, "RDONLY 0->0");
     assert_eq(ao_to_o(1), 1, "WRONLY 1->1");
