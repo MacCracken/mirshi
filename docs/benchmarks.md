@@ -33,14 +33,24 @@ uses `PTRACE_SYSCALL`, which stops the child **twice per syscall** (enter + exit
 Each translated call pays, roughly:
 
 - **2 ptrace stops** = 2 supervisor↔child context-switch round-trips (`waitpid`
-  wakes the supervisor; `PTRACE_SYSCALL` resumes the child) — the dominant cost.
-- **2× `PTRACE_GETREGS` + 1× `PTRACE_SETREGS`** (enter rewrite + exit return-map),
-  each copying the 216-byte register set across the process boundary.
+  wakes the supervisor; `PTRACE_SYSCALL` resumes the child) — the dominant cost,
+  and **irreducible under ptrace** (only seccomp-notify removes a stop).
+- **Register I/O.** The **enter** rewrite needs the full register set —
+  `PTRACE_GETREGS` reads `nr` + args, `PTRACE_SETREGS` writes the renumbered
+  `orig_rax` + synthesized args (up to 5–6 registers) — each a 216-byte
+  cross-process copy. The **exit** stop, since **0.8.0**
+  ([ADR 0010](adr/0010-ptrace-exit-stop-single-register-io.md)), does
+  **single-register I/O**: `PTRACE_PEEKUSER` reads only `rax` (8 bytes) and
+  `PTRACE_POKEUSER` writes it back only when the agnos return differs (success
+  pass-through ⇒ no write-back at all), replacing the old exit `GETREGS` +
+  unconditional `SETREGS` (two 216-byte copies).
 
 The translation *arithmetic* itself (`src/translate.cyr`: number remap, return
 mapping, mmap synth) is single-digit nanoseconds — the ~30 µs is **kernel
 crossings, not the handler table**. So the lever is the *number of crossings per
-syscall*, which is what M4 targets.
+syscall*. 0.8.0 trims the exit-stop register copies (~5–7 % off the syscall-dense
+tax, byte-identical) — near the **ptrace ceiling**; the *stop count* is what only
+seccomp-notify (M4, deferred-by-data) can cut.
 
 ## The seccomp-notify projection (M4 — pending)
 
@@ -77,3 +87,15 @@ CI runs the harness **non-gating** (absolute µs drifts with the runner); the
 - **2026-06-29 — ptrace baseline (v0.4.0).** getpid ~30.5 µs/call (~100× native),
   getrandom ~30.5 µs/call (~63×), cat-4MB ~5× native. The per-syscall floor that
   M4 (seccomp-notify hybrid) and 0.8.0 (optimization) work against.
+- **2026-06-30 — 0.8.0 exit-stop single-register I/O ([ADR 0010](adr/0010-ptrace-exit-stop-single-register-io.md)).**
+  A/B vs the 0.7.1 HEAD binary, same fixtures (N=150k, min-of-5/9): getpid storm
+  **−5.4 to −6.6 %** (~30.7 → ~28.9 µs/call), getrandom storm **−6.9 %**
+  (~31.3 → ~29.1 µs/call), `cat` unchanged within noise (already buffer-amortized).
+  Byte-identical (123 unit + `m1_run`/`m2_fs`/`confine` ITs green). This is
+  register-I/O trimming **within** the two stops — near the ptrace ceiling; the
+  stop count itself only seccomp-notify can cut, and that stays deferred-by-data
+  (realistic workloads aren't syscall-bound). **ptrace remains the documented
+  default** (the roadmap's "seccomp-notify default" line is superseded by
+  [ADR 0005](adr/0005-seccomp-notify-feasibility.md)). No fully-transparent
+  pass-through fast-path exists in direction 1 (no agnos call shares Linux's
+  number **and** return convention — even `write#1` needs `-errno`→`-1`).

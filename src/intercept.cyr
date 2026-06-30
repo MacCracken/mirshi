@@ -45,7 +45,9 @@ enum MirshiPtrace {
     PTRACE_CONT = 7;
     PTRACE_SYSCALL = 24;              # resume + EXECUTE one (rewritten) call, stop at exit
     PTRACE_GETREGS = 12;
-    PTRACE_SETREGS = 13;              # M1: write the rewritten/return regs back
+    PTRACE_SETREGS = 13;              # M1: write the rewritten args back at the ENTER stop
+    PTRACE_PEEKUSER = 3;              # 0.8.0: read ONE user-area word (exit stop needs only rax)
+    PTRACE_POKEUSER = 6;              # 0.8.0: write ONE user-area word (exit stop writes only rax)
     PTRACE_SYSEMU = 31;
     PTRACE_GETSIGINFO = 0x4202;       # 0.6.0: probe a non-syscall stop — fails -EINVAL at a group-stop
     PTRACE_SETOPTIONS = 0x4200;
@@ -295,6 +297,7 @@ fn _trace_run(pid): i64 {
     var regs = alloc(USER_REGS_SIZE);
     var status = alloc(8);
     var siginfo = alloc(SIGINFO_SIZE);   # group-stop discrimination buffer (PTRACE_GETSIGINFO)
+    var raxbuf = alloc(8);               # 0.8.0: 1-word PTRACE_PEEKUSER target (exit reads only rax)
 
     var a = _attach(pid, status);
     if (a >= 0) { return a; }
@@ -321,20 +324,37 @@ fn _trace_run(pid): i64 {
                     strat = translate_dispatch(pid, regs);
                     at_entry = 0;
                 } else {
-                    # Syscall-EXIT: write the agnos-convention return into rax.
-                    pt(PTRACE_GETREGS, pid, 0, regs);
+                    # Syscall-EXIT (0.8.0 hot-path opt; docs/benchmarks.md). The exit stop
+                    # needs exactly ONE register: rax (the raw kernel return). So read just
+                    # that word with PTRACE_PEEKUSER (8 bytes) instead of GETREGS (the full
+                    # 216-byte register set), map it to the agnos convention, and write it
+                    # back with PTRACE_POKEUSER (8 bytes) ONLY if it actually CHANGED. The
+                    # syscall-dense SUCCESS path then costs one 8-byte peek and NO write-back
+                    # at all — getpid/read/write/lseek/mmap/getrandom return values pass
+                    # through unchanged, and stat success stays 0 with its output already
+                    # repacked into child memory by fs_exit_return — vs the old GETREGS +
+                    # unconditional SETREGS, two 216-byte cross-process copies. Byte-identical:
+                    # at a syscall-exit the supervisor only ever wrote rax (rcx/r11 are kernel-
+                    # restored, every other GP reg is child-preserved), so touching exactly
+                    # rax, only when it differs, leaves the child resuming with precisely the
+                    # rax the unconditional path would have set. Only ERROR returns (-errno ->
+                    # -1, mmap/time -> 0), the getdents repack count, and the EMULATE/ENOSYS
+                    # injection (raw rax is -ENOSYS there) differ -> POKEUSER fires.
+                    # (PEEKUSER's raw ABI writes the word to the data pointer and returns
+                    # 0/-errno; POKEUSER takes the value in data. REG_RAX=80 is the offset
+                    # into struct user too — user_regs_struct is its leading member.)
+                    pt(PTRACE_PEEKUSER, pid, REG_RAX, raxbuf);
+                    var raw = load64(raxbuf);
+                    var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
                     if (strat == STRAT_EXECUTE) {
-                        # fs_exit_return maps the Linux return AND, for stat/getdents,
-                        # repacks the Linux output struct into the agnos layout in the
-                        # child's saved output buffer. Other calls map only the return.
-                        store64(regs + REG_RAX,
-                                fs_exit_return(pid, agnos_nr, load64(regs + REG_RAX)));
-                    } else {
-                        # EMULATE / ENOSYS: the syscall was skipped (rax=-ENOSYS);
-                        # inject the supervisor-computed return.
-                        store64(regs + REG_RAX, _xlat_emu_ret);
+                        # fs_exit_return maps the return AND, for stat/getdents, repacks the
+                        # Linux output struct into the child's saved buffer — a child-MEMORY
+                        # write, independent of the rax write-back conditionally done below.
+                        agret = fs_exit_return(pid, agnos_nr, raw);
                     }
-                    pt(PTRACE_SETREGS, pid, 0, regs);
+                    if (agret != raw) {
+                        pt(PTRACE_POKEUSER, pid, REG_RAX, agret);
+                    }
                     at_entry = 1;
                 }
             } else {

@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+0.8.0 optimizations (in progress) — measure-first hot-path work. The per-syscall cost model
+is dominated by the two `PTRACE_SYSCALL` stops (irreducible under ptrace); the available
+byte-identical lever is trimming the register I/O within those stops.
+
+### Performance
+- **Exit-stop single-register I/O** ([ADR 0010](docs/adr/0010-ptrace-exit-stop-single-register-io.md)):
+  the `PTRACE_SYSCALL` exit stop now reads only `rax` via `PTRACE_PEEKUSER` (8 bytes) and
+  writes it back via `PTRACE_POKEUSER` **only when the agnos return differs** from the raw
+  kernel return — replacing the old `GETREGS` + unconditional `SETREGS` (two 216-byte
+  register copies). The syscall-dense success path costs one 8-byte peek and no write-back at
+  all (getpid/read/write/lseek/mmap/getrandom returns pass through unchanged; `stat` success
+  stays 0 with its output already repacked into child memory). **Byte-identical** to 0.7.1
+  (at a syscall-exit the supervisor only ever wrote `rax`); A/B vs HEAD measured ~5–7 % off
+  the per-syscall tax on syscall-dense workloads (getpid −5.4…6.6 %, getrandom −6.9 %),
+  negligible on buffer-heavy ones. The enter stop stays full-register (it rewrites
+  `orig_rax` + 5–6 arg registers). See [docs/benchmarks.md](docs/benchmarks.md).
+
+### Changed
+- **Toolchain pin → `6.3.12`** (`cyrius.cyml [package].cyrius`, the source of truth) — synced
+  to the current `cycc`/`cyrius` wrapper, clearing the pin-drift build warning.
+
 ## [0.7.1] — 2026-06-30
 
 Supervisor rootfs confinement — the path-escape blocker fix (audit class-(c)), bites
