@@ -4,7 +4,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-0.6.0 — Hardening (in progress): the supervisor against a misbehaving / hostile child.
+## [0.6.0] — 2026-06-30
+
+Hardening: the supervisor against a misbehaving / hostile child. Supervisor stable +
+host untouched across the fault-injection harness; host-resource bounds enforced;
+signal handling and child-hang robustness closed.
 
 ### Added
 - **Host-resource bounds** (`src/limits.cyr`): kernel-enforced rlimits set on the
@@ -32,6 +36,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-injected. New regression gate `scripts/it/groupstop.sh` (external `SIGSTOP` →
   child must run to completion, mirshi must not die with it stuck).
   [ADR 0007](docs/adr/0007-group-stop-signal-handling.md).
+- **Child-hang robustness** ([ADR 0008](docs/adr/0008-child-hang-supervisor-robustness.md)):
+  a hung child (blocked or spinning) was scoped empirically and found **handled by
+  design** — correct block-mirroring, `PTRACE_O_EXITKILL` reaping the child on any
+  supervisor death (no orphan/zombie, verified even in the `fork`→attach window), and
+  no deadlock; **no internal watchdog** is added (it would wrongly kill a legitimately
+  long-running tool). The scoping surfaced one real gap, now fixed: the dispatcher
+  `alloc()`d a 16-byte timespec **per call** for the emulated timers `uptime_ms#40` /
+  `sleep_ms#41`, so a child looping one grew mirshi's heap unbounded (a child-driven
+  supervisor-OOM) — hoisted to a one-time static buffer (`_emu_ts_buf`), RSS now flat
+  under the storm. New regression gate `scripts/it/supervisor_hardening.sh`
+  (heap-bound under an emulate-timer storm + no-orphan/zombie on terminate-mid-hang).
 
 ### Changed
 - **Fault-harness zombie check** (`scripts/it/fault_inject.sh`): scans all defunct

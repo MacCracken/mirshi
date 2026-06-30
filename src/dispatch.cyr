@@ -44,6 +44,19 @@ var _m2_out_ptr = 0;    # the agnos output pointer the child gave us (stat/getde
 var _m2_out_cap = 0;    # the agnos output capacity (getdents bufsize)
 var _m2_scratch = 0;    # the red-zone scratch the Linux output struct was written into
 
+# A 16-byte timespec scratch for the supervisor-emulated timers (uptime_ms#40 /
+# sleep_ms#41), allocated ONCE (lazily) — never per call. The bump allocator never
+# frees, so a per-call alloc here let a child that loops an emulated timer grow the
+# supervisor's heap without bound (a child-driven supervisor-OOM DoS, 0.6.0 hardening
+# — see docs/adr/0008). Single in-flight call per child + strict enter/exit
+# alternation make one shared slot safe (same discipline as _xlat_emu_ret); each call
+# overwrites both fields before use.
+var _emu_ts = 0;
+fn _emu_ts_buf(): i64 {
+    if (_emu_ts == 0) { _emu_ts = alloc(16); }
+    return _emu_ts;
+}
+
 # Fail a translated fs call without running it: skip the syscall (orig_rax=-1)
 # and inject the agnos error sentinel -1. Used when path staging short-fails.
 fn _m2_fail(pid, regs): i64 {
@@ -135,7 +148,7 @@ fn translate_dispatch(pid, regs): i64 {
     # host kernel, so read it in the supervisor (no child buffer needed), convert
     # to ms, skip the kernel syscall, stash the result. No fault surface.
     if (nr == 40) {
-        var ts = alloc(16);
+        var ts = _emu_ts_buf();        # one-time alloc, not per-call (no supervisor heap leak)
         store64(ts, 0);
         store64(ts + 8, 0);
         syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, ts);
@@ -152,7 +165,7 @@ fn translate_dispatch(pid, regs): i64 {
         var ms = decode_arg(regs, 0);
         if (ms > 0) {
             if (ms > SLEEP_MS_CAP) { ms = SLEEP_MS_CAP; }
-            var req = alloc(16);
+            var req = _emu_ts_buf();       # one-time alloc, not per-call (no supervisor heap leak)
             store64(req, ms / 1000);                   # tv_sec
             store64(req + 8, (ms % 1000) * 1000000);   # tv_nsec
             syscall(SYS_NANOSLEEP, req, 0);

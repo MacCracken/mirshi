@@ -98,6 +98,15 @@ jobs:
         # timing) so a regression is diagnosable.
         run: bash scripts/it/groupstop.sh
 
+      - name: Supervisor hardening (heap bound + hung-child cleanup)
+        # 0.6.0 hardening of the SUPERVISOR's own robustness against a hung/abusive
+        # child: (1) a child that loops the emulated uptime_ms#40 must not grow
+        # mirshi's heap without bound (the per-call dispatcher alloc leak — a child-
+        # driven supervisor-OOM, now a one-time static buffer); (2) terminating mirshi
+        # while the child is stuck must leave no orphan and no zombie (PTRACE_O_EXITKILL;
+        # no watchdog needed). Same ptrace requirements as the M0/M1/M2 steps.
+        run: bash scripts/it/supervisor_hardening.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

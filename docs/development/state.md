@@ -5,9 +5,12 @@
 
 ## Version
 
-**0.5.0** — 2026-06-29. M4 = seccomp-notify feasibility + benchmark baseline (full migration reframed
-to a hybrid, deferred by data — [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)). 0.4.0 = M3 Docker
-vehicle (functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1 translation; 0.1.0 = M0 trap loop.
+**0.6.0** — 2026-06-30. Hardening: host-resource bounds ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md)),
+group-stop signal handling ([ADR 0007](../adr/0007-group-stop-signal-handling.md)), child-hang robustness +
+the supervisor-emulate heap-leak fix ([ADR 0008](../adr/0008-child-hang-supervisor-robustness.md)), and the
+fault-injection harness wired into CI. 0.5.0 = M4 seccomp-notify feasibility + benchmark baseline (reframed to
+a hybrid, deferred by data — [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)); 0.4.0 = M3 Docker vehicle
+(functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1 translation; 0.1.0 = M0 trap loop.
 
 ## Toolchain
 
@@ -73,6 +76,10 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/groupstop.sh` — 0.6.0 hardening gate (CI step, after fault_inject): an
   external `SIGSTOP` to the agnos child (a ptrace group-stop) must leave the child
   runnable — mirshi resumes it and it runs to completion, no hang.
+- `scripts/it/supervisor_hardening.sh` — 0.6.0 hardening gate (CI step, after
+  groupstop): the supervisor's own robustness — mirshi's RSS stays flat under an
+  emulated-timer (`uptime_ms#40`) storm (no per-call heap leak), and terminating
+  mirshi mid-hang leaves no orphan / no zombie (`PTRACE_O_EXITKILL`).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -99,7 +106,7 @@ swallow** layer. None wired yet (scaffold).
 
 See [`roadmap.md`](roadmap.md) — M0–M3 (functional v1 surface) + M4 (seccomp-notify
 feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
-**0.6.0 hardening** (in progress). Landed so far (in `[Unreleased]`):
+**0.6.0 hardening** — ✅ shipped 2026-06-30:
 - **Host-resource bounds** ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md))
   — kernel-enforced child rlimits cap the `mmap#27` / `open#7` exhaustion vectors;
   PID vector already closed by the seccomp allowlist. Verified firing on an unlimited
@@ -108,11 +115,12 @@ feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
   zombie check rewritten to find mirshi's grandchild agnos zombies (not `--ppid $$`).
 - **Group-stop signal handling** ([ADR 0007](../adr/0007-group-stop-signal-handling.md))
   — both trace loops discriminate a ptrace group-stop via `PTRACE_GETSIGINFO` and
-  suppress it (resume with no signal) instead of blindly re-injecting the stop.
-  Correctness/robustness, not a hang fix (verified: on Linux the child completes
-  either way). Regression gate `scripts/it/groupstop.sh`.
+  suppress it (resume with no signal). Correctness/robustness, not a hang fix.
+- **Child-hang robustness** ([ADR 0008](../adr/0008-child-hang-supervisor-robustness.md))
+  — a hung child is handled by design (block-mirror + `PTRACE_O_EXITKILL` + `waitpid`
+  status), no watchdog; the scoping fixed a real supervisor-emulate heap leak
+  (`uptime_ms#40` / `sleep_ms#41` per-call alloc → one-time static).
 
-Remaining for 0.6.0: **child hang reaping** (no internal watchdog for a child that
-blocks indefinitely) — to be scoped/validated (like group-stop, confirm a real
-failure mode before building); then the version bump to 0.6.0. Then 0.7.0 security
-sweep → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
+Next: **0.7.0 — security CVE / 0-day sweep** (the sandbox-escape classes: child-memory
+read TOCTOU, the `FLAG_CONTINUE` rule, seccomp default-deny completeness, path-translation
+escapes, arg-confusion) → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
