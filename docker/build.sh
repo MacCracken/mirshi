@@ -19,7 +19,7 @@ echo "==> building mirshi (Linux-target supervisor)"
 cyrius build src/main.cyr "$stage/mirshi" >/dev/null
 
 echo "==> building agnos userland tools (agnos-target ELFs)"
-for t in hello catfile ls echo; do
+for t in hello catfile ls echo cp; do
     cyrius build --agnos "docker/tools/$t.cyr" "$stage/bin/$t" >/dev/null
 done
 

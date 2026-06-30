@@ -1,0 +1,37 @@
+# docker/tools/cp.cyr — agnos demo tool: copy a file within the container fs, then
+# read the copy back to stdout. Proves the M2 filesystem WRITE/create path
+# (open with AO_CREAT|AO_WRONLY + write) end-to-end inside the container — the one
+# part of the frozen fs surface the read-only tools (catfile/ls) don't exercise.
+# Copies /data/motd.txt -> /data/out.txt, then cats /data/out.txt so the round-trip
+# is observable on stdout (the smoke gate asserts the copied content comes back).
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var src = "/data/motd.txt";
+    var dst = "/data/out.txt";
+    var sfd = sys_open(src, strlen(src), AO_RDONLY);
+    if (sfd < 0) { return 1; }
+    var dfd = sys_open(dst, strlen(dst), AO_WRONLY | AO_CREAT | AO_TRUNC);
+    if (dfd < 0) { sys_close(sfd); return 2; }
+    var buf[512];
+    # copy src -> dst
+    while (1 == 1) {
+        var n = sys_read(sfd, &buf, 512);
+        if (n <= 0) { break; }
+        sys_write(dfd, &buf, n);
+    }
+    sys_close(sfd);
+    sys_close(dfd);
+    # read the freshly-written copy back to stdout (proves create+write worked)
+    var vfd = sys_open(dst, strlen(dst), AO_RDONLY);
+    if (vfd < 0) { return 3; }
+    while (1 == 1) {
+        var m = sys_read(vfd, &buf, 512);
+        if (m <= 0) { sys_close(vfd); return 0; }
+        sys_write(1, &buf, m);
+    }
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

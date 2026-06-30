@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+v1.0.0 clean cut (in progress) — the representative agnos CLI userland in a plain Docker
+container under mirshi, no QEMU. No translation-logic change.
+
+### Added
+- **`docker/tools/cp.cyr`** — a `cp` write-path demo tool: copies `/data/motd.txt` →
+  `/data/out.txt` (`open AO_CREAT|AO_WRONLY` + `write`) then reads the copy back to stdout,
+  exercising the M2 filesystem **write/create** path end-to-end in-container — the one part
+  of the frozen fs surface the read-only tools (`catfile`/`ls`) didn't show.
+
+### Changed
+- **`docker/smoke.sh`** now asserts the full representative userland in-container: console
+  out (`hello`), stdin echo (`echo`), fs read (`catfile`), dir listing (`ls`, getdents), and
+  the fs **write** path (`cp`) — previously only `hello` + `catfile` were asserted (the others
+  were built but unproven). Plus the existing no-QEMU proof + 4-container fan-out.
+
 ## [0.9.0] — 2026-06-30
 
 Freeze + docs cleanup — no behavior change. Froze the v1 contracts (the per-number syscall-
