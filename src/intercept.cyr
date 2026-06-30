@@ -1,28 +1,35 @@
-# src/intercept.cyr — the M0 trap loop (the impure half of the supervisor).
+# src/intercept.cyr — the supervisor trap loop (the impure core). Two modes:
 #
-# fork+exec an agnos-target static ELF and trap EVERY syscall it makes via
-# ptrace(PTRACE_SYSEMU), logging the agnos number + decoded name + args. M0 is
-# "interception proven BEFORE translation": it executes NOTHING and translates
-# NOTHING — with ONE necessary exception, the agnos program-exit (#0).
+#   --selftest-trace (selftest==1): the M0 mode — trap EVERY syscall via
+#     ptrace(PTRACE_SYSEMU), log the agnos number+name+args, execute/translate
+#     NOTHING (tear down on agnos exit#0). Proven by scripts/it/m0_trap.sh.
+#   default        (selftest==0): the M1 mode — trap, then TRANSLATE + EXECUTE
+#     each agnos syscall so the binary actually runs as a native Linux process.
 #
-# Why PTRACE_SYSEMU and not PTRACE_SYSCALL: agnos and Linux share the identical
-# register ABI and `syscall` instruction emit — only the NUMBERS differ. Under
-# PTRACE_SYSCALL the host kernel would actually EXECUTE the child's foreign
-# agnos number against the Linux table (agnos exit#0 -> Linux read#0, the child
-# blocks reading into garbage; agnos sock_accept#57 -> Linux fork#57, a fork
-# bomb; etc.). PTRACE_SYSEMU stops the child at syscall ENTRY and SUPPRESSES
-# kernel execution entirely — exactly one stop per syscall, no exit-stop — so
-# the host kernel never runs the raw foreign call. See docs/adr/0001.
+# Why PTRACE_SYSEMU and not PTRACE_SYSCALL for the TRAP: agnos and Linux share
+# the identical register ABI and `syscall` instruction emit — only the NUMBERS
+# differ. Under a bare PTRACE_SYSCALL the host kernel would EXECUTE the child's
+# foreign agnos number against the Linux table (agnos exit#0 -> Linux read#0,
+# the child blocks reading into garbage; agnos sock_accept#57 -> Linux fork#57,
+# a fork bomb). PTRACE_SYSEMU stops at syscall ENTRY and SUPPRESSES kernel
+# execution, so we see every call before anything runs. See docs/adr/0001.
 #
-# The exit#0 consequence of that suppression: since SYSEMU does not run the
-# call, the child's own exit() never executes — if mirshi merely logged and
-# resumed, the child would sail past exit() with rax=-ENOSYS and keep running.
-# So on agnos exit#0 the supervisor logs it, then tears the child down itself
-# (SIGKILL + reap) and returns the requested code. That is the truest-to-M0
-# action (no syscall translation); real exit translation is M1.
+# M1 translation (docs/adr/0002): run mode resumes with PTRACE_SYSCALL, which
+# stops the child at BOTH syscall entry and exit (an alternating phase the loop
+# tracks via `at_entry`). At the ENTER stop the dispatcher (src/dispatch.cyr)
+# classifies the call: EXECUTE renumbers orig_rax to the Linux peer (+ synthesizes
+# args) so the kernel runs it IN the child's own address space (pointers + a new
+# mmap land natively); EMULATE/ENOSYS SKIP the call (orig_rax = -1) so the foreign
+# agnos number is never run as a Linux syscall, computing the return in the
+# supervisor. At the matching EXIT stop the loop maps the raw Linux return to the
+# agnos convention (EXECUTE) or injects the supervisor-computed value into rax
+# (EMULATE/ENOSYS). agnos exit#0 is renumbered to a real exit_group, so the child
+# terminates and waitpid carries its status out. No rip rewrite — the kernel
+# dispatches on orig_rax at the enter stop (the rip-rewind path is ADR 0002's
+# rejected alternative).
 #
-# x86_64 Linux ONLY: PTRACE_SYSEMU and the user_regs_struct offsets (decode.cyr)
-# are x86_64-specific. The fixture + supervisor are x86_64 targets.
+# x86_64 Linux ONLY: PTRACE_SYSEMU/SYSCALL and the user_regs_struct offsets
+# (decode.cyr) are x86_64-specific. The fixtures + supervisor are x86_64 targets.
 
 include "src/decode.cyr"
 
@@ -32,11 +39,12 @@ include "src/decode.cyr"
 # ----------------------------------------------------------------------------
 enum MirshiPtrace {
     SYS_PTRACE = 101;
-    SYS_PROCESS_VM_READV = 310;       # reserved for M1 child-memory reads
+    SYS_PROCESS_VM_READV = 310;       # reserved for M2+ supervisor-side buffer copies
     PTRACE_TRACEME = 0;
     PTRACE_CONT = 7;
+    PTRACE_SYSCALL = 24;              # resume + EXECUTE one (rewritten) call, stop at exit
     PTRACE_GETREGS = 12;
-    PTRACE_SETREGS = 13;              # reserved for M1 return injection
+    PTRACE_SETREGS = 13;              # M1: write the rewritten/return regs back
     PTRACE_SYSEMU = 31;
     PTRACE_SETOPTIONS = 0x4200;
     PTRACE_O_TRACESYSGOOD = 0x1;      # syscall-stops report SIGTRAP|0x80
@@ -44,6 +52,7 @@ enum MirshiPtrace {
     SIG_KILL = 9;
     SYSCALL_STOP_SIG = 0x85;          # SIGTRAP(5) | 0x80 — the TRACESYSGOOD marker
     EXECVE_FAILED = 127;
+    WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
 }
 
 # wait-status decoders the stdlib lacks. lib/syscalls_linux_common.cyr provides
@@ -92,6 +101,13 @@ fn _wait(pid, status): i64 {
     return r;
 }
 
+# The translation layer: pure agnos->Linux mapping (src/translate.cyr, also
+# unit-tested) then the impure register-rewriting dispatcher (src/dispatch.cyr).
+# Included HERE so they see decode.cyr's REG_*, the MirshiPtrace enum, pt(), and
+# _emit/_emit_int defined above, and so _trace_loop below sees translate_dispatch.
+include "src/translate.cyr"
+include "src/dispatch.cyr"
+
 # The traced child. Runs the ABSOLUTE MINIMUM between fork and execve — mark
 # self as tracee, then replace the image. No alloc, no print: anything that
 # syscalls here would show up as a spurious pre-image trap (and we are not yet
@@ -108,20 +124,15 @@ fn _child_exec(path): i64 {
     return EXECVE_FAILED;
 }
 
-# The tracer loop. `selftest` = 1 emits ONLY the bare event stream to stdout
-# (for the golden integration compare); 0 emits human diagnostics. Returns the
-# child's effective exit code.
-fn _trace_loop(pid, selftest): i64 {
-    var regs = alloc(USER_REGS_SIZE);
-    var status = alloc(8);
-    var line = alloc(256);
-
-    # (1) Consume the post-execve SIGTRAP stop. It is delivered BEFORE options
-    #     are set, so it carries no 0x80 bit and is not a syscall-stop.
+# Consume the post-execve SIGTRAP stop (delivered BEFORE options are set, so no
+# 0x80 bit) and set ptrace options ONCE. Returns -1 when attached OK (proceed),
+# else a >= 0 mirshi exit code to propagate immediately (the child died or
+# misbehaved before tracing could begin — never ptrace a wrongly-assumed state).
+fn _attach(pid, status): i64 {
     var w = _wait(pid, status);
     if (w < 0) {
         _emit(2, "mirshi: waitpid failed before trace began\n");
-        return 125;
+        return WAIT_FAILED;
     }
     var st = load64(status);
     if (WIFEXITED(st) == 1) {
@@ -132,95 +143,117 @@ fn _trace_loop(pid, selftest): i64 {
         _emit(2, "mirshi: child signalled before trace began\n");
         return 128 + WTERMSIG(st);
     }
-    # The only remaining valid first event is the post-execve stop. Do not
-    # ptrace a wrongly-assumed state — if the child is not stopped, bail loud.
     if (WIFSTOPPED(st) != 1) {
         _emit(2, "mirshi: child in unexpected state before trace began\n");
-        return 125;
+        return WAIT_FAILED;
     }
-
-    # (2) Set options ONCE while stopped: tag syscall-stops (TRACESYSGOOD) and
-    #     guarantee the child dies if we do (EXITKILL — no orphans).
+    # Tag syscall-stops (TRACESYSGOOD -> SIGTRAP|0x80) and SIGKILL the child if we
+    # die (EXITKILL — no orphans).
     pt(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL);
+    return 0 - 1;
+}
+
+# M0 trap-log mode (--selftest-trace). PTRACE_SYSEMU traps every syscall at entry
+# — ONE stop per call, kernel executes NOTHING — logs the bare agnos event line,
+# and tears the child down on agnos exit#0. Translates nothing. See docs/adr/0001.
+fn _trace_log(pid): i64 {
+    var regs = alloc(USER_REGS_SIZE);
+    var status = alloc(8);
+    var line = alloc(256);
+
+    var a = _attach(pid, status);
+    if (a >= 0) { return a; }
 
     var pending_sig = 0;
     while (1 == 1) {
-        # (3) Single resume site: advance to the next syscall ENTRY. The kernel
-        #     will NOT execute it. pending_sig forwards a real signal (0 for
-        #     syscall-stops / group-stops).
-        pt(PTRACE_SYSEMU, pid, 0, pending_sig);
+        pt(PTRACE_SYSEMU, pid, 0, pending_sig);    # advance to next entry; no exec
         pending_sig = 0;
-
-        # (4) Reap the next state change. A failed wait must NOT be laundered
-        #     into "child exited 0" (status is pre-zeroed, WIFEXITED(0) is true).
-        w = _wait(pid, status);
-        if (w < 0) {
-            _emit(2, "mirshi: waitpid failed\n");
-            return 125;
-        }
-        st = load64(status);
-
-        # (5) Child gone -> never ptrace an exited pid (ESRCH). Return its code.
-        if (WIFEXITED(st) == 1) {
-            var code = WEXITSTATUS(st);
-            if (selftest == 0) {
-                _emit(1, "mirshi: child exited, code=");
-                _emit_int(1, code);
-                _emit(1, "\n");
-            }
-            return code;
-        }
-        if (WIFSIGNALED(st) == 1) {
-            var sg = WTERMSIG(st);
-            if (selftest == 0) {
-                _emit(1, "mirshi: child killed by signal ");
-                _emit_int(1, sg);
-                _emit(1, "\n");
-            }
-            return 128 + sg;
-        }
-
+        var w = _wait(pid, status);
+        if (w < 0) { _emit(2, "mirshi: waitpid failed\n"); return WAIT_FAILED; }
+        var st = load64(status);
+        if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
+        if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
         if (WIFSTOPPED(st) == 1) {
             var sig = WSTOPSIG(st);
             if (sig == SYSCALL_STOP_SIG) {
-                # A genuine SYSEMU syscall-entry stop: read + log the agnos call.
                 pt(PTRACE_GETREGS, pid, 0, regs);
                 var nr = decode_nr(regs);
                 format_event(line, nr, decode_arg(regs, 0), decode_arg(regs, 1),
                              decode_arg(regs, 2), decode_arg(regs, 3));
-                if (selftest == 1) {
-                    _emit(1, line);
-                    _emit(1, "\n");
-                } else {
-                    _emit(1, "trap ");
-                    _emit(1, line);
-                    _emit(1, "\n");
-                }
-                # M0: do NOT translate, do NOT inject a return. The lone action
-                # is on agnos exit#0 — SYSEMU suppressed it, so we end the run.
+                _emit(1, line);
+                _emit(1, "\n");
                 if (nr == 0) {
-                    # The logged/returned exit argument is the RAW agnos value;
-                    # the code mirshi can actually propagate is (value & 0xFF)
-                    # per the POSIX 8-bit exit contract — so exit#0(256) logs 256
-                    # but the real process status is 0.
+                    # agnos exit#0 — SYSEMU suppressed it; tear the child down.
                     var ecode = decode_arg(regs, 0);
                     syscall(SYS_KILL, pid, SIG_KILL);
                     _wait(pid, status);            # reap the corpse, no zombie
-                    if (selftest == 0) {
-                        _emit(1, "mirshi: child exited via agnos exit#0, code=");
-                        _emit_int(1, ecode);
-                        _emit(1, "\n");
-                    }
                     return ecode;
                 }
             } else {
-                # A real signal-delivery stop (e.g. SIGSEGV): forward it by
-                # injecting `sig` on the next resume. NOTE (M1 robustness): a
-                # stopping-signal group-stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU)
-                # must instead resume with inject-0 — re-injecting the stop
-                # signal would re-group-stop the child in a livelock. The M0
-                # fixture never triggers a group-stop, so the discriminator is
-                # deferred to the M1 signal-handling work, not handled here.
+                # Real signal-delivery stop: forward it. (Group-stop inject-0
+                # discrimination is M1+ robustness; the trace fixture never trips it.)
+                pending_sig = sig;
+            }
+        }
+    }
+    return 0;
+}
+
+# M1 run mode (default). PTRACE_SYSCALL traps each syscall at ENTRY and EXIT (two
+# stops/call, alternating). At ENTRY the dispatcher (src/dispatch.cyr) rewrites
+# the call to its Linux peer (EXECUTE: kernel runs it in the child's own address
+# space) or skips it with a supervisor-computed return (EMULATE/ENOSYS). At EXIT
+# the raw return is mapped to the agnos convention. agnos exit#0 was rewritten to
+# a real exit_group, so the child terminates and waitpid carries its status out.
+# See docs/adr/0002.
+fn _trace_run(pid): i64 {
+    var regs = alloc(USER_REGS_SIZE);
+    var status = alloc(8);
+
+    var a = _attach(pid, status);
+    if (a >= 0) { return a; }
+
+    var pending_sig = 0;
+    var at_entry = 1;        # PTRACE_SYSCALL alternates enter/exit — track the phase
+    var agnos_nr = 0;        # captured at enter, used to map the return at exit
+    var strat = 0;           # the dispatcher's verdict at enter, applied at exit
+    while (1 == 1) {
+        pt(PTRACE_SYSCALL, pid, 0, pending_sig);
+        pending_sig = 0;
+        var w = _wait(pid, status);
+        if (w < 0) { _emit(2, "mirshi: waitpid failed\n"); return WAIT_FAILED; }
+        var st = load64(status);
+        if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }    # incl. exit#0 -> exit_group
+        if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
+        if (WIFSTOPPED(st) == 1) {
+            var sig = WSTOPSIG(st);
+            if (sig == SYSCALL_STOP_SIG) {
+                if (at_entry == 1) {
+                    # Syscall-ENTER: read regs, classify, rewrite for the kernel.
+                    pt(PTRACE_GETREGS, pid, 0, regs);
+                    agnos_nr = decode_nr(regs);
+                    strat = translate_dispatch(pid, regs);
+                    at_entry = 0;
+                } else {
+                    # Syscall-EXIT: write the agnos-convention return into rax.
+                    pt(PTRACE_GETREGS, pid, 0, regs);
+                    if (strat == STRAT_EXECUTE) {
+                        store64(regs + REG_RAX,
+                                linux_ret_to_agnos(agnos_nr, load64(regs + REG_RAX)));
+                    } else {
+                        # EMULATE / ENOSYS: the syscall was skipped (rax=-ENOSYS);
+                        # inject the supervisor-computed return.
+                        store64(regs + REG_RAX, _xlat_emu_ret);
+                    }
+                    pt(PTRACE_SETREGS, pid, 0, regs);
+                    at_entry = 1;
+                }
+            } else {
+                # Real signal-delivery stop: forward it; the enter/exit phase is
+                # unchanged (a signal stop is not a syscall boundary). NOTE (M1+
+                # robustness, same as _trace_log): a stopping-signal group-stop
+                # needs inject-0 / PTRACE_LISTEN, not blind re-injection — the M1
+                # fixtures never trigger one, so the discriminator is deferred.
                 pending_sig = sig;
             }
         }
@@ -239,5 +272,6 @@ fn intercept_run(path, selftest): i64 {
         _child_exec(path);          # never returns on success
         return EXECVE_FAILED;
     }
-    return _trace_loop(pid, selftest);
+    if (selftest == 1) { return _trace_log(pid); }
+    return _trace_run(pid);
 }

@@ -59,3 +59,11 @@ jobs:
         # permitted with no CAP_SYS_PTRACE. A future container/Docker job (M3)
         # must add: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined.
         run: bash scripts/it/m0_trap.sh
+
+      - name: M1 run integration test
+        # The real translate+execute path (M1 acceptance): agnos hello + stdin
+        # cat run under mirshi via PTRACE_SYSCALL translation, exit codes
+        # propagate, and a heap fixture proves mmap#27 is executed in-child (the
+        # M0->M1 segfault regression gate). Same ptrace requirements as the M0
+        # step. Kept separate so a translation regression is diagnosable.
+        run: bash scripts/it/m1_run.sh

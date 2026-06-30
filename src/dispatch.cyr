@@ -1,0 +1,116 @@
+# src/dispatch.cyr — the IMPURE M1 syscall dispatcher (supervisor-only glue).
+#
+# Run mode uses PTRACE_SYSCALL (enter/exit stops). At the syscall-ENTER stop this
+# dispatcher rewrites the trapped registers and returns a STRAT_* code telling the
+# loop how to handle the matching EXIT stop:
+#   STRAT_EXECUTE — rewrite orig_rax to the Linux peer (+ synth/translate args) so
+#     the kernel runs it IN the child (pointers + a new mmap land natively); the
+#     loop maps the raw Linux return to the agnos convention at the exit stop.
+#   STRAT_EMULATE / STRAT_ENOSYS — SKIP the kernel syscall by setting orig_rax=-1
+#     (so the dangerous foreign agnos number is NEVER run as a Linux syscall), and
+#     stash the supervisor-computed return in `_xlat_emu_ret`; the loop writes it
+#     into rax at the exit stop (the skip path leaves rax=-ENOSYS otherwise).
+# agnos exit#0 is rewritten to a real Linux exit_group(code): the child terminates
+# and its status propagates through waitpid — no SIGKILL, no exit stop.
+#
+# The PURE translation arithmetic lives in src/translate.cyr (unit-tested). This
+# file is the ptrace + supervisor-side clock/sleep glue. x86_64 Linux only.
+#
+# INCLUDE ORDER (relies on the includer): src/intercept.cyr includes this AFTER
+# src/decode.cyr (REG_*/decode_*), the MirshiPtrace enum + pt() + _emit/_emit_int,
+# and src/translate.cyr (STRAT_*/the pure helpers).
+
+# Linux x86_64 syscall numbers the stdlib peer enum does NOT carry (chrono.cyr
+# uses these raw); mirshi defines them here for the supervisor-emulated timers.
+enum MirshiXlatNr {
+    SYS_TIME = 201;
+    SYS_CLOCK_GETTIME = 228;
+    SYS_NANOSLEEP = 35;
+    SLEEP_MS_CAP = 3600000;     # mirror agnos's 1 h sleep cap
+}
+
+# The supervisor-computed return for the current EMULATE/ENOSYS call, carried
+# from the enter stop (where it is computed + the syscall skipped) to the exit
+# stop (where the loop writes it into the child's rax). Single in-flight call per
+# child + strict enter/exit alternation make a one-slot global safe here.
+var _xlat_emu_ret = 0;
+
+# Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
+# syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
+# STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
+fn translate_dispatch(pid, regs): i64 {
+    var nr = decode_nr(regs);
+
+    # agnos exit#0 -> real Linux exit_group(code). The code is already in rdi
+    # (agnos a1); resuming executes it, the child terminates, and waitpid/
+    # WIFEXITED carries the status out. No return-mapping / exit-stop.
+    if (nr == 0) {
+        store64(regs + REG_ORIG_RAX, SYS_EXIT_GROUP);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+
+    # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
+    # host kernel, so read it in the supervisor (no child buffer needed), convert
+    # to ms, skip the kernel syscall, stash the result. No fault surface.
+    if (nr == 40) {
+        var ts = alloc(16);
+        store64(ts, 0);
+        store64(ts + 8, 0);
+        syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, ts);
+        _xlat_emu_ret = ms_from_timespec(load64(ts), load64(ts + 8));
+        store64(regs + REG_ORIG_RAX, 0 - 1);   # skip — never run agnos#40 as Linux
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EMULATE;
+    }
+
+    # sleep_ms#41 -> supervisor-emulate. With one child stopped at the trap,
+    # sleeping in the supervisor is equivalent to the child blocking and avoids a
+    # writable child timespec buffer. ms<=0 -> return 0 immediately.
+    if (nr == 41) {
+        var ms = decode_arg(regs, 0);
+        if (ms > 0) {
+            if (ms > SLEEP_MS_CAP) { ms = SLEEP_MS_CAP; }
+            var req = alloc(16);
+            store64(req, ms / 1000);                   # tv_sec
+            store64(req + 8, (ms % 1000) * 1000000);   # tv_nsec
+            syscall(SYS_NANOSLEEP, req, 0);
+        }
+        _xlat_emu_ret = 0;
+        store64(regs + REG_ORIG_RAX, 0 - 1);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EMULATE;
+    }
+
+    # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg
+    # synthesis), run it IN the child. NO rax/rip changes — at the enter stop the
+    # kernel dispatches on orig_rax; the loop maps the return at the exit stop.
+    var lnr = agnos_to_linux_nr(nr);
+    if (lnr >= 0) {
+        if (nr == 27) {
+            # mmap(length) -> Linux 6-arg mmap; synthesize the extra 5 args.
+            synth_mmap_regs(regs, decode_arg(regs, 0));
+        }
+        if (nr == 28) {
+            # munmap: round the length to match the mmap granularity (LIFO 2 MB).
+            store64(regs + REG_RSI, mmap_round_up_2mb(decode_arg(regs, 1)));
+        }
+        if (nr == 46) {
+            # time(NULL): seconds come back purely in rax, no output buffer.
+            store64(regs + REG_RDI, 0);
+        }
+        store64(regs + REG_ORIG_RAX, lnr);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+
+    # Out of the M1 surface: skip the foreign syscall and degrade to the agnos
+    # error sentinel (-1) + a diagnostic, rather than run a wrong Linux call.
+    _xlat_emu_ret = 0 - 1;
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    _emit(2, "mirshi: ENOSYS agnos#");
+    _emit_int(2, nr);
+    _emit(2, " -> -1\n");
+    return STRAT_ENOSYS;
+}

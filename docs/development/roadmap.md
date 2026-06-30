@@ -28,11 +28,15 @@ must be supervisor-side (ptrace or seccomp-user-notify).
 - `cyrius init --bin` scaffold (mirshi is a **Linux-target** Cyrius binary supervising **agnos-target** ELFs).
 - **✅ The real M0 work — the trap loop:** a supervisor that `fork`+`exec`s an agnos static ELF and **traps every syscall** via `ptrace(PTRACE_SYSEMU)` (fastest bring-up — full register read/rewrite), logging the agnos syscall number + args. **Acceptance met:** `mirshi --selftest-trace <agnos-elf>` traps + logs a trivial agnos binary's complete stream (`getpid#2`, `write#1`, `exit#0`) — interception proven *before* any translation. Mechanism: `src/intercept.cyr` (SYSEMU loop) + `src/decode.cyr` (pure agnos#→name/arity/ptr-arg decode), proven by `scripts/it/m0_trap.sh`. Why SYSEMU not SYSCALL: [`../adr/0001-ptrace-sysemu-intercept.md`](../adr/0001-ptrace-sysemu-intercept.md).
 
-### M1 — Core translation: process + console (hello-world runs) (v0.2.0)
-`src/translate.cyr` handler table for the minimal runnable set: `exit#0`, `write#1` (stdout/stderr),
-`read#5` (stdin), `getpid#2`, `mmap#27`/`munmap#28` (→ Linux `mmap`, handle 2 MB granularity),
-`sync#12`, `getrandom#45`, `time_unix#46`/`uptime_ms#40`/`sleep_ms#41`. Acceptance: an agnos-compiled
-`hello` (write+exit) and a stdin `cat` run correctly under mirshi, **exit codes propagate, no QEMU**.
+### M1 — Core translation: process + console (hello-world runs) (v0.2.0) — ✅ shipped 2026-06-29
+Handler table (`src/translate.cyr` pure + `src/dispatch.cyr` impure) for the minimal runnable set:
+`exit#0` (→`exit_group`), `write#1` (stdout/stderr), `read#5` (stdin), `getpid#2`, `mmap#27`/`munmap#28`
+(→ Linux `mmap`, 2 MB granularity), `sync#12`, `getrandom#45`, `time_unix#46`/`uptime_ms#40`/`sleep_ms#41`.
+**Acceptance met:** agnos `hello` (write+exit) + stdin `cat` run correctly under `mirshi <elf>`, exit codes
+propagate (incl. non-zero, e.g. 42), no QEMU; a heap fixture proves `mmap#27` runs in-child (no segfault).
+Model — execute-in-child via `PTRACE_SYSCALL` register rewrite + emulate the buffer-less timers:
+[`../adr/0002-execute-in-child-translation.md`](../adr/0002-execute-in-child-translation.md). Proven by
+`scripts/it/m1_run.sh`.
 
 ### M2 — Filesystem syscalls (real agnos CLI tools run) (v0.3.0)
 `open#7`/`close#6`/`read`/`write`/`lseek#58`/`stat#33`/`getdents#29`/`mkdir#9`/`rmdir#10`/`unlink#30`/

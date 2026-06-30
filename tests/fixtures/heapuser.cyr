@@ -1,0 +1,18 @@
+# tests/fixtures/heapuser.cyr — the M0->M1 mmap regression gate. agnos
+# alloc_init() issues mmap#27(2 MB); under M0 (PTRACE_SYSEMU) that mmap is
+# suppressed, the heap base is garbage, and the first heap store SEGFAULTs.
+# Under M1 the translated in-child Linux mmap installs a real, writable heap, so
+# this stores into the heap and writes FROM a heap pointer — exit 0, no segfault.
+
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    alloc_init();                       # -> agnos mmap#27(2097152)
+    var p = alloc(64);                  # a heap sub-region
+    memcpy(p, "heap ok\n", 8);          # write INTO the heap (proves it's writable)
+    syscall(SYS_WRITE, 1, p, 8);        # write FROM a heap pointer (in-child)
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

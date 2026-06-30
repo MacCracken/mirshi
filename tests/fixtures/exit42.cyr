@@ -1,0 +1,11 @@
+# tests/fixtures/exit42.cyr — non-zero exit-code propagation proof. The only
+# syscall is exit#0(42); mirshi must propagate 42 as its own exit status.
+
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    return 42;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);   # agnos exit#0(42)

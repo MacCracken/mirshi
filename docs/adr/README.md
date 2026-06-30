@@ -20,3 +20,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 ## Index
 
 - [0001 — ptrace(PTRACE_SYSEMU) as the M0 syscall-intercept mechanism](0001-ptrace-sysemu-intercept.md) — *Accepted*
+- [0002 — Execute-in-child translation via PTRACE_SYSCALL register rewrite](0002-execute-in-child-translation.md) — *Accepted*

@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-29
+
+M1 — core translation. agnos binaries run as native Linux processes, no QEMU.
+
+### Added
+- **M1 core translation (process + console)** — mirshi's default mode now
+  TRANSLATES + EXECUTES agnos syscalls so an agnos-compiled binary runs as a
+  native Linux process (no QEMU). `mirshi <agnos-elf>` runs it; `--selftest-trace`
+  keeps the M0 trap-log mode. Acceptance met: an agnos `hello` (write+exit) and a
+  stdin `cat` run correctly, exit codes propagate, and a heap fixture proves
+  `mmap#27` is executed in-child (the M0→M1 segfault gate).
+  - `src/translate.cyr` — PURE agnos→Linux translation: the number remap, the
+    number-aware return mapping (`-errno`→`-1`, but `mmap#27`/`time_unix#46`
+    failure→0), the 2 MB mmap round-up, and the 6-arg mmap register synthesis.
+    Unit-tested (39 new assertions; 64 total).
+  - `src/dispatch.cyr` — the impure dispatcher: execute-in-child (rewrite
+    `orig_rax`+args, kernel runs it in the child) for `write#1`/`read#5`/
+    `getpid#2`/`mmap#27`/`munmap#28`/`sync#12`/`getrandom#45`/`time_unix#46`;
+    supervisor-emulate (`uptime_ms#40` via shared `clock_gettime`, `sleep_ms#41`)
+    via the `orig_rax=-1` skip + injected return; `exit#0`→real `exit_group`.
+  - `src/intercept.cyr` — split into `_trace_log` (M0 `PTRACE_SYSEMU`) and
+    `_trace_run` (M1 `PTRACE_SYSCALL` enter/exit loop), sharing `_attach`.
+  - `tests/fixtures/{hello,cat,exit42,heapuser}.cyr` + `scripts/it/m1_run.sh` —
+    the real translate+execute integration gate (wired into CI after the M0 step).
+  - [ADR 0002](docs/adr/0002-execute-in-child-translation.md) — why
+    execute-in-child via `PTRACE_SYSCALL` register rewrite (not SYSEMU+rip-rewind,
+    not pure supervisor-emulate).
+
 ## [0.1.0] — 2026-06-29
 
 M0 — scaffold + the trap loop. Interception proven *before* translation.

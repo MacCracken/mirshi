@@ -1,0 +1,92 @@
+# src/translate.cyr — PURE agnos→Linux translation logic for the M1 handler set.
+#
+# Like src/decode.cyr, everything here is side-effect-free arithmetic / table
+# lookup over integers and a caller-owned register buffer — NO syscalls, NO
+# ptrace. That keeps the whole translation CONTRACT (number remap, the agnos vs
+# Linux return convention, mmap's 2 MB round-up + 6-arg synthesis) unit-testable
+# under `cyrius test` with synthetic buffers. The IMPURE dispatcher that actually
+# rewrites the traced child's registers + drives ptrace lives in src/dispatch.cyr.
+#
+# Depends only on the REG_* offsets from decode.cyr (for synth_mmap_regs).
+
+# Resume strategy a dispatched syscall maps to (returned by translate_dispatch).
+# (agnos exit#0 needs no strategy of its own — it is rewritten to a real Linux
+# exit_group, an EXECUTE whose effect is the child terminating.)
+enum MirshiStrat {
+    STRAT_EXECUTE = 1;     # rewrite orig_rax to the Linux peer; kernel runs it in-child
+    STRAT_EMULATE = 2;     # syscall skipped; supervisor-computed return injected into rax
+    STRAT_ENOSYS = 3;      # out-of-M1-surface number — skipped, agnos -1 injected
+}
+
+# agnos syscall number -> its Linux x86_64 peer number, for the calls that
+# translate by a pure renumber (+ identical or supervisor-synthesized args) and
+# execute in the child. Returns -1 for any agnos number WITHOUT a direct peer
+# (the supervisor-emulated calls uptime_ms#40 / sleep_ms#41, agnos exit#0 which
+# terminates, and anything out of the M1 surface) — the dispatcher routes those
+# elsewhere. Linux numbers are the x86_64 values (cf. lib/syscalls_x86_64_linux.cyr).
+fn agnos_to_linux_nr(agnos_nr): i64 {
+    if (agnos_nr == 1) { return 1; }      # write       -> write(1)
+    if (agnos_nr == 5) { return 0; }      # read        -> read(0)     [number DIFFERS]
+    if (agnos_nr == 2) { return 39; }     # getpid      -> getpid(39)  [number DIFFERS]
+    if (agnos_nr == 27) { return 9; }     # mmap        -> mmap(9)     [+ 6-arg synth]
+    if (agnos_nr == 28) { return 11; }    # munmap      -> munmap(11)
+    if (agnos_nr == 12) { return 162; }   # sync        -> sync(162)
+    if (agnos_nr == 45) { return 318; }   # getrandom   -> getrandom(318) [number DIFFERS]
+    if (agnos_nr == 46) { return 201; }   # time_unix   -> time(201, NULL)
+    return 0 - 1;                         # no direct peer
+}
+
+# Round a requested length UP to the agnos 2 MB (0x200000) mmap granularity.
+# agnos mmap is 2 MB-granular; the heap already passes exactly 2 MB, so this is a
+# no-op there but defends a non-aligned length. A one-granule error here would
+# reintroduce the M0→M1 heap segfault, so it is unit-pinned.
+fn mmap_round_up_2mb(length): i64 {
+    return (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
+}
+
+# True (1) iff a raw Linux syscall return is an error: a negated errno lands in
+# the signed band [-4095, -1]. Done as SIGNED i64 — a successful mmap returns a
+# large positive user-space address (bit 63 clear), which must NOT be misread as
+# negative, or a good mapping would be turned into a fake failure.
+fn is_linux_err(rax): i64 {
+    if (rax < 0) {
+        if (rax >= (0 - 4095)) { return 1; }
+    }
+    return 0;
+}
+
+# Map a raw Linux return into the agnos return convention. agnos uses bytes/0/
+# addr on success and a BARE -1 on error for most calls — EXCEPT mmap#27 and
+# time_unix#46, whose failure sentinel is 0 (mmap: "no base"; time: "RTC
+# unreadable"), NOT -1. Success values (counts, 0=EOF, pid, addr) pass through.
+fn linux_ret_to_agnos(agnos_nr, linux_ret): i64 {
+    if (is_linux_err(linux_ret) == 1) {
+        if (agnos_nr == 27) { return 0; }   # mmap failure -> 0 (not -1)
+        if (agnos_nr == 46) { return 0; }   # time_unix failure -> 0 (not -1)
+        return 0 - 1;                       # generic agnos error
+    }
+    return linux_ret;
+}
+
+# Monotonic milliseconds from a (sec, nsec) timespec — agnos uptime_ms() units.
+# Sub-millisecond nsec truncates (agnos has 10 ms tick resolution anyway).
+fn ms_from_timespec(sec, nsec): i64 {
+    return (sec * 1000) + (nsec / 1000000);
+}
+
+# Synthesize the Linux 6-arg mmap registers into a caller-owned regs buffer from
+# agnos's single-arg mmap(length). Linux mmap(addr, len, prot, flags, fd, off)
+# rides the kernel syscall ABI a1..a6 = rdi/rsi/rdx/r10/r8/r9 (a4=r10 NOT rcx).
+# Pure register-buffer write (no ptrace); the dispatcher SETREGS it. Anonymous,
+# zero-filled, private — matching the agnos mmap contract. addr=0 lets the kernel
+# pick a (4 KB-aligned) base; the agnos bump allocator (lib/alloc_agnos.cyr) treats
+# the base as opaque and only checks `== 0`, so it does NOT need a 2 MB-aligned base.
+fn synth_mmap_regs(regs, length): i64 {
+    store64(regs + REG_RDI, 0);                       # addr  = 0 (kernel chooses)
+    store64(regs + REG_RSI, mmap_round_up_2mb(length)); # len  = round up to 2 MB
+    store64(regs + REG_RDX, 3);                        # prot  = PROT_READ|PROT_WRITE
+    store64(regs + REG_R10, 0x22);                     # flags = MAP_PRIVATE|MAP_ANONYMOUS
+    store64(regs + REG_R8, 0xFFFFFFFFFFFFFFFF);        # fd    = -1 (full 64-bit)
+    store64(regs + REG_R9, 0);                         # off   = 0
+    return 0;
+}

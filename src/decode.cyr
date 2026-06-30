@@ -27,12 +27,15 @@
 # budget the stdlib warns about.
 # ----------------------------------------------------------------------------
 enum MirshiRegOff {
-    REG_R10 = 56;        # a4
+    REG_R10 = 56;        # a4 (NOT rcx — the `syscall` insn clobbers rcx with the return RIP)
+    REG_R9 = 64;         # a6 (mmap's `offset`)
+    REG_R8 = 72;         # a5 (mmap's `fd`)
     REG_RAX = 80;        # return value at exit / -ENOSYS at entry (never the nr)
     REG_RDX = 96;        # a3
     REG_RSI = 104;       # a2
     REG_RDI = 112;       # a1
     REG_ORIG_RAX = 120;  # the agnos syscall number at a syscall-entry stop
+    REG_RIP = 128;       # instruction pointer (reserved; unused in M1 — the kernel dispatches on orig_rax)
     USER_REGS_SIZE = 216;
 }
 

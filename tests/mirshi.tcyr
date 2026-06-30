@@ -7,6 +7,7 @@
 # (it needs an actual traced child, which a pure-cyrius .tcyr cannot express).
 
 include "src/decode.cyr"
+include "src/translate.cyr"
 
 fn main() {
     alloc_init();
@@ -63,6 +64,67 @@ fn main() {
     assert_streq(line, "exit#0(0)", "format exit");
     format_event(line, 99, 0, 0, 0, 0);
     assert_streq(line, "unknown#99()", "format unknown number");
+
+    # --- M1 pure translation contract -------------------------------------
+    # agnos# -> Linux# remap (the direct-pass / execute-in-child family).
+    test_group("xlat-nr");
+    assert_eq(agnos_to_linux_nr(1), 1, "write 1->1");
+    assert_eq(agnos_to_linux_nr(5), 0, "read 5->0 (DIFFERS)");
+    assert_eq(agnos_to_linux_nr(2), 39, "getpid 2->39 (DIFFERS)");
+    assert_eq(agnos_to_linux_nr(27), 9, "mmap 27->9");
+    assert_eq(agnos_to_linux_nr(28), 11, "munmap 28->11");
+    assert_eq(agnos_to_linux_nr(12), 162, "sync 12->162");
+    assert_eq(agnos_to_linux_nr(45), 318, "getrandom 45->318 (DIFFERS)");
+    assert_eq(agnos_to_linux_nr(46), 201, "time_unix 46->201");
+    assert_eq(agnos_to_linux_nr(40), 0 - 1, "uptime_ms 40 -> no peer (emulated)");
+    assert_eq(agnos_to_linux_nr(41), 0 - 1, "sleep_ms 41 -> no peer (emulated)");
+    assert_eq(agnos_to_linux_nr(99), 0 - 1, "unknown 99 -> no peer");
+
+    # mmap 2 MB round-up (the load-bearing arithmetic — off by a granule = segfault).
+    test_group("xlat-mmap-round");
+    assert_eq(mmap_round_up_2mb(0), 0, "0 -> 0");
+    assert_eq(mmap_round_up_2mb(1), 2097152, "1 -> 2 MB");
+    assert_eq(mmap_round_up_2mb(2097152), 2097152, "2 MB exact (no double-round)");
+    assert_eq(mmap_round_up_2mb(2097153), 4194304, "2 MB + 1 -> 4 MB");
+    assert_eq(mmap_round_up_2mb(4194304), 4194304, "4 MB exact");
+
+    # is_linux_err: the signed [-4095,-1] band, NOT a high positive address.
+    test_group("xlat-errband");
+    assert_eq(is_linux_err(0 - 1), 1, "-1 is err");
+    assert_eq(is_linux_err(0 - 4095), 1, "-4095 is err");
+    assert_eq(is_linux_err(0 - 4096), 0, "-4096 not err");
+    assert_eq(is_linux_err(0), 0, "0 not err");
+    assert_eq(is_linux_err(0x7fff00000000), 0, "high addr not err (signedness)");
+
+    # return-convention mapping (number-aware: mmap/time fail -> 0, else -1).
+    test_group("xlat-ret");
+    assert_eq(linux_ret_to_agnos(1, 0 - 9), 0 - 1, "write err -> -1");
+    assert_eq(linux_ret_to_agnos(1, 13), 13, "write 13 passes");
+    assert_eq(linux_ret_to_agnos(5, 0), 0, "read EOF 0 passes");
+    assert_eq(linux_ret_to_agnos(27, 0 - 12), 0, "mmap fail -> 0 (not -1)");
+    assert_eq(linux_ret_to_agnos(27, 0x7fff00000000), 0x7fff00000000, "mmap addr passes");
+    assert_eq(linux_ret_to_agnos(46, 0 - 1), 0, "time fail -> 0 (not -1)");
+    assert_eq(linux_ret_to_agnos(2, 1234), 1234, "getpid passes");
+
+    # ms_from_timespec (uptime_ms emulation arithmetic).
+    test_group("xlat-ms");
+    assert_eq(ms_from_timespec(1, 500000000), 1500, "1s 500ms");
+    assert_eq(ms_from_timespec(0, 0), 0, "zero");
+    assert_eq(ms_from_timespec(0, 999999), 0, "sub-ms truncates");
+    assert_eq(ms_from_timespec(10, 1000000), 10001, "10s + 1ms");
+
+    # mmap 6-arg register synthesis into a seeded regs buffer.
+    test_group("xlat-mmap-synth");
+    var mr = alloc(USER_REGS_SIZE);
+    synth_mmap_regs(mr, 2097152);
+    assert_eq(load64(mr + 112), 0, "rdi addr = 0");
+    assert_eq(load64(mr + 104), 2097152, "rsi len = 2 MB");
+    assert_eq(load64(mr + 96), 3, "rdx prot = RW");
+    assert_eq(load64(mr + 56), 0x22, "r10 flags = PRIVATE|ANON");
+    assert_eq(load64(mr + 72), 0xFFFFFFFFFFFFFFFF, "r8 fd = -1");
+    assert_eq(load64(mr + 64), 0, "r9 off = 0");
+    synth_mmap_regs(mr, 1);
+    assert_eq(load64(mr + 104), 2097152, "unaligned len rounds up");
 
     return assert_summary();
 }
