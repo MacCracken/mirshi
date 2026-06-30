@@ -4,7 +4,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-0.7.1 — Supervisor rootfs confinement (the path-escape blocker fix), bites 1+2.
+0.7.1 — Supervisor rootfs confinement (the path-escape blocker fix), bites 1+2+3.
 
 ### Security
 - **`--root <dir>` rootfs confinement** ([ADR 0009](docs/adr/0009-rootfs-confinement-openat2-in-child.md)):
@@ -19,6 +19,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     → the `*at` family anchored at the rootfd, with the path **lexically sanitized**
     (`sanitize_rootrel`: strip leading `/`, reject any `..` component) since `*at` has no
     `RESOLVE_*`. So under `--root` no path string reaches the kernel unconfined.
+  - **bite 3 (hardening)** — `RESOLVE_NO_MAGICLINKS` added to the `open` resolve, blocking
+    proc magic-links (`/proc/*/root`, `/proc/*/fd/N`) that could jump out of a bare-CLI
+    jail containing `/proc`. The Docker vehicle needs no `--root` — its mount namespace
+    already confines every path to the container image.
   Without `--root`, transparent pass-through is unchanged (a loud warning prints in run
   mode); the container mount namespace remains the boundary for the v1 vehicle. New gate
   `scripts/it/confine.sh` (self-validating: proves the escape leaks without `--root`,

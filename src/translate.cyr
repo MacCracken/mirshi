@@ -75,6 +75,8 @@ fn mkdir_create_mode(): i64 { return 0x1C0; }    # 0700
 #   - strip leading '/'  — an absolute path handed to *at IGNORES the dirfd and resolves
 #     at the host root (verified escape), so it must be made relative to ROOTFD.
 #   - REJECT any ".." component — *at would walk it out of the anchor (verified escape).
+#     Conservative: a recoverable path like "a/../b" is REJECTED, not normalized to "b"
+#     (purely lexical — it may over-reject, but it NEVER under-rejects, the safe direction).
 # "" / "/" collapse to "." (the root dir itself). Returns 0 on success (buf now holds the
 # relative path), or -1 if a ".." component is present (the caller DENIES). NOTE: this is
 # lexical, so a PRE-EXISTING symlink component in the rootfs can still redirect (agnos

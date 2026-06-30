@@ -49,8 +49,11 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   as an `openat2` anchor. **Fail-closed**: if the root won't open, abort the child.
 - **`open#7` confined** (`src/dispatch.cyr`): stage the path + a 24-byte
   `struct open_how {flags = ao_to_o(aflags), mode = (O_CREAT ? 0600 : 0), resolve =
-  RESOLVE_IN_ROOT}` in the red zone, synth `openat2(437)` with `rdi=ROOTFD`, `r10=24`.
-  (`how.mode` must be 0 without `O_CREAT` — `openat2` is stricter than `open(2)`.)
+  RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS}` in the red zone, synth `openat2(437)` with
+  `rdi=ROOTFD`, `r10=24`. (`how.mode` must be 0 without `O_CREAT` — `openat2` is stricter
+  than `open(2)`.) `RESOLVE_NO_MAGICLINKS` blocks proc magic-links (`/proc/*/root`,
+  `/proc/*/fd/N`, …) that could otherwise jump **outside** a bare-CLI jail that contains
+  `/proc`; it does NOT affect regular files or symlinks (those stay `IN_ROOT`-clamped).
 - **Bite split.** **Bite 1**: `open#7` → `openat2 RESOLVE_IN_ROOT`. Every fd-based op
   (`read`/`write`/`lseek`/`dup`/`close`/`getdents#29`) rides a fd from a confined open,
   so it is transitively confined. **Bite 2**: the path-mutation+metadata ops
@@ -76,7 +79,11 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   mount NS. `--root` is never a false-confidence footgun — unconfined ops are denied,
   not silently escaping.
 - **Negative / owned** — `--root` is **opt-in** (absent by default, with a warning),
-  so an operator who forgets it is unconfined; the Docker image should add `--root /`.
+  so a bare-CLI operator who forgets it is unconfined. (The **Docker vehicle does NOT
+  need `--root`** — its mount namespace already makes the container *image* the root for
+  every path, including `/proc` magic-links, since the child's actual root IS the
+  container root, not the host. `--root /` there would be redundant. `--root` is the
+  supervisor-side confinement for the **bare CLI**, where there is no namespace.)
   The bite-2 `*at` confinement is **lexical** (`sanitize_rootrel`), so it is
   `..`/absolute-safe but NOT symlink-safe for a **pre-existing** symlink component in the
   rootfs (a hostile symlink already in the root could redirect a mutation op) — a
@@ -85,9 +92,11 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   residual (`openat2 RESOLVE_IN_ROOT` is symlink-safe). The `..` semantics differ between
   classes: `open` **clamps** `..` (kernel), the mutation ops **reject** it (lexical) —
   both safe. One fixed `ROOTFD`=100 is consumed in the child's fd table. Linux 5.6+ only.
-- **Neutral** — bites 1+2 confine the full path surface under `--root`. The remaining
-  0.7.1 work is activating `--root /` in the Docker vehicle's `ENTRYPOINT` + an
-  in-container escape-attempt assertion in the smoke gate (bite 3).
+- **Neutral** — bites 1+2 confine the full path surface under `--root`; bite 3 adds
+  `RESOLVE_NO_MAGICLINKS`. The Docker vehicle relies on its mount namespace (not
+  `--root`), which the smoke gate already proves (`FROM scratch`, no host bind mounts).
+  0.7.1's class-(c) remediation is complete: confined under `--root` (bare CLI),
+  namespace-bounded (container).
 
 ## Alternatives considered
 

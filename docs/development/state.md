@@ -134,12 +134,14 @@ path-escape** (no in-supervisor path confinement; bare-CLI child reaches arbitra
 paths, PoC-confirmed) — bounded by the container mount NS in the v1 vehicle, fixed
 properly by the **0.7.1** supervisor rootfs confinement.
 
-**0.7.1 rootfs confinement** — ⚙ in progress. Bites 1+2 done (in `[Unreleased]`):
+**0.7.1 rootfs confinement** — ✅ complete (in `[Unreleased]`):
 `--root <dir>` confines the full path surface ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)),
 kernel-enforced + unprivileged. Bite 1: `open#7` → `openat2 RESOLVE_IN_ROOT` (abs/traversal/
 symlink clamped; all fd-based ops transitively confined). Bite 2: `mkdir`/`rmdir`/`unlink`/
 `rename`/`link`/`stat` → the `*at` family with the path lexically sanitized
-(`sanitize_rootrel`: strip `/`, reject `..` — unit-tested). Gate `scripts/it/confine.sh`.
-Bite 3: activate `--root /` in the Docker `ENTRYPOINT` + an in-container escape assertion.
+(`sanitize_rootrel`: strip `/`, reject `..` — unit-tested; brute-force-verified no bypass).
+Bite 3: `RESOLVE_NO_MAGICLINKS` (block proc magic-link escapes). Gate `scripts/it/confine.sh`.
+The Docker vehicle stays namespace-confined (no `--root` needed). The audit's class-(c)
+blocker tier is closed.
 
 Then 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.

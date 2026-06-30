@@ -38,6 +38,11 @@ enum MirshiConfine {
     SYS_OPENAT2 = 437;          # openat2(dirfd, path, &open_how, size) — the only RESOLVE_* op
     OPEN_HOW_SIZE = 24;         # sizeof(struct open_how) {u64 flags; u64 mode; u64 resolve}
     RESOLVE_IN_ROOT = 0x10;     # clamp resolution within the anchor dirfd (abs + .. + symlink)
+    RESOLVE_NO_MAGICLINKS = 0x2;  # block proc magic-links (/proc/*/root, /proc/*/fd/N, ...) — they
+                                  # can jump OUTSIDE a jail that contains /proc. (NB: this does NOT
+                                  # block /proc/self/mem — /proc/self is a regular symlink, clamped
+                                  # by IN_ROOT; the real /proc defense is a jail with no /proc.)
+    OPEN_RESOLVE = 0x12;        # RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS (the how.resolve we set)
     O_PATH = 0x200000;          # rootfd open: an inert dirfd anchor (read/getdents -> EBADF)
     O_DIRECTORY = 0x10000;      # assert the root is a directory at open time (fail-fast)
     O_CREAT = 0x40;             # openat2 rejects a nonzero how.mode UNLESS O_CREAT is set
@@ -289,7 +294,7 @@ fn translate_dispatch(pid, regs): i64 {
             var hb = _how_buf_get();
             store64(hb + 0, oflags);                   # how.flags
             store64(hb + 8, howmode);                  # how.mode  (0 unless O_CREAT)
-            store64(hb + 16, RESOLVE_IN_ROOT);         # how.resolve
+            store64(hb + 16, OPEN_RESOLVE);            # how.resolve = IN_ROOT | NO_MAGICLINKS
             var howsc = stage_bytes(pid, hb, OPEN_HOW_SIZE, sc7);   # struct BELOW the path
             if (howsc < 0) { return _m2_fail(pid, regs); }
             store64(regs + REG_RDI, ROOTFD);           # dirfd = the child's rootfs anchor
