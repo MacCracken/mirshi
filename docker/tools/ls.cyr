@@ -1,0 +1,27 @@
+# docker/tools/ls.cyr — agnos demo tool: list the container root "/".
+# Proves the M2 getdents translation (open O_DIRECTORY + getdents + the dirent
+# repack) inside the container. Prints one name per line.
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var p = "/";
+    var fd = sys_open(p, strlen(p), AO_RDONLY | AO_DIRECTORY);
+    if (fd < 0) { return 1; }
+    var buf[2048];
+    while (1 == 1) {
+        var n = sys_getdents(fd, &buf, 2048);
+        if (n <= 0) { sys_close(fd); return 0; }
+        var off = 0;
+        while (off < n) {
+            var reclen = load16(&buf + off + 0);     # DIRENT_RECLEN@0
+            var namelen = load8(&buf + off + 3);     # DIRENT_NAMELEN@3
+            sys_write(1, &buf + off + 8, namelen);   # DIRENT_NAME@8
+            sys_write(1, "\n", 1);
+            off = off + reclen;
+        }
+    }
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

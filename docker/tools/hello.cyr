@@ -1,0 +1,13 @@
+# docker/tools/hello.cyr — agnos demo tool: write + exit.
+# Built agnos-target and bundled into the agnos-mirshi image; run as
+#   docker run --rm agnos-mirshi /bin/hello
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var m = "hello from agnos userland, under mirshi, in a plain container (no QEMU)\n";
+    sys_write(1, m, strlen(m));
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

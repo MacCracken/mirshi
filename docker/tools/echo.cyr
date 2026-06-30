@@ -1,0 +1,17 @@
+# docker/tools/echo.cyr — agnos demo tool: stdin -> stdout echo (a "cat -").
+# Proves read#5 (stdin) + write#1 translation; useful for the fan-out demo
+#   echo hi | docker run -i --rm agnos-mirshi /bin/echo
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var buf[512];
+    while (1 == 1) {
+        var n = sys_read(0, &buf, 512);
+        if (n <= 0) { return 0; }
+        sys_write(1, &buf, n);
+    }
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

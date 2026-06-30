@@ -109,13 +109,18 @@ fn _wait(pid, status): i64 {
 include "src/translate.cyr"
 include "src/scratch.cyr"
 include "src/dispatch.cyr"
+include "src/seccomp.cyr"
 
 # The traced child. Runs the ABSOLUTE MINIMUM between fork and execve — mark
 # self as tracee, then replace the image. No alloc, no print: anything that
 # syscalls here would show up as a spurious pre-image trap (and we are not yet
 # set up to trace it). execve only returns on failure.
-fn _child_exec(path): i64 {
+fn _child_exec(path, bound): i64 {
     pt(PTRACE_TRACEME, 0, 0, 0);
+    # M3 bounding seccomp: restrict the child to the agnos syscall surface before
+    # exec (the filter persists across execve). Installed here, after TRACEME and
+    # before execve, so the agnos image runs under it. Non-fatal if it fails.
+    if (bound == 1) { apply_child_bound(); }
     var argv[24];                 # 3 slots: [path, NULL, spare] — bytes, not entries
     store64(&argv, path);
     store64(&argv + 8, 0);
@@ -267,14 +272,19 @@ fn _trace_run(pid): i64 {
 }
 
 # Public entry: fork the agnos child, trace it to completion, return its code.
-fn intercept_run(path, selftest): i64 {
+fn intercept_run(path, selftest, bound): i64 {
     var pid = sys_fork();
     if (pid < 0) {
         _emit(2, "mirshi: fork failed\n");
         return 1;
     }
     if (pid == 0) {
-        _child_exec(path);          # never returns on success
+        # The bounding allowlist is the RUN translation's output set; it does not
+        # fit the trace mode (SYSEMU leaves the raw agnos numbers unrewritten), so
+        # only bound in run mode.
+        var b = bound;
+        if (selftest == 1) { b = 0; }
+        _child_exec(path, b);       # never returns on success
         return EXECVE_FAILED;
     }
     if (selftest == 1) { return _trace_log(pid); }

@@ -4,6 +4,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-29
+
+M3 — the Docker vehicle. agnos userland runs in a plain container, no QEMU.
+This completes the functional v1 surface (direction-1 headless CLI, M0–M3).
+
+### Added
+- **M3 — the Docker vehicle + multi-container fan-out** (the v1 vehicle): agnos
+  userland runs in a plain container, **no QEMU**.
+  - `docker/Dockerfile` — a **`FROM scratch`** image (~58 KB) carrying mirshi +
+    agnos-target static ELFs + a tiny rootfs, `ENTRYPOINT ["/mirshi"]`. Static
+    no-libc binaries → no base OS, no shell, structurally no QEMU.
+  - `docker/{build,fanout,smoke}.sh` + `docker/tools/*.cyr` (hello/catfile/ls/echo)
+    — build the image, run agnos tools (`docker run agnos-mirshi /bin/hello`),
+    demonstrate N-container fan-out, and a CI smoke gate (proves no qemu in the
+    image). Wired into CI after the M2 step.
+  - **Bounding seccomp policy** (`src/seccomp.cyr`): mirshi installs a classic-BPF
+    allowlist on the child (after `PTRACE_TRACEME`, before `execve`, with
+    `PR_SET_NO_NEW_PRIVS`) capping it to the syscalls the translation emits;
+    anything else is `SIGSYS`-killed. Default-on in run mode, `--no-seccomp`
+    opt-out, off in trace mode. The default-deny completeness proof is 0.7.0.
+  - `mirshi` CLI: `mirshi [--selftest-trace] [--no-seccomp] <agnos-elf>`.
+  - [ADR 0004](docs/adr/0004-docker-vehicle-bounding-seccomp.md) + the
+    [fan-out guide](docs/guides/docker-fanout.md). ADR 0004 records the
+    load-bearing finding that **seccomp is evaluated after the ptrace rewrite**
+    (so the filter allowlists mirshi's *output* syscalls, not the agnos input).
+
 ## [0.3.0] — 2026-06-29
 
 M2 — filesystem syscalls. agnos coreutils-class tools read+write a real fs, no QEMU.

@@ -22,3 +22,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0001 — ptrace(PTRACE_SYSEMU) as the M0 syscall-intercept mechanism](0001-ptrace-sysemu-intercept.md) — *Accepted*
 - [0002 — Execute-in-child translation via PTRACE_SYSCALL register rewrite](0002-execute-in-child-translation.md) — *Accepted*
 - [0003 — Filesystem translation: red-zone path staging + exit-stop repack](0003-fs-redzone-path-staging.md) — *Accepted*
+- [0004 — The Docker vehicle (FROM scratch) + child bounding seccomp](0004-docker-vehicle-bounding-seccomp.md) — *Accepted*

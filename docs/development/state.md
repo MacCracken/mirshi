@@ -5,8 +5,9 @@
 
 ## Version
 
-**0.3.0** — 2026-06-29. M2 = filesystem syscalls (agnos coreutils-class tools read+write a real fs, no QEMU).
-0.2.0 = M1 core translation; 0.1.0 = M0 scaffold + trap loop.
+**0.4.0** — 2026-06-29. M3 = the Docker vehicle (agnos userland in a plain container, no QEMU) +
+bounding seccomp. **Completes the functional v1 surface (M0–M3).** 0.3.0 = M2 fs; 0.2.0 = M1 core
+translation; 0.1.0 = M0 scaffold + trap loop.
 
 ## Toolchain
 
@@ -32,6 +33,10 @@ trap-log mode.
   red-zone `stage_at` (NUL-terminated paths / Linux structs into the stopped child).
 - `src/dispatch.cyr` — the impure dispatcher: execute-in-child / emulate / ENOSYS
   rewrites (M1) + the 13 fs handlers incl. the stat/getdents exit-stop repack (M2).
+- `src/seccomp.cyr` — M3 bounding seccomp: a classic-BPF allowlist of the
+  translation's output syscalls, installed on the child (default-on in run mode).
+- `docker/` — the v1 vehicle: a `FROM scratch` image (mirshi + agnos tools, no
+  QEMU), `build.sh`/`fanout.sh`/`smoke.sh`, and `tools/*.cyr`.
 
 Translation model: execute-in-child via `PTRACE_SYSCALL` register rewrite
 ([`../adr/0002`](../adr/0002-execute-in-child-translation.md)); fs calls stage
@@ -52,9 +57,11 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
   run under real translation (`heapuser` is the mmap-in-child regression gate).
 - `scripts/it/m2_fs.sh` — M2 fs integration test: agnos open/read/write/close/cp/
-  mkdir/rename/link/unlink/stat/getdents against a sandboxed temp rootfs, asserted by
-  HOST EFFECTS. All three ITs are CI steps after `cyrius test`; they need ptrace of a
-  same-uid child (no extra privilege on ubuntu-latest;
+  mkdir/rename/link/unlink/stat/getdents against a sandboxed temp rootfs (HOST EFFECTS).
+- `docker/smoke.sh` — M3 docker gate: build the `agnos-mirshi` image, `docker run`
+  agnos tools (correct output, no qemu in image), and a fan-out. The three `scripts/it/*`
+  + `docker/smoke.sh` are CI steps after `cyrius test`; the ptrace ITs need a same-uid
+  child (no extra privilege on ubuntu-latest;
   `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` in a container).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
@@ -80,8 +87,11 @@ swallow** layer. None wired yet (scaffold).
 
 ## Next
 
-See [`roadmap.md`](roadmap.md) — M0 + M1 + M2 done. Next is **M3** (v0.4.0): the
-Docker image (mirshi + an agnos userland set, `ENTRYPOINT ["mirshi"]`, **no QEMU in
-the image**) running the child under a **bounding seccomp policy**, + the
-multi-container fan-out story. This is also where the fs rootfs isolation (the M2
-path pass-through) gets its real boundary — the container mount namespace.
+See [`roadmap.md`](roadmap.md) — M0–M3 done (the functional v1 surface is in).
+Next is **M4** (v0.5.0): replace the ptrace trap loop with `SECCOMP_RET_USER_NOTIF`
+(read child memory via `process_vm_readv`, return results on the notify fd,
+`FLAG_CONTINUE` for pass-through numbers) — the low-overhead path for fan-out at
+scale, benchmarked against ptrace. ⚠ The documented `FLAG_CONTINUE` TOCTOU is the
+headline 0-day class (0.7.0): never `FLAG_CONTINUE` a security-relevant syscall.
+After M4, the **0.6.0–0.9.0 quality arc** (harden → security sweep → optimize →
+freeze + docs) closes v1.

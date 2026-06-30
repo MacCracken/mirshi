@@ -50,13 +50,16 @@ there is **no symlink syscall** — mirshi follows agnos's surface. **Acceptance
 Known gaps: transparent path pass-through (rootfs isolation = M3, escape hardening = 0.7.0); `getdents`
 overflow-drop + ino u64→u32 truncation.
 
-### M3 — The Docker image + multi-container fan-out (the v1 vehicle) (v0.4.0)
+### M3 — The Docker image + multi-container fan-out (the v1 vehicle) (v0.4.0) — ✅ shipped 2026-06-29
 A `Dockerfile` building an image that carries **mirshi (Linux-target)** + an **agnos userland set
 (agnos-target ELFs)**, `ENTRYPOINT ["mirshi"]`; `docker run` an agnos binary with **no QEMU in the image**.
 mirshi runs the child under a **bounding seccomp policy**. Document multi-container fan-out (boot N containers,
-throw concurrent tests across heterogeneous Linux hosts — the near-term win). Acceptance:
-`docker run agnos-mirshi /bin/<agnos-tool>` runs in a plain container (no qemu binary present), correct
-output/exit; N-container fan-out demonstrated.
+throw concurrent tests across heterogeneous Linux hosts — the near-term win). **Acceptance met:**
+`docker run agnos-mirshi /bin/hello|catfile|ls` runs in a **`FROM scratch`** container (proven no qemu binary
+present), correct output/exit; N-container fan-out demonstrated (`docker/fanout.sh`); proven by `docker/smoke.sh`
+(a CI gate). Bounding seccomp = an allowlist of the translation's output syscalls (default-on, run mode);
+mechanism + the seccomp-after-ptrace finding: [`../adr/0004-docker-vehicle-bounding-seccomp.md`](../adr/0004-docker-vehicle-bounding-seccomp.md).
+The container mount namespace is also where M2's transparent path pass-through gets its rootfs boundary.
 
 ### M4 — seccomp-user-notify migration (scale) (v0.5.0)
 Replace the ptrace trap loop with `SECCOMP_RET_USER_NOTIF`: read child memory via `process_vm_readv`,

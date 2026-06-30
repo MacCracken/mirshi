@@ -1,0 +1,20 @@
+# docker/tools/catfile.cyr — agnos demo tool: cat a file from the container fs.
+# Reads /data/motd.txt (baked into the image) and writes it to stdout — proves
+# the M2 filesystem translation (open/read/write/close) inside the container.
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var p = "/data/motd.txt";
+    var fd = sys_open(p, strlen(p), AO_RDONLY);
+    if (fd < 0) { return 1; }
+    var buf[512];
+    while (1 == 1) {
+        var n = sys_read(fd, &buf, 512);
+        if (n <= 0) { sys_close(fd); return 0; }
+        sys_write(1, &buf, n);
+    }
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

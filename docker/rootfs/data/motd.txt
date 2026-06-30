@@ -1,0 +1,3 @@
+agnos userland is running as a native Linux process under mirshi.
+This file was read from the container filesystem via translated open/read/close.
+No QEMU, shared host kernel — direction 1 of the mirror-shim.

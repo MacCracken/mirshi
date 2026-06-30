@@ -75,3 +75,10 @@ jobs:
         # the red-zone path staging + process_vm_* + the stat/getdents repacks.
         # Same ptrace requirements as the M0/M1 steps.
         run: bash scripts/it/m2_fs.sh
+
+      - name: M3 docker smoke test
+        # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
+        # image, `docker run` agnos tools in a plain container (correct output,
+        # NO qemu in the image), and a multi-container fan-out. ubuntu-latest
+        # ships Docker; the child runs under mirshi's bounding seccomp allowlist.
+        run: bash docker/smoke.sh
