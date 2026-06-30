@@ -51,12 +51,16 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   `struct open_how {flags = ao_to_o(aflags), mode = (O_CREAT ? 0600 : 0), resolve =
   RESOLVE_IN_ROOT}` in the red zone, synth `openat2(437)` with `rdi=ROOTFD`, `r10=24`.
   (`how.mode` must be 0 without `O_CREAT` — `openat2` is stricter than `open(2)`.)
-- **Bite split.** Bite 1 (this ADR): `open#7` confined. Because every fd-based op
-  (`read`/`write`/`lseek`/`dup`/`close`/`getdents#29`) rides a fd that came from a
-  confined open, they are transitively confined. The path-mutation+metadata ops
-  (`mkdir#9`/`rmdir#10`/`unlink#30`/`rename#31`/`link#32`/`stat#33`) have **no** `openat2`
-  form and need parent-anchored `*at` — **bite 2**; until then they are **denied**
-  under `--root`.
+- **Bite split.** **Bite 1**: `open#7` → `openat2 RESOLVE_IN_ROOT`. Every fd-based op
+  (`read`/`write`/`lseek`/`dup`/`close`/`getdents#29`) rides a fd from a confined open,
+  so it is transitively confined. **Bite 2**: the path-mutation+metadata ops
+  (`mkdir#9`/`rmdir#10`/`unlink#30`/`rename#31`/`link#32`/`stat#33`) → the `*at` family
+  (`mkdirat`/`unlinkat`(+`AT_REMOVEDIR` for rmdir)/`renameat2`/`linkat`/`newfstatat`)
+  anchored at `ROOTFD`. The `*at` family has **no** `RESOLVE_*` (only `openat2` does) —
+  verified empirically that `*at` with an absolute path ignores the dirfd and `..` walks
+  out — so the supervisor **lexically sanitizes** the path first (`sanitize_rootrel`:
+  strip leading `/`, **reject** any `..` component; `""`/`"/"` → `"."`), then stages the
+  relative path. The sanitizer is pure and unit-tested.
 - **The fd-clobber invariant** (load-bearing): clamping is safe ONLY because the child
   can never obtain an **unconfined** dirfd to `dup3` over `ROOTFD`. Every fd it holds
   came from a confined `open#7`; `dup`-ing a confined fd over `ROOTFD` only narrows the
@@ -73,11 +77,17 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   not silently escaping.
 - **Negative / owned** — `--root` is **opt-in** (absent by default, with a warning),
   so an operator who forgets it is unconfined; the Docker image should add `--root /`.
-  Bite 1 **denies** `mkdir`/`rmdir`/`unlink`/`rename`/`link`/`stat` under `--root`, so
-  mutate/stat-heavy tools don't yet work confined (bite 2 lifts this). One fixed
-  `ROOTFD`=100 is consumed in the child's fd table. Linux 5.6+ only (`openat2`).
-- **Neutral** — bite 2 (parent-anchored `*at` + lexical sanitization for the mutation
-  ops) and the in-container escape-attempt assertions are the remaining 0.7.1 work.
+  The bite-2 `*at` confinement is **lexical** (`sanitize_rootrel`), so it is
+  `..`/absolute-safe but NOT symlink-safe for a **pre-existing** symlink component in the
+  rootfs (a hostile symlink already in the root could redirect a mutation op) — a
+  narrower **rootfs-trust** residual than the blocker tier, and unreachable for an agnos
+  child since agnos has **no symlink syscall** (it cannot plant one). `open#7` has no such
+  residual (`openat2 RESOLVE_IN_ROOT` is symlink-safe). The `..` semantics differ between
+  classes: `open` **clamps** `..` (kernel), the mutation ops **reject** it (lexical) —
+  both safe. One fixed `ROOTFD`=100 is consumed in the child's fd table. Linux 5.6+ only.
+- **Neutral** — bites 1+2 confine the full path surface under `--root`. The remaining
+  0.7.1 work is activating `--root /` in the Docker vehicle's `ENTRYPOINT` + an
+  in-container escape-attempt assertion in the smoke gate (bite 3).
 
 ## Alternatives considered
 

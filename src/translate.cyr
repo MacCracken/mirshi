@@ -69,6 +69,49 @@ fn ao_to_o(ao): i64 {
 fn open_create_mode(): i64 { return 0x180; }     # 0600
 fn mkdir_create_mode(): i64 { return 0x1C0; }    # 0700
 
+# 0.7.1 bite 2: sanitize a NUL-terminated agnos path IN PLACE into a root-RELATIVE form
+# for the confined *at(ROOTFD, ...) path-mutation ops. The *at family does NOT honor
+# RESOLVE_* (only openat2 does), so we must lexically neutralize escapes ourselves:
+#   - strip leading '/'  — an absolute path handed to *at IGNORES the dirfd and resolves
+#     at the host root (verified escape), so it must be made relative to ROOTFD.
+#   - REJECT any ".." component — *at would walk it out of the anchor (verified escape).
+# "" / "/" collapse to "." (the root dir itself). Returns 0 on success (buf now holds the
+# relative path), or -1 if a ".." component is present (the caller DENIES). NOTE: this is
+# lexical, so a PRE-EXISTING symlink component in the rootfs can still redirect (agnos
+# cannot create symlinks, so this needs a hostile rootfs — narrower than the blocker
+# tier; see docs/adr/0009). Pure: touches only the caller's buffer (unit-tested).
+fn sanitize_rootrel(buf): i64 {
+    # (1) Reject any ".." component. A component is ".." iff, at a component start
+    # (buffer start or just after '/'), the next bytes are ".." then '/' or NUL.
+    var p = buf;
+    var start = 1;
+    while (load8(p) != 0) {
+        if (start == 1) {
+            if (load8(p) == 46) {                  # '.'
+                if (load8(p + 1) == 46) {          # '.'
+                    var c2 = load8(p + 2);
+                    if (c2 == 0) { return 0 - 1; }     # ".." at end
+                    if (c2 == 47) { return 0 - 1; }    # "../"
+                }
+            }
+            start = 0;
+        }
+        if (load8(p) == 47) { start = 1; }         # '/' -> next byte starts a component
+        p = p + 1;
+    }
+    # (2) Strip leading '/' (make it relative to the anchor dirfd).
+    var src = buf;
+    while (load8(src) == 47) { src = src + 1; }
+    if (src != buf) {
+        var d = buf;
+        while (load8(src) != 0) { store8(d, load8(src)); d = d + 1; src = src + 1; }
+        store8(d, 0);
+    }
+    # (3) Empty (was "" or all '/') -> "." (the root dir itself).
+    if (load8(buf) == 0) { store8(buf, 46); store8(buf + 1, 0); }
+    return 0;
+}
+
 # Map a Linux getdents64 d_type to the agnos AgnosDirent type byte.
 fn dtype_to_agnos(d_type): i64 {
     if (d_type == 8) { return 1; }    # DT_REG -> file

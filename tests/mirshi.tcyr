@@ -204,6 +204,37 @@ fn main() {
     # Overflow: a tiny cap stops before the first record's 13 bytes.
     assert_eq(getdents_repack(glb, 56, gab, 10), 0, "cap 10 < 13 -> drop, return 0");
 
+    # --- 0.7.1 path sanitization (the *at confinement gate — a bug here is an escape) ---
+    test_group("sanitize-rootrel");
+    var sb = alloc(64);
+    memcpy(sb, "/etc/passwd", 11); store8(sb + 11, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "/etc/passwd ok");
+    assert_streq(sb, "etc/passwd", "strip leading slash -> relative");
+    memcpy(sb, "//foo", 5); store8(sb + 5, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "//foo ok");
+    assert_streq(sb, "foo", "strip multiple leading slashes");
+    memcpy(sb, "x/y", 3); store8(sb + 3, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "x/y ok");
+    assert_streq(sb, "x/y", "relative path unchanged");
+    memcpy(sb, "/", 1); store8(sb + 1, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "/ ok");
+    assert_streq(sb, ".", "/ -> . (root dir)");
+    store8(sb, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "empty ok");
+    assert_streq(sb, ".", "empty -> .");
+    memcpy(sb, "a/..foo", 7); store8(sb + 7, 0);
+    assert_eq(sanitize_rootrel(sb), 0, "a/..foo ok (..foo is not ..)");
+    assert_streq(sb, "a/..foo", "..foo preserved (not a .. component)");
+    # ".." components in any position are REJECTED (-1):
+    memcpy(sb, "/../etc", 7); store8(sb + 7, 0);
+    assert_eq(sanitize_rootrel(sb), 0 - 1, "/../etc -> reject (leading ..)");
+    memcpy(sb, "a/../b", 6); store8(sb + 6, 0);
+    assert_eq(sanitize_rootrel(sb), 0 - 1, "a/../b -> reject (internal ..)");
+    memcpy(sb, "a/b/..", 6); store8(sb + 6, 0);
+    assert_eq(sanitize_rootrel(sb), 0 - 1, "a/b/.. -> reject (trailing ..)");
+    memcpy(sb, "..", 2); store8(sb + 2, 0);
+    assert_eq(sanitize_rootrel(sb), 0 - 1, ".. -> reject (bare)");
+
     return assert_summary();
 }
 

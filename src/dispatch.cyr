@@ -45,6 +45,14 @@ enum MirshiConfine {
     HOST_OPEN = 2;              # Linux open(2)  — used pre-execve in the child to get rootfd
     HOST_CLOSE = 3;             # Linux close(2) — close the temporary low rootfd after dup3
     HOST_DUP3 = 292;            # Linux dup3(2)  — pin rootfd at ROOTFD (flags=0, survives execve)
+    # bite 2: the path-mutation/metadata *at peers, anchored at ROOTFD with a
+    # lexically-sanitized relative path (the *at family has no RESOLVE_* of its own).
+    SYS_NEWFSTATAT = 262;       # stat#33  -> newfstatat(ROOTFD, rel, statbuf, flag=0)
+    SYS_MKDIRAT = 258;          # mkdir#9  -> mkdirat(ROOTFD, rel, mode)
+    SYS_UNLINKAT = 263;         # unlink#30/rmdir#10 -> unlinkat(ROOTFD, rel, flag)
+    SYS_RENAMEAT2 = 316;        # rename#31 -> renameat2(ROOTFD, oldrel, ROOTFD, newrel, 0)
+    SYS_LINKAT = 265;           # link#32   -> linkat(ROOTFD, oldrel, ROOTFD, newrel, 0)
+    AT_REMOVEDIR = 0x200;       # unlinkat flag for rmdir (remove a directory, not a file)
 }
 
 # Whether path confinement is active (a --root was configured). Set by intercept_run
@@ -120,6 +128,58 @@ fn _m2_two_path(pid, regs, lnr): i64 {
     store64(regs + REG_RDI, s0);
     store64(regs + REG_RSI, s1);
     store64(regs + REG_ORIG_RAX, lnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# --- 0.7.1 bite 2: CONFINED path-mutation/metadata ops (--root). Each sanitizes+stages
+#     its path(s) to a root-relative form and anchors the *at peer at ROOTFD. ---
+
+# Confined single-path op: mkdir#9 (mkdirat, a3=mode) / rmdir#10 (unlinkat, a3=AT_REMOVEDIR)
+# / unlink#30 (unlinkat, a3=0). a3 is the op's 3rd arg (mode or *at flag).
+fn _cf_one(pid, regs, atnr, a3): i64 {
+    var sc = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                               load64(regs + REG_RSP) - RED_ZONE);
+    if (sc < 0) { return _m2_fail(pid, regs); }
+    store64(regs + REG_RDI, ROOTFD);
+    store64(regs + REG_RSI, sc);
+    store64(regs + REG_RDX, a3);
+    store64(regs + REG_ORIG_RAX, atnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# Confined two-path op: rename#31 -> renameat2 / link#32 -> linkat — both share the
+# (olddirfd, old, newdirfd, new, flags=0) shape; both dirfds are ROOTFD.
+fn _cf_two(pid, regs, atnr): i64 {
+    var s0 = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                               load64(regs + REG_RSP) - RED_ZONE);
+    if (s0 < 0) { return _m2_fail(pid, regs); }
+    var s1 = stage_at_confined(pid, decode_arg(regs, 2), decode_arg(regs, 3), s0);   # below s0
+    if (s1 < 0) { return _m2_fail(pid, regs); }
+    store64(regs + REG_RDI, ROOTFD);      # old dirfd
+    store64(regs + REG_RSI, s0);          # old path (sanitized)
+    store64(regs + REG_RDX, ROOTFD);      # new dirfd
+    store64(regs + REG_R10, s1);          # new path (sanitized)
+    store64(regs + REG_R8, 0);            # flags = 0
+    store64(regs + REG_ORIG_RAX, atnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# Confined stat#33 -> newfstatat(ROOTFD, rel, statbuf144, flag=0). Same exit-stop repack
+# as the unconfined stat (fs_exit_return(33) repacks the 144 B Linux struct -> agnos 48 B).
+fn _cf_stat(pid, regs): i64 {
+    var sps = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                                load64(regs + REG_RSP) - RED_ZONE);
+    if (sps < 0) { return _m2_fail(pid, regs); }
+    _m2_scratch = (sps - 144) & (0 - 8);      # 144 B Linux statbuf, below the path
+    _m2_out_ptr = decode_arg(regs, 2);        # the agnos 48 B statbuf (for the exit repack)
+    store64(regs + REG_RDI, ROOTFD);
+    store64(regs + REG_RSI, sps);
+    store64(regs + REG_RDX, _m2_scratch);     # statbuf
+    store64(regs + REG_R10, 0);               # flags (0: follow symlinks, like stat)
+    store64(regs + REG_ORIG_RAX, SYS_NEWFSTATAT);
     pt(PTRACE_SETREGS, pid, 0, regs);
     return STRAT_EXECUTE;
 }
@@ -246,19 +306,18 @@ fn translate_dispatch(pid, regs): i64 {
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EXECUTE;
     }
-    # 0.7.1 bite 1: open#7 (above) is confined via openat2 RESOLVE_IN_ROOT, and the
-    # fd-based ops (read/write/lseek/dup/close/getdents) ride already-confined fds. The
-    # path-MUTATION + metadata ops (mkdir#9 / rmdir#10 / unlink#30 / rename#31 / link#32 /
-    # stat#33) are NOT yet confined — under --root they are DENIED fail-closed (agnos -1)
-    # rather than reaching arbitrary host paths. --root must never be a false-confidence
-    # footgun. Their parent-anchored *at forms land in bite 2 (docs/adr/0009).
+    # 0.7.1: open#7 (above) is confined via openat2 RESOLVE_IN_ROOT, and the fd-based ops
+    # (read/write/lseek/dup/close/getdents) ride already-confined fds. The path-MUTATION +
+    # metadata ops (mkdir#9 / rmdir#10 / unlink#30 / rename#31 / link#32 / stat#33) are
+    # confined here (bite 2) via *at anchored at ROOTFD with a sanitized relative path —
+    # so under --root no path string ever reaches the kernel unconfined. See ADR 0009.
     if (_confine_active == 1) {
-        if (nr == 9) { return _m2_fail(pid, regs); }
-        if (nr == 10) { return _m2_fail(pid, regs); }
-        if (nr == 30) { return _m2_fail(pid, regs); }
-        if (nr == 31) { return _m2_fail(pid, regs); }
-        if (nr == 32) { return _m2_fail(pid, regs); }
-        if (nr == 33) { return _m2_fail(pid, regs); }
+        if (nr == 9) { return _cf_one(pid, regs, SYS_MKDIRAT, mkdir_create_mode()); }
+        if (nr == 10) { return _cf_one(pid, regs, SYS_UNLINKAT, AT_REMOVEDIR); }   # rmdir
+        if (nr == 30) { return _cf_one(pid, regs, SYS_UNLINKAT, 0); }              # unlink
+        if (nr == 31) { return _cf_two(pid, regs, SYS_RENAMEAT2); }                # rename
+        if (nr == 32) { return _cf_two(pid, regs, SYS_LINKAT); }                   # link
+        if (nr == 33) { return _cf_stat(pid, regs); }                             # stat
     }
 
     if (nr == 9) {

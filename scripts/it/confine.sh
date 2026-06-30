@@ -60,9 +60,8 @@ ck "symlink target clamped" "DENIED" "$(timeout 15 "$mirshi" --root "$jail" "$fi
 # (4) WITH --root: a legitimate in-root path still resolves.
 ck "in-root path resolves"  "IN-ROOT-OK" "$(timeout 15 "$mirshi" --root "$jail" "$fix/inroot" 2>/dev/null)"
 
-# (5) WITH --root: a not-yet-confined path-MUTATION op (unlink#30) is DENIED fail-closed
-# (bite 1), so an absolute host path is NOT deleted. (Bite 2 will CONFINE these ops via
-# parent-anchored *at rather than deny them.)
+# (5) WITH --root: path-MUTATION ops are CONFINED via *at(ROOTFD, sanitized) (bite 2).
+#   (a) an absolute host path unlink rebases INTO the root, so the host file is untouched.
 victim="$sbox/host_victim.txt"; echo keep > "$victim"
 cat > "$fix/unlinker.cyr" <<EOF
 include "lib/syscalls.cyr"
@@ -72,8 +71,30 @@ syscall(SYS_EXIT, r);
 EOF
 cyrius build --agnos "$fix/unlinker.cyr" "$fix/unlinker" >/dev/null 2>&1
 timeout 15 "$mirshi" --root "$jail" "$fix/unlinker" >/dev/null 2>&1 || true
-if [ -e "$victim" ]; then echo "OK: path-mutation (unlink) denied under --root — host file survived"
+if [ -e "$victim" ]; then echo "OK: host-abs unlink contained under --root — host file survived"
 else echo "FAIL: unlink ESCAPED under --root — host file deleted!" >&2; fail=1; fi
 
+#   (b) a `..` mutation path is REJECTED by the sanitizer, and does not escape the root.
+cat > "$fix/mktrav.cyr" <<'EOF'
+include "lib/syscalls.cyr"
+fn main(): i64 { var r = syscall(9, "../escaped", 10); if (r == 0 - 1) { syscall(1,1,"DENIED\n",7); } return 0; }
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$fix/mktrav.cyr" "$fix/mktrav" >/dev/null 2>&1
+ck ".. mutation rejected" "DENIED" "$(timeout 15 "$mirshi" --root "$jail" "$fix/mktrav" 2>/dev/null)"
+if [ -e "$sbox/escaped" ]; then echo "FAIL: .. mkdir ESCAPED to the sbox!" >&2; fail=1; rm -rf "$sbox/escaped"; fi
+
+#   (c) a LEGITIMATE in-root mutation works (mkdir creates a dir inside the root).
+cat > "$fix/mkin.cyr" <<'EOF'
+include "lib/syscalls.cyr"
+fn main(): i64 { var r = syscall(9, "/made", 5); if (r == 0 - 1) { syscall(1,1,"FAIL\n",5); } else { syscall(1,1,"MADE\n",5); } return 0; }
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$fix/mkin.cyr" "$fix/mkin" >/dev/null 2>&1
+ck "in-root mkdir works" "MADE" "$(timeout 15 "$mirshi" --root "$jail" "$fix/mkin" 2>/dev/null)"
+if [ ! -d "$jail/made" ]; then echo "FAIL: in-root mkdir did not create jail/made" >&2; fail=1; fi
+
 if [ "$fail" -ne 0 ]; then echo "confine: FAILED" >&2; exit 1; fi
-echo "OK: confine — --root clamps abs/traversal/symlink escapes, in-root paths resolve"
+echo "OK: confine — --root clamps open + mutation escapes (abs/traversal/symlink), in-root ops work"
