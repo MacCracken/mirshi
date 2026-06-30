@@ -25,6 +25,15 @@ byte-identical lever is trimming the register I/O within those stops.
 - **Toolchain pin → `6.3.12`** (`cyrius.cyml [package].cyrius`, the source of truth) — synced
   to the current `cycc`/`cyrius` wrapper, clearing the pin-drift build warning.
 
+### Tests
+- **0-alloc-per-syscall gate** (`scripts/it/alloc_clean.sh`, the roadmap's named 0.8.0
+  acceptance): asserts the supervisor's per-syscall hot path allocates **nothing** per
+  translated call — mirshi's bump allocator never frees, so any per-call `alloc` is linear
+  RSS growth under a storm. Storms the EXECUTE pass-through (getpid#2) and fs path-staging
+  (stat#33) classes and asserts mirshi's RSS stays flat (delta 0 kB observed), complementing
+  `supervisor_hardening.sh`'s emulate-path (uptime#40) heap-bound check. Teeth-verified (a
+  materialized per-call `alloc(16)` grows RSS ~2.7 MB and trips the gate). Wired into CI.
+
 ## [0.7.1] — 2026-06-30
 
 Supervisor rootfs confinement — the path-escape blocker fix (audit class-(c)), bites

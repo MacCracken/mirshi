@@ -107,6 +107,15 @@ jobs:
         # no watchdog needed). Same ptrace requirements as the M0/M1/M2 steps.
         run: bash scripts/it/supervisor_hardening.sh
 
+      - name: Allocation-clean hot path (0-alloc per syscall)
+        # 0.8.0 optimization gate: the supervisor's per-syscall hot path allocates
+        # NOTHING per translated call (mirshi's bump allocator never frees, so any
+        # per-call alloc is linear RSS growth under a storm). Storms the EXECUTE
+        # pass-through (getpid#2) and fs path-staging (stat#33) classes and asserts
+        # mirshi's RSS stays flat — complementing supervisor_hardening's emulate-path
+        # (uptime#40) heap-bound check. Same ptrace requirements as the M0/M1/M2 steps.
+        run: bash scripts/it/alloc_clean.sh
+
       - name: Path confinement (--root rootfs jail)
         # 0.7.1 path-escape containment (the audit class-c blocker fix): under
         # --root <dir>, open#7 is rewritten to openat2 with RESOLVE_IN_ROOT anchored
