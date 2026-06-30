@@ -21,7 +21,7 @@
 agnos uses the x86_64 kernel register ABI (a1..a6 = `rdi/rsi/rdx/r10/r8/r9`; **a4 = r10**,
 not `rcx`). The agnos error convention is a **bare `-1`** for most calls (mmap#27 and
 time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
-([`linux_ret_to_agnos`](../src/translate.cyr)).
+([`linux_ret_to_agnos`](../../src/translate.cyr)).
 
 ## Matrix (agnos# 0–61)
 
@@ -34,7 +34,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 4 | waitpid | ENOSYS | — | multi-process — post-v1 |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
 | 6 | close | EXECUTE | `close` (3) | |
-| 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../src/translate.cyr)); mode 0600 on `O_CREAT` |
+| 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../../src/translate.cyr)); mode 0600 on `O_CREAT` |
 | 8 | dup | EXECUTE | `dup` (32) | |
 | 9 | mkdir | EXECUTE | `mkdir` (83) ¹ | path staged; mode 0700 |
 | 10 | rmdir | EXECUTE | `rmdir` (84) ¹ | path staged |

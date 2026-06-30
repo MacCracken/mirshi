@@ -8,6 +8,19 @@ cyrius build src/main.cyr build/mirshi    # compile
 cyrius test                              # run [build].test + tests/*.tcyr
 ```
 
+## Run an agnos binary
+
+```sh
+build/mirshi ./hello                     # translate + execute an agnos ELF (seccomp on, fs unconfined)
+build/mirshi --root ./rootfs ./ls /      # confine the child's filesystem to ./rootfs
+build/mirshi --selftest-trace ./hello    # M0 trap-log: print the agnos syscall stream, no translation
+```
+
+The full flag set, modes, and exit codes are the **frozen CLI contract**
+([`../reference/cli.md`](../reference/cli.md)); which agnos syscalls are mapped / emulated /
+ENOSYS is the **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md)).
+To run in a container with fan-out, see [`docker-fanout.md`](docker-fanout.md).
+
 ## Layout
 
 - `src/main.cyr` — entry point. Top-level `var r = main(); syscall(SYS_EXIT, r);`.

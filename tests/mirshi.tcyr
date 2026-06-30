@@ -168,8 +168,13 @@ fn main() {
     assert_eq(agnos_to_linux_nr(26), 0 - 1, "write_boot_checkpoint#26 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(35), 0 - 1, "sysinfo#35 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(36), 0 - 1, "undefined#36 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(37), 0 - 1, "undefined#37 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(38), 0 - 1, "undefined#38 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(39), 0 - 1, "undefined#39 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(42), 0 - 1, "undefined#42 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(43), 0 - 1, "undefined#43 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(44), 0 - 1, "undefined#44 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(47), 0 - 1, "sock_connect#47 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(48), 0 - 1, "sock_send#48 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(49), 0 - 1, "sock_recv#49 -> ENOSYS (net band)");

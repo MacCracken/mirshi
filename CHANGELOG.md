@@ -12,13 +12,21 @@ consolidate the docs before the v1.0.0 cut.
   the canonical, exhaustive per-number (agnos 0–61) AGNOS→Linux matrix — disposition
   (EXECUTE / EMULATE / EXIT / ENOSYS), the Linux peer, the `--root` re-anchored peers, the
   arg/return notes, the runnable v1 surface, and the carried-forward gaps. Mirrors the code
-  and is **pinned by tests** (`tests/mirshi.tcyr` `xlat-coverage`: every number's disposition
-  asserted, +38 assertions → 161 total). Adversarially audited row-by-row against the code.
+  and is **pinned by tests** (`tests/mirshi.tcyr` `xlat-coverage`: every agnos# 0–61's
+  disposition exhaustively asserted → 166 total). Adversarially audited row-by-row vs the code.
 - **Frozen CLI contract** — [`docs/reference/cli.md`](docs/reference/cli.md): the synopsis,
   flags (`--selftest-trace` / `--no-seccomp` / `--root <dir>`), modes, streams, and the
   exit-code map (child code / `128+sig` / `2` usage / `125` wait / `126` bound / `127` execve).
   Pinned by `scripts/it/cli.sh` (usage on misuse + `EXECVE_FAILED`), wired into CI.
 - New `docs/reference/` section (frozen contracts); indexed in `CLAUDE.md`.
+- **Boundary discipline ADR** — [ADR 0011](docs/adr/0011-mirshi-qemu-iron-boundary-discipline.md):
+  the load-bearing rule that mirshi *complements, never replaces* QEMU+KVM (real agnos kernel)
+  + iron (hardware truth), with the per-surface bug-class ownership table — promoting the
+  discipline from CLAUDE.md/roadmap prose to a cited decision (closes the "boundary-vs-QEMU"
+  + "discipline doc" 0.9.0 items). Linked from the roadmap's discipline note.
+- **Guides cross-linked** to the frozen contracts: `getting-started.md` gains a "Run an agnos
+  binary" section pointing at `reference/cli.md` + `reference/syscall-coverage.md`. (Verified
+  current — build/test commands, the ptrace recipe, and `--no-seccomp` are all accurate.)
 
 ## [0.8.0] — 2026-06-30
 

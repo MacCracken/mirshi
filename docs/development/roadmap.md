@@ -11,7 +11,8 @@
 > **Discipline** ([[feedback_qemu_test_agnos_userland]]): mirshi runs agnos userland on the
 > *host* Linux kernel — it validates **userland concurrency + Linux-app compat at scale**, NOT
 > the agnos kernel's own SMP scheduler / net stack. It **complements, never replaces** QEMU+KVM
-> (real kernel) + iron (hardware truth). Each surface owns a distinct bug class.
+> (real kernel) + iron (hardware truth). Each surface owns a distinct bug class —
+> [ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md).
 
 ## The core technical problem
 
