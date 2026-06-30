@@ -131,23 +131,28 @@ transparent (only `write#1` shares Linux's number, and even it needs the `-errno
 remains the documented default**. Acceptance (met): `docs/benchmarks.md` shows the per-syscall overhead + the
 realistic-workload (`cat`) wall-clock ✅; the 0-alloc gate is green ✅; numerics/behavior **byte-identical to 0.7.1** ✅.
 
-### 0.9.0 — Freeze + docs cleanup
-Freeze the **translation-table contract** (the per-agnos-syscall mapped / emulated / `ENOSYS` matrix) + the CLI;
-document the full syscall-coverage matrix, the Docker usage + multi-container fan-out guide, the discipline doc
-(mirshi vs QEMU vs iron), and ADRs for the load-bearing decisions (intercept mechanism, the `FLAG_CONTINUE`
-security rule, the boundary-vs-QEMU). CHANGELOG complete from 0.1.0. No behavior change — freeze + docs only.
+### 0.9.0 — Freeze + docs cleanup — ✅ shipped 2026-06-30
+No behavior change — froze the v1 contracts + consolidated the docs. **Translation-table contract frozen**: the
+per-number AGNOS→Linux **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md))
+— disposition (EXECUTE/EMULATE/EXIT/ENOSYS), Linux peer, the `--root` re-anchored peers, arg/return notes, gaps —
+**exhaustively test-pinned** for agnos# 0–61 (`tests/mirshi.tcyr` `xlat-coverage`) and adversarially audited
+row-by-row vs the code. **CLI frozen**: [`../reference/cli.md`](../reference/cli.md) (flags, modes, exit-code map),
+pinned by `scripts/it/cli.sh`. The Docker/fan-out guide is current; the **discipline doc**
+([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md): mirshi *complements, never replaces* QEMU+iron) is
+in place; the load-bearing decisions all have ADRs (intercept #0001, the `FLAG_CONTINUE` rule #0005,
+boundary-vs-QEMU #0011); CHANGELOG complete from 0.1.0; ADR index complete (0001–0011). Acceptance: all met ✅.
 
 ### v1.0.0 — clean cut: AGNOS userland in Docker, no QEMU (direction 1, headless CLI)
 The clean cut of the hardened/audited/optimized/frozen foundation: a representative agnos **CLI userland**
 (kriya coreutils + iam/mihi sysinfo + bannermanor + non-net tools) runs in a plain Docker container under mirshi,
 fan-out-ready, seccomp-bounded. **Acceptance = the v1 definition: AGNOS + mirshi runs in a docker container, no
 QEMU**, with every v1.0 criterion met across the 0.6–0.9 arc:
-- [ ] Translation-table contract **frozen** + per-syscall documented + tested (0.9.0)
-- [ ] ≥1 real agnos tool green end-to-end in-container; the Docker image published
-- [ ] Security audit pass — sandbox-escape classes swept, seccomp default-deny proven (0.7.0)
-- [ ] Benchmarks captured (per-syscall + workload; ptrace vs seccomp-notify) (0.8.0)
-- [ ] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
-- [ ] CHANGELOG complete from 0.1.0; ADRs for the load-bearing decisions
+- [x] Translation-table contract **frozen** + per-syscall documented + tested (0.9.0)
+- [ ] ≥1 real agnos tool green end-to-end in-container; the Docker image **published** ← the v1.0.0 cut deliverable
+- [x] Security audit pass — sandbox-escape classes swept, seccomp default-deny proven (0.7.0)
+- [x] Benchmarks captured (per-syscall + workload; ptrace vs seccomp-notify) (0.8.0)
+- [x] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
+- [x] CHANGELOG complete from 0.1.0; ADRs for the load-bearing decisions (0.9.0)
 
 ## Out of scope for v1 (post-v1 / v2+)
 

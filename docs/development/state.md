@@ -5,14 +5,15 @@
 
 ## Version
 
-**0.8.0** — 2026-06-30. Optimizations (measure-first hot-path). The ~30 µs per-syscall tax is
-dominated by the two `PTRACE_SYSCALL` stops (irreducible under ptrace); the byte-identical lever
-is trimming register I/O within them. Ships the **exit-stop single-register I/O**
-([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md)) — `PTRACE_PEEKUSER` reads only
-`rax`, `PTRACE_POKEUSER` writes it back only when it changed (~5–7 % off the syscall-dense tax,
-byte-identical) — plus a 0-alloc-per-syscall gate (`scripts/it/alloc_clean.sh`) and the honest
-reconciliation that **ptrace stays the documented default** (no transparent pass-through fast-path
-exists in direction 1; the seccomp-notify hybrid is deferred-by-data). 0.7.1 = rootfs confinement
+**0.9.0** — 2026-06-30. Freeze + docs cleanup (no behavior change). Froze the v1 contracts: the
+per-number AGNOS→Linux **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md),
+exhaustively test-pinned for agnos# 0–61) and the **CLI contract** ([`../reference/cli.md`](../reference/cli.md),
+pinned by `scripts/it/cli.sh`); added the **boundary-discipline ADR** ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md):
+mirshi *complements, never replaces* QEMU+iron); guides cross-linked; CHANGELOG complete from 0.1.0.
+0.8.0 = optimizations: the **exit-stop single-register I/O** ([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md),
+`PTRACE_PEEKUSER`/`POKEUSER`, ~5–7 % off the syscall-dense tax, byte-identical) + a 0-alloc-per-syscall
+gate; ptrace stays the documented default (no transparent fast-path; seccomp-notify deferred-by-data).
+0.7.1 = rootfs confinement
 (`--root`, audit class-(c), [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)):
 `--root <dir>` confines the child's filesystem via `openat2 RESOLVE_IN_ROOT` (open) +
 the `*at` family with lexical `sanitize_rootrel` (mutation/metadata) + `RESOLVE_NO_MAGICLINKS`;
@@ -64,13 +65,15 @@ paths in the child red zone + repack output structs at the exit stop
 - M1 set: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`, `sync#12`,
   `getrandom#45`, `time_unix#46`, `uptime_ms#40`, `sleep_ms#41`.
 - M2 set: `open#7`, `close#6`, `lseek#58`, `dup#8`, `mkdir#9`, `rmdir#10`, `unlink#30`,
-  `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent
-  pass-through (rootfs isolation deferred to M3 / hardening to 0.7.0).
+  `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
+  default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
+  The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
 
 ## Tests
 
-- `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer +
-  the M1 translation contract + the M2 fs contract; **105 assertions**, hermetic)
+- `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer + the M1/M2
+  translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
+  0–61's disposition); **166 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -101,6 +104,9 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/confine.sh` — 0.7.1 path-confinement gate (CI step, after supervisor):
   under `--root`, `open#7` escapes (abs / `..` / symlink) are clamped to the root and
   path-mutation ops denied; self-validating (proves the escape leaks without `--root`).
+- `scripts/it/cli.sh` — 0.9.0 CLI-freeze gate (CI step, after confine): pins the frozen CLI
+  contract ([`../reference/cli.md`](../reference/cli.md)) — usage on misuse (no args / `--root`
+  without a dir → exit 2) + the `EXECVE_FAILED` (127) exit code.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -171,4 +177,15 @@ direction 1 (even `write#1` needs the `-errno`→`-1` remap), and the seccomp-no
 deferred-by-data → **ptrace is the documented default**
 (see [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-Then 0.9.0 freeze+docs → v1.0.0.
+**0.9.0 freeze + docs cleanup** — ✅ shipped 2026-06-30 (no behavior change): froze the v1
+contracts. The per-number AGNOS→Linux **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md))
+— exhaustively test-pinned for agnos# 0–61 (`xlat-coverage`, 166 assertions) and adversarially
+audited row-by-row vs the code. The **CLI contract** ([`../reference/cli.md`](../reference/cli.md))
+— flags, modes, exit-code map — pinned by `scripts/it/cli.sh`. The **boundary discipline**
+([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md)): mirshi *complements, never
+replaces* QEMU+KVM + iron, promoted from prose to a cited decision. Guides cross-linked; ADR
+index complete (0001–0011); CHANGELOG complete from 0.1.0.
+
+Then **v1.0.0** — the clean cut: a representative agnos CLI userland in a plain Docker container
+under mirshi, fan-out-ready, no QEMU. The 0.6–0.9 quality arc is complete; only the v1 cut + the
+published image remain.

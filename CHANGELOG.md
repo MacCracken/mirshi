@@ -4,8 +4,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-0.9.0 freeze + docs cleanup (in progress) — no behavior change; freeze the v1 contracts +
-consolidate the docs before the v1.0.0 cut.
+## [0.9.0] — 2026-06-30
+
+Freeze + docs cleanup — no behavior change. Froze the v1 contracts (the per-number syscall-
+coverage matrix + the CLI), promoted the mirshi/QEMU/iron boundary discipline to a cited ADR,
+and consolidated the docs before the v1.0.0 cut. No `src/*.cyr` logic changed.
 
 ### Docs
 - **Frozen translation-table contract** — [`docs/reference/syscall-coverage.md`](docs/reference/syscall-coverage.md):
