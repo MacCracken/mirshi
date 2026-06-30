@@ -59,6 +59,7 @@ enum MirshiPtrace {
     SIGINFO_SIZE = 128;              # siginfo_t size on x86_64 (PTRACE_GETSIGINFO output buffer)
     SYSCALL_STOP_SIG = 0x85;          # SIGTRAP(5) | 0x80 — the TRACESYSGOOD marker
     EXECVE_FAILED = 127;
+    BOUND_FAILED = 126;               # seccomp bound failed to install — child aborted, not run unbounded
     WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
 }
 
@@ -131,8 +132,16 @@ fn _child_exec(path, bound): i64 {
     apply_child_rlimits();
     # M3 bounding seccomp: restrict the child to the agnos syscall surface before
     # exec (the filter persists across execve). Installed here, after TRACEME and
-    # before execve, so the agnos image runs under it. Non-fatal if it fails.
-    if (bound == 1) { apply_child_bound(); }
+    # before execve, so the agnos image runs under it. FAIL-CLOSED (0.7.0 audit b1):
+    # if the bound cannot be installed, ABORT the child rather than exec it
+    # unconfined — a sandbox that silently runs unbounded is worse than not running.
+    if (bound == 1) {
+        if (apply_child_bound() != 0) {
+            _emit(2, "mirshi: seccomp bound failed to install — refusing to run child unbounded\n");
+            syscall(SYS_EXIT, BOUND_FAILED);
+            return BOUND_FAILED;
+        }
+    }
     var argv[24];                 # 3 slots: [path, NULL, spare] — bytes, not entries
     store64(&argv, path);
     store64(&argv + 8, 0);

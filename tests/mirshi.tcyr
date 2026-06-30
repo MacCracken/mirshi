@@ -149,8 +149,8 @@ fn main() {
     assert_eq(ao_to_o(0x400), 0x400, "AO_APPEND same 0x400");
     assert_eq(ao_to_o(0x800), 0x10000, "AO_DIRECTORY 0x800->O_DIRECTORY 0x10000");
     assert_eq(ao_to_o(0x301), 0x241, "0x301 (WRONLY|CREAT|TRUNC) -> 0x241 (ground truth)");
-    assert_eq(open_create_mode(), 420, "open mode = 0644 (0x1A4, NOT 0x1B6=0666)");
-    assert_eq(mkdir_create_mode(), 511, "mkdir mode = 0777 (0x1FF)");
+    assert_eq(open_create_mode(), 384, "open mode = 0600 (0x180, least-privilege)");
+    assert_eq(mkdir_create_mode(), 448, "mkdir mode = 0700 (0x1C0, least-privilege)");
 
     test_group("fs-dtype");
     assert_eq(dtype_to_agnos(8), 1, "DT_REG->file");

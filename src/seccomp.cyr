@@ -28,7 +28,9 @@ enum MirshiSeccompConst {
     # classic-BPF opcodes
     BPF_LD_W_ABS = 0x20;                # BPF_LD | BPF_W | BPF_ABS
     BPF_JEQ_K = 0x15;                   # BPF_JMP | BPF_JEQ | BPF_K
+    BPF_JGE_K = 0x35;                   # BPF_JMP | BPF_JGE | BPF_K
     BPF_RET_K = 0x06;                   # BPF_RET | BPF_K
+    X32_SYSCALL_BIT = 0x40000000;       # __X32_SYSCALL_BIT — set on every x32-ABI nr
 }
 
 # Write one 8-byte classic-BPF sock_filter {u16 code; u8 jt; u8 jf; u32 k}.
@@ -76,8 +78,9 @@ fn _bound_allowlist(buf): i64 {
     # PTRACE_SYSCALL loop / on the execve-failure path):
     n = _allow(buf, n, 59);     # execve  (the initial image load)
     n = _allow(buf, n, 60);     # exit    (execve-failure fallback in _child_exec)
-    # mirshi's emulate/ENOSYS skip leaves orig_rax = -1:
-    n = _allow(buf, n, SECCOMP_SKIP_NR);
+    # NOTE: the emulate/ENOSYS skip sentinel (orig_rax = -1 -> nr 0xFFFFFFFF) is NOT in
+    # this chain — it is allowed explicitly in apply_child_bound BEFORE the x32 guard,
+    # which would otherwise KILL it (0xFFFFFFFF >= 0x40000000).
     return n;
 }
 
@@ -87,26 +90,37 @@ fn _bound_allowlist(buf): i64 {
 fn apply_child_bound(): i64 {
     sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    var allow = alloc(8 * 64);   # headroom: na=23 now; grows with the translation set
+    var allow = alloc(8 * 64);   # headroom: na=22 now; grows with the translation set
+    if (allow == 0) { return 0 - 1; }                   # fail-closed: caller aborts the child
     var na = _bound_allowlist(allow);
 
-    # Filter layout: arch-guard (3) + load nr (1) + na JEQ-allow + KILL + ALLOW.
-    var ninst = na + 6;
+    # Filter layout: arch-guard (3) + load nr (1) + skip-allow (1) + x32 guard (1)
+    #              + na JEQ-allow + KILL + ALLOW.
+    var ninst = na + 8;
     var f = alloc(8 * ninst);
+    if (f == 0) { return 0 - 1; }
     _bpf(f, 0,  BPF_LD_W_ABS, 0, 0, 4);                 # A = seccomp_data.arch (@4)
     _bpf(f, 8,  BPF_JEQ_K, 1, 0, AUDIT_ARCH_X86_64);    # if A==x86_64 skip 1, else fall -> kill
     _bpf(f, 16, BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS);     #   wrong arch -> kill
     _bpf(f, 24, BPF_LD_W_ABS, 0, 0, 0);                 # A = seccomp_data.nr (@0)
-    # JEQ chain at instruction indices 4..4+na-1: on match jump to ALLOW (index 5+na).
+    # The emulate/ENOSYS skip leaves orig_rax = -1, which seccomp sees as nr 0xFFFFFFFF;
+    # allow it FIRST so the x32 guard below does not KILL it (0xFFFFFFFF >= 0x40000000).
+    _bpf(f, 32, BPF_JEQ_K, na + 2, 0, SECCOMP_SKIP_NR); # nr == skip sentinel -> ALLOW
+    # x32 guard: a legit x86_64 nr is always small; any OTHER nr with __X32_SYSCALL_BIT
+    # set (>= 0x40000000) is an x32 call that could alias an allowed number under the
+    # same AUDIT_ARCH_X86_64 — KILL it. jt jumps over the JEQ chain to the KILL below.
+    _bpf(f, 40, BPF_JGE_K, na, 0, X32_SYSCALL_BIT);     # if nr >= 0x40000000 -> KILL
+    # JEQ chain at instruction indices 6..6+na-1: on match jump to ALLOW (index 7+na).
     var k = 0;
     while (k < na) {
-        _bpf(f, 32 + k * 8, BPF_JEQ_K, na - k, 0, load64(allow + k * 8));
+        _bpf(f, 48 + k * 8, BPF_JEQ_K, na - k, 0, load64(allow + k * 8));
         k = k + 1;
     }
-    _bpf(f, 32 + na * 8, BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS);        # no match -> kill
-    _bpf(f, 32 + na * 8 + 8, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);   # JEQ jt target -> allow
+    _bpf(f, 48 + na * 8, BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS);        # no match -> kill
+    _bpf(f, 48 + na * 8 + 8, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);   # JEQ jt target -> allow
 
     var prog = alloc(16);                               # struct sock_fprog {u16 len; filter*}
+    if (prog == 0) { return 0 - 1; }
     store64(prog, 0);
     store64(prog + 8, 0);
     store16(prog, ninst);

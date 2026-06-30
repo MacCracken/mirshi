@@ -86,17 +86,31 @@ Unsupported syscalls degrade to a clean `ENOSYS` + a logged diagnostic, never a 
 a fault-injection harness (bad-pointer / storm / crash / unknown-syscall children) leaves the supervisor stable
 and the host untouched.
 
-### 0.7.0 — Security CVE / 0-day sweep
+### 0.7.0 — Security CVE / 0-day sweep (audit + hardening) — ✅ shipped 2026-06-30
 mirshi is a **sandbox-class trust boundary** — it runs foreign-ish agnos binaries and translates their syscalls
-while holding host privilege (a classic **confused-deputy** surface). Adversarial review (the kavach / net-syscall
-sweep model) of the escape classes: **(a)** child-memory-read **TOCTOU** (`process_vm_readv` / `/proc/pid/mem` —
-args re-read after a check; **the documented seccomp-notify `FLAG_CONTINUE` TOCTOU is the headline 0-day class** —
-never `FLAG_CONTINUE` a security-relevant syscall, perform it in the supervisor); **(b)** can the child reach the
-host syscall table *around* the translation (seccomp bounding-policy completeness — default-deny, no gap)? **(c)**
-path-translation escapes (traversal / symlink / the agnos-VFS→host-FS mapping reaching unintended host paths);
-**(d)** arg-confusion letting a translated call touch a host resource the agnos ABI never granted. Acceptance:
-documented sweep (`docs/audit/YYYY-MM-DD-audit.md`), every reachable finding fixed, the seccomp policy proven
-default-deny, escape attempts in the fault harness contained.
+while holding host privilege (a classic **confused-deputy** surface). Adversarial sweep of the escape classes:
+**(a)** child-memory-read **TOCTOU** (`process_vm_readv` / `/proc/pid/mem`; the seccomp-notify `FLAG_CONTINUE`
+TOCTOU is the headline 0-day class for the *future* hybrid — moot under ptrace-only); **(b)** seccomp
+bounding-policy completeness (default-deny, no gap); **(c)** path-translation escapes (traversal / symlink /
+the agnos-VFS→host-FS mapping reaching unintended host paths); **(d)** arg-confusion.
+
+**Phased** (user-selected, 2026-06-30 — *harden now, confine next*). The
+[audit](../audit/2026-06-30-audit.md) found the whole **blocker tier is class (c) path-escape**; (a) is
+safe-by-design, (b) is **proven default-deny**, (d) is mostly clean. **This milestone (0.7.0)** ships:
+the documented sweep; the seccomp **default-deny proof** + completeness hardening (x32-bit mask, the install
+made **fail-closed**, filter `alloc` guards); arg-confusion least-privilege (create modes 0600/0700,
+`synth_mmap_regs` confirmed no PROT_EXEC/MAP_FIXED/file-backed). Acceptance (0.7.0): documented sweep ✅,
+seccomp proven default-deny ✅, the minor/bounded findings fixed ✅.
+
+### 0.7.1 — Supervisor rootfs confinement (the path-escape blocker fix) — the "confine next" half
+Close the class-(c) blockers (`open#7`/`stat#33`/`mkdir#9`/`rmdir#10`/`unlink#30`/`rename#31`/`link#32`/
+`getdents#29` reach **arbitrary host paths** — no chroot, no canonicalization, no rootfs prefix; confirmed by
+PoC). Fix: a supervisor-resolved **rootfs** — a `--root` opened once (`rootfd`), every path op routed through
+**kernel-enforced bounded resolution** (`openat2` `RESOLVE_IN_ROOT`/`RESOLVE_BENEATH` for `open`; parent-anchored
+`*at` ops for the rest), rejecting escape before staging. Unprivileged, TOCTOU-safe, defense-in-depth over the
+container mount NS. Until it lands, the **container NS is the confinement boundary** (the v1 vehicle is contained;
+the **bare CLI is unconfined by design**). Acceptance: every class-(c) finding fixed; escape-attempt fault-harness
+cases contained (bare-CLI **and** in-container); the audit's open checkboxes closed.
 
 ### 0.8.0 — Optimizations
 The per-syscall hot path is the whole cost model for the fan-out-at-scale goal: minimize trap→read-args→translate→

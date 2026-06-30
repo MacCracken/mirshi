@@ -8,7 +8,10 @@
 #       allocator, so a looping child drove mirshi's RSS up by megabytes (a child-
 #       driven supervisor-OOM — the supervisor DoS'd by the child it contains). Fixed
 #       with a one-time static buffer (docs/adr/0008). With the fix mirshi's RSS is
-#       FLAT under the storm; the leak grew it ~MBs over this window.
+#       FLAT under the storm; the leak grew it ~MBs over this window. NOTE: uptime_ms#40
+#       is an EMULATE/skip call, so this storm also gates that the skip sentinel
+#       (orig_rax=-1, nr 0xFFFFFFFF) survives the bounding seccomp filter under the
+#       default bound — a broken x32/skip guard SIGSYS-kills the child here.
 #
 #   (2) hung-child cleanup — when mirshi is terminated while the child is stuck
 #       (spinning / blocked), PTRACE_O_EXITKILL must leave NO orphan and NO zombie

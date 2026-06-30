@@ -61,10 +61,13 @@ fn ao_to_o(ao): i64 {
 }
 
 # Creation modes mirshi synthesizes (agnos open/mkdir carry no mode). The child's
-# umask trims them. 0644 = 0x1A4 (rw-r--r--), 0777 = 0x1FF (rwxr-xr-x). Kept as
-# pure helpers so the octal<->hex value is pinned by a unit test (not a literal).
-fn open_create_mode(): i64 { return 0x1A4; }     # 0644
-fn mkdir_create_mode(): i64 { return 0x1FF; }    # 0777
+# umask trims them further. LEAST-PRIVILEGE (0.7.0 audit d): a sandboxed child's
+# created files/dirs default to owner-only, not world-readable — agnos carries no
+# mode, so the supervisor is free to pick the safe default. 0600 = 0x180 (rw-------),
+# 0700 = 0x1C0 (rwx------). Pinned by a unit test so the octal<->hex value is not a
+# bare literal.
+fn open_create_mode(): i64 { return 0x180; }     # 0600
+fn mkdir_create_mode(): i64 { return 0x1C0; }    # 0700
 
 # Map a Linux getdents64 d_type to the agnos AgnosDirent type byte.
 fn dtype_to_agnos(d_type): i64 {

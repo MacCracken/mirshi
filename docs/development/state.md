@@ -5,12 +5,14 @@
 
 ## Version
 
-**0.6.0** — 2026-06-30. Hardening: host-resource bounds ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md)),
-group-stop signal handling ([ADR 0007](../adr/0007-group-stop-signal-handling.md)), child-hang robustness +
-the supervisor-emulate heap-leak fix ([ADR 0008](../adr/0008-child-hang-supervisor-robustness.md)), and the
-fault-injection harness wired into CI. 0.5.0 = M4 seccomp-notify feasibility + benchmark baseline (reframed to
-a hybrid, deferred by data — [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)); 0.4.0 = M3 Docker vehicle
-(functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1 translation; 0.1.0 = M0 trap loop.
+**0.7.0** — 2026-06-30. Security sweep (audit + hardening, phased): the
+[audit](../audit/2026-06-30-audit.md) (32 findings; **seccomp proven default-deny**;
+TOCTOU safe-by-design; `mmap` synth hardened) + fail-closed seccomp install, x32-bit
+mask, 0600/0700 create modes. The class-(c) path-escape blocker fix (supervisor rootfs
+confinement) is **0.7.1**. 0.6.0 = hardening (rlimits / group-stop / child-hang, ADRs
+0006-0008); 0.5.0 = M4 seccomp-notify feasibility + benchmark ([ADR 0005](../adr/0005-seccomp-notify-feasibility.md));
+0.4.0 = M3 Docker vehicle (functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1
+translation; 0.1.0 = M0 trap loop.
 
 ## Toolchain
 
@@ -121,6 +123,14 @@ feasibility + benchmark) done. Now the **pure-quality closing arc** toward v1.0:
   status), no watchdog; the scoping fixed a real supervisor-emulate heap leak
   (`uptime_ms#40` / `sleep_ms#41` per-call alloc → one-time static).
 
-Next: **0.7.0 — security CVE / 0-day sweep** (the sandbox-escape classes: child-memory
-read TOCTOU, the `FLAG_CONTINUE` rule, seccomp default-deny completeness, path-translation
-escapes, arg-confusion) → 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
+**0.7.0 security sweep** — ✅ shipped 2026-06-30 (phased: *harden now, confine next*).
+The [audit](../audit/2026-06-30-audit.md) (32 findings; **seccomp proven default-deny**;
+TOCTOU safe-by-design; `mmap` synth hardened) + the cheap hardening — fail-**closed**
+seccomp install, x32-bit mask, 0600/0700 create modes. The **blocker tier is class-(c)
+path-escape** (no in-supervisor path confinement; bare-CLI child reaches arbitrary host
+paths, PoC-confirmed) — bounded by the container mount NS in the v1 vehicle, fixed
+properly by the **0.7.1** supervisor rootfs confinement.
+
+Next: **0.7.1 — supervisor rootfs confinement** (`--root` + `openat2`/`*at` bounded
+resolution for the 7 path handlers; escape-attempt fault tests) → 0.8.0 optimize →
+0.9.0 freeze+docs → v1.0.0.

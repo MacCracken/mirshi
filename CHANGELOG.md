@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-30
+
+Security CVE / 0-day sweep — audit + hardening (phased: the path-escape confinement is
+0.7.1). seccomp **proven default-deny**; TOCTOU safe-by-design; the path-escape blocker
+tier is bounded by the container mount namespace in the v1 vehicle pending 0.7.1.
+
+### Added
+- **Security audit** ([docs/audit/2026-06-30-audit.md](docs/audit/2026-06-30-audit.md)):
+  a 32-finding adversarial sandbox-escape sweep across the four escape classes +
+  supervisor integrity. **seccomp proven default-deny**; TOCTOU **safe by design**
+  (single-threaded ptrace-stopped child); `mmap` synthesis confirmed hardened (no
+  PROT_EXEC/MAP_FIXED/file-backed). The **blocker tier is entirely class-(c)
+  path-escape** — mirshi has no in-supervisor path confinement, so a bare-CLI child
+  reaches arbitrary host paths (confirmed by PoC). Bounded by the container mount
+  namespace in the v1 (Docker) vehicle; the supervisor-side **rootfs confinement** fix
+  is the next milestone (0.7.1).
+
+### Security
+- **Fail-closed bound** (`src/intercept.cyr`, `src/seccomp.cyr`): if the bounding
+  seccomp filter cannot be installed in bounded mode, mirshi now **aborts the child**
+  (exit 126) instead of running it unconfined; filter `alloc()`s are guarded (audit b1).
+- **x32-ABI mask** (`src/seccomp.cyr`): the filter rejects any `nr >= 0x40000000`
+  (`__X32_SYSCALL_BIT`, the emulate/ENOSYS skip sentinel excepted), closing the x32
+  number-alias gap and completing the default-deny proof (audit b2).
+- **Least-privilege create modes** (`src/translate.cyr`): `open#7` 0644 → **0600**,
+  `mkdir#9` 0777 → **0700** — a sandboxed child's created files are not world-readable
+  by default (audit d).
+
 ## [0.6.0] — 2026-06-30
 
 Hardening: the supervisor against a misbehaving / hostile child. Supervisor stable +
