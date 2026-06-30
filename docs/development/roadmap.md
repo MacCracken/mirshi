@@ -112,13 +112,23 @@ container mount NS. Until it lands, the **container NS is the confinement bounda
 the **bare CLI is unconfined by design**). Acceptance: every class-(c) finding fixed; escape-attempt fault-harness
 cases contained (bare-CLI **and** in-container); the audit's open checkboxes closed.
 
-### 0.8.0 — Optimizations
-The per-syscall hot path is the whole cost model for the fan-out-at-scale goal: minimize trap→read-args→translate→
-return overhead — a **fast-path for pure pass-through numbers** (let the kernel run them, no supervisor round-trip),
-fewer/batched `process_vm_readv` calls, a cheap dispatch over the handler table, and the **ptrace-vs-seccomp-notify**
-bench made rigorous. Allocation-clean hot path (no per-syscall churn). Acceptance: `docs/benchmarks.md` shows the
-per-syscall overhead + the realistic-workload (a real agnos tool) wall-clock, with the seccomp-notify path the
-documented default; numerics/behavior byte-identical to 0.7.0.
+### 0.8.0 — Optimizations — ✅ shipped 2026-06-30
+The per-syscall hot path is the whole cost model for the fan-out-at-scale goal. **Measured first**
+([`../benchmarks.md`](../benchmarks.md)): the ~30 µs tax is dominated by the **two `PTRACE_SYSCALL` stops**
+(supervisor↔child context-switch round-trips), **irreducible under ptrace** — the register copies are a
+secondary term and the handler-table arithmetic is single-digit ns. So the byte-identical lever is **trimming
+the register I/O within the stops we must take**: the **exit-stop single-register I/O**
+([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md)) reads only `rax` (`PTRACE_PEEKUSER`) and writes
+it back (`PTRACE_POKEUSER`) only when it changed — **~5–7 % off the syscall-dense tax, byte-identical**.
+**Allocation-clean hot path** proven by a 0-alloc-per-syscall gate (`scripts/it/alloc_clean.sh`, teeth-verified).
+**Two premises in the original plan were found unachievable-by-design and reconciled here**: (1) a *fast-path for
+pure pass-through numbers (no supervisor round-trip)* does **not exist** in direction 1 — no agnos call is fully
+transparent (only `write#1` shares Linux's number, and even it needs the `-errno`→`-1` return remap, so seccomp
+`RET_ALLOW` cannot pass it through); (2) the *seccomp-notify documented default* is superseded by
+[ADR 0005](../adr/0005-seccomp-notify-feasibility.md) — the hybrid stays **deferred-by-data** (realistic workloads
+~3–5× native, not syscall-bound, and notify wins *least* on the buffer calls that dominate them), so **ptrace
+remains the documented default**. Acceptance (met): `docs/benchmarks.md` shows the per-syscall overhead + the
+realistic-workload (`cat`) wall-clock ✅; the 0-alloc gate is green ✅; numerics/behavior **byte-identical to 0.7.1** ✅.
 
 ### 0.9.0 — Freeze + docs cleanup
 Freeze the **translation-table contract** (the per-agnos-syscall mapped / emulated / `ENOSYS` matrix) + the CLI;

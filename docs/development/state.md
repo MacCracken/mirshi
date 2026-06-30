@@ -5,8 +5,15 @@
 
 ## Version
 
-**0.7.1** — 2026-06-30. Supervisor rootfs confinement — the path-escape blocker fix
-(audit class-(c), [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)):
+**0.8.0** — 2026-06-30. Optimizations (measure-first hot-path). The ~30 µs per-syscall tax is
+dominated by the two `PTRACE_SYSCALL` stops (irreducible under ptrace); the byte-identical lever
+is trimming register I/O within them. Ships the **exit-stop single-register I/O**
+([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md)) — `PTRACE_PEEKUSER` reads only
+`rax`, `PTRACE_POKEUSER` writes it back only when it changed (~5–7 % off the syscall-dense tax,
+byte-identical) — plus a 0-alloc-per-syscall gate (`scripts/it/alloc_clean.sh`) and the honest
+reconciliation that **ptrace stays the documented default** (no transparent pass-through fast-path
+exists in direction 1; the seccomp-notify hybrid is deferred-by-data). 0.7.1 = rootfs confinement
+(`--root`, audit class-(c), [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)):
 `--root <dir>` confines the child's filesystem via `openat2 RESOLVE_IN_ROOT` (open) +
 the `*at` family with lexical `sanitize_rootrel` (mutation/metadata) + `RESOLVE_NO_MAGICLINKS`;
 the container vehicle stays namespace-confined. 0.7.0 = security sweep (audit + hardening:
@@ -17,7 +24,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.5` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.12` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -30,6 +37,9 @@ trap-log mode.
   and the two loops — `_trace_log` (M0 `PTRACE_SYSEMU`, trap+log) and `_trace_run`
   (M1 `PTRACE_SYSCALL` enter/exit, translate+execute). Defines the ptrace ABI the
   Linux stdlib peer lacks (`SYS_PTRACE=101`, `PTRACE_*`, `WIFSTOPPED`/`WSTOPSIG`).
+  0.8.0: the EXIT stop does single-register I/O — `PTRACE_PEEKUSER` reads only `rax`,
+  `PTRACE_POKEUSER` writes it back only when the agnos return changed
+  ([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md)).
 - `src/decode.cyr` — pure decode (no syscalls): x86_64 `user_regs_struct` offsets,
   the agnos number→name/arity/pointer-arg tables, and `format_event`.
 - `src/translate.cyr` — PURE agnos→Linux translation (unit-tested): number remap,
@@ -83,6 +93,11 @@ paths in the child red zone + repack output structs at the exit stop
   groupstop): the supervisor's own robustness — mirshi's RSS stays flat under an
   emulated-timer (`uptime_ms#40`) storm (no per-call heap leak), and terminating
   mirshi mid-hang leaves no orphan / no zombie (`PTRACE_O_EXITKILL`).
+- `scripts/it/alloc_clean.sh` — 0.8.0 optimization gate (CI step, after supervisor): the
+  per-syscall hot path allocates NOTHING per translated call — storms the EXECUTE
+  pass-through (`getpid#2`) and fs path-staging (`stat#33`) classes and asserts mirshi's
+  RSS stays flat (the bump allocator never frees, so a per-call alloc is linear growth).
+  Teeth-verified; complements supervisor_hardening's emulate-path (`uptime#40`) check.
 - `scripts/it/confine.sh` — 0.7.1 path-confinement gate (CI step, after supervisor):
   under `--root`, `open#7` escapes (abs / `..` / symlink) are clamped to the root and
   path-mutation ops denied; self-validating (proves the escape leaks without `--root`).
@@ -145,4 +160,15 @@ Bite 3: `RESOLVE_NO_MAGICLINKS` (block proc magic-link escapes). Gate `scripts/i
 The Docker vehicle stays namespace-confined (no `--root` needed). The audit's class-(c)
 blocker tier is closed.
 
-Then 0.8.0 optimize → 0.9.0 freeze+docs → v1.0.0.
+**0.8.0 optimizations** — ✅ shipped 2026-06-30: measure-first hot-path work. The ~30 µs
+per-syscall tax is dominated by the two `PTRACE_SYSCALL` stops (irreducible under ptrace); the
+byte-identical lever is trimming the register I/O within them. **Exit-stop single-register I/O**
+([ADR 0010](../adr/0010-ptrace-exit-stop-single-register-io.md)) — `PTRACE_PEEKUSER` reads only
+`rax`, `PTRACE_POKEUSER` writes it back only when it changed (~5–7 % off the syscall-dense tax,
+byte-identical). **0-alloc-per-syscall gate** `scripts/it/alloc_clean.sh` (teeth-verified).
+Reconciled two unachievable roadmap premises: no transparent pass-through fast-path exists in
+direction 1 (even `write#1` needs the `-errno`→`-1` remap), and the seccomp-notify hybrid stays
+deferred-by-data → **ptrace is the documented default**
+(see [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
+
+Then 0.9.0 freeze+docs → v1.0.0.

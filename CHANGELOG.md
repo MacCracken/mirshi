@@ -4,9 +4,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-0.8.0 optimizations (in progress) — measure-first hot-path work. The per-syscall cost model
-is dominated by the two `PTRACE_SYSCALL` stops (irreducible under ptrace); the available
-byte-identical lever is trimming the register I/O within those stops.
+## [0.8.0] — 2026-06-30
+
+Optimizations — measure-first hot-path work. The per-syscall cost model is dominated by the
+two `PTRACE_SYSCALL` stops (irreducible under ptrace); the byte-identical lever is trimming
+the register I/O within those stops. Ships the exit-stop single-register I/O (~5–7 % off the
+syscall-dense tax), the 0-alloc-per-syscall gate, and the honest cost-model reconciliation —
+no transparent pass-through fast-path exists in direction 1, and the seccomp-notify hybrid
+stays deferred-by-data, so **ptrace is the documented default** (superseding two aspirational
+roadmap lines).
 
 ### Performance
 - **Exit-stop single-register I/O** ([ADR 0010](docs/adr/0010-ptrace-exit-stop-single-register-io.md)):
