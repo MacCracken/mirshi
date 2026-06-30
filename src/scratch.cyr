@@ -1,0 +1,72 @@
+# src/scratch.cyr — child-memory staging for M2 filesystem translation.
+#
+# The fs syscalls carry EXPLICIT-LENGTH, non-NUL-terminated agnos paths (and, for
+# stat/getdents, output structs in a foreign layout). Execute-in-child needs the
+# child to see a NUL-terminated path / a Linux-layout output buffer, so the
+# supervisor stages those into the child's OWN memory — the red zone just below
+# its stack pointer, which is idle while the child is stopped in-kernel at a
+# syscall. Reads/writes go through process_vm_readv(310)/writev(311).
+#
+# x86_64 Linux only. INCLUDE ORDER (relies on the includer): src/intercept.cyr
+# includes this AFTER the MirshiPtrace enum (SYS_PROCESS_VM_READV/WRITEV) + decode.cyr
+# (REG_RSP), and BEFORE src/dispatch.cyr (whose handlers call stage_at).
+
+enum MirshiScratch {
+    PATH_MAX = 4096;     # bound the staged path so a hostile namelen can't run wild
+    RED_ZONE = 128;      # x86_64 SysV ABI leaf red zone — start scratch BELOW it
+}
+
+# Supervisor-side scratch buffers (lazily allocated once). _m2_pathbuf holds a
+# path while we NUL-terminate it; _m2_linbuf / _m2_agnbuf are the M2 repack
+# staging buffers (Linux struct in, agnos struct out) used at the exit stop.
+var _m2_pathbuf = 0;
+var _m2_linbuf = 0;
+var _m2_agnbuf = 0;
+
+fn _m2_init(): i64 {
+    if (_m2_pathbuf == 0) {
+        _m2_pathbuf = alloc(PATH_MAX + 8);
+        _m2_linbuf = alloc(4104);     # one page + slack: Linux stat (144) / getdents records
+        _m2_agnbuf = alloc(4104);     # repacked agnos output
+    }
+    return 0;
+}
+
+# Build a 16-byte iovec {iov_base@0, iov_len@8} pair (local + remote) into `iov`
+# and copy `len` bytes between the supervisor's `local` buffer and the child's
+# `child_addr`. iovec is exactly 16 bytes, no padding. flags (a6/r9) MUST be 0.
+# Returns the bytes transferred (callers MUST check == len; a short count means a
+# page boundary / bad address, never assume success).
+fn pvm_read(pid, child_addr, local, len): i64 {
+    var iov[32];
+    store64(&iov, local);            # local.iov_base
+    store64(&iov + 8, len);          # local.iov_len
+    store64(&iov + 16, child_addr);  # remote.iov_base
+    store64(&iov + 24, len);         # remote.iov_len
+    return syscall(SYS_PROCESS_VM_READV, pid, &iov, 1, &iov + 16, 1, 0);
+}
+fn pvm_write(pid, child_addr, local, len): i64 {
+    var iov[32];
+    store64(&iov, local);            # local (source).iov_base
+    store64(&iov + 8, len);
+    store64(&iov + 16, child_addr);  # remote (dest).iov_base
+    store64(&iov + 24, len);
+    return syscall(SYS_PROCESS_VM_WRITEV, pid, &iov, 1, &iov + 16, 1, 0);
+}
+
+# Stage a NUL-terminated copy of the child's [child_ptr, namelen) path into the
+# child's red zone, ENDING just below `top` (exclusive; `top` is rsp-RED_ZONE for
+# the first slot, or the previous slot's start for a second slot). Returns the
+# 8-aligned scratch address, or -1 on a bad length or a short/failed transfer.
+fn stage_at(pid, child_ptr, namelen, top): i64 {
+    if (namelen < 0) { return 0 - 1; }
+    if (namelen > PATH_MAX) { return 0 - 1; }
+    _m2_init();
+    var n = pvm_read(pid, child_ptr, _m2_pathbuf, namelen);
+    if (n != namelen) { return 0 - 1; }
+    store8(_m2_pathbuf + namelen, 0);                  # NUL-terminate for the Linux call
+    var scratch = (top - (namelen + 1)) & (0 - 8);     # 8-align downward
+    var w = pvm_write(pid, scratch, _m2_pathbuf, namelen + 1);
+    if (w != (namelen + 1)) { return 0 - 1; }
+    return scratch;
+}

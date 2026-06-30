@@ -126,6 +126,84 @@ fn main() {
     synth_mmap_regs(mr, 1);
     assert_eq(load64(mr + 104), 2097152, "unaligned len rounds up");
 
+    # --- M2 filesystem translation contract ------------------------------
+    test_group("fs-nr");
+    assert_eq(agnos_to_linux_nr(7), 2, "open 7->2");
+    assert_eq(agnos_to_linux_nr(6), 3, "close 6->3");
+    assert_eq(agnos_to_linux_nr(33), 4, "stat 33->4");
+    assert_eq(agnos_to_linux_nr(58), 8, "lseek 58->8");
+    assert_eq(agnos_to_linux_nr(8), 32, "dup 8->32");
+    assert_eq(agnos_to_linux_nr(31), 82, "rename 31->82");
+    assert_eq(agnos_to_linux_nr(9), 83, "mkdir 9->83");
+    assert_eq(agnos_to_linux_nr(10), 84, "rmdir 10->84");
+    assert_eq(agnos_to_linux_nr(32), 86, "link 32->86 (hardlink)");
+    assert_eq(agnos_to_linux_nr(30), 87, "unlink 30->87");
+    assert_eq(agnos_to_linux_nr(29), 217, "getdents 29->217");
+
+    test_group("fs-ao-to-o");
+    assert_eq(ao_to_o(0), 0, "RDONLY 0->0");
+    assert_eq(ao_to_o(1), 1, "WRONLY 1->1");
+    assert_eq(ao_to_o(2), 2, "RDWR 2->2");
+    assert_eq(ao_to_o(0x100), 0x40, "AO_CREAT 0x100->O_CREAT 0x40");
+    assert_eq(ao_to_o(0x200), 0x200, "AO_TRUNC same 0x200");
+    assert_eq(ao_to_o(0x400), 0x400, "AO_APPEND same 0x400");
+    assert_eq(ao_to_o(0x800), 0x10000, "AO_DIRECTORY 0x800->O_DIRECTORY 0x10000");
+    assert_eq(ao_to_o(0x301), 0x241, "0x301 (WRONLY|CREAT|TRUNC) -> 0x241 (ground truth)");
+    assert_eq(open_create_mode(), 420, "open mode = 0644 (0x1A4, NOT 0x1B6=0666)");
+    assert_eq(mkdir_create_mode(), 511, "mkdir mode = 0777 (0x1FF)");
+
+    test_group("fs-dtype");
+    assert_eq(dtype_to_agnos(8), 1, "DT_REG->file");
+    assert_eq(dtype_to_agnos(4), 2, "DT_DIR->dir");
+    assert_eq(dtype_to_agnos(10), 3, "DT_LNK->symlink");
+    assert_eq(dtype_to_agnos(0), 0, "DT_UNKNOWN->unknown");
+    assert_eq(dtype_to_agnos(6), 0, "DT_BLK->unknown");
+
+    test_group("fs-stat-repack");
+    var lb = alloc(144);
+    store32(lb + 24, 0x81a4);          # st_mode = S_IFREG|0644
+    store64(lb + 16, 2);               # st_nlink
+    store64(lb + 48, 1234);            # st_size
+    store64(lb + 8, 99);               # st_ino
+    store64(lb + 64, 8);               # st_blocks
+    store64(lb + 88, 1700000000);      # st_mtime (sec)
+    var ab = alloc(48);
+    stat_repack_144_to_48(lb, ab);
+    assert_eq(load64(ab + 0), 0x81a4, "mode @0 (zero-extended)");
+    assert_eq(load64(ab + 8), 2, "nlink @8");
+    assert_eq(load64(ab + 16), 1234, "size @16");
+    assert_eq(load64(ab + 24), 99, "ino @24");
+    assert_eq(load64(ab + 32), 8, "blocks @32");
+    assert_eq(load64(ab + 40), 1700000000, "mtime @40");
+
+    test_group("fs-getdents-repack");
+    # Two synthetic Linux getdents64 records: "alpha" (DT_REG, >32-bit ino), "beta" (DT_DIR).
+    var glb = alloc(128);
+    store64(glb + 0, 0x123456789A);    # rec0 d_ino@0 (low 32 = 0x3456789A)
+    store16(glb + 16, 32);             # rec0 d_reclen@16 (padded)
+    store8(glb + 18, 8);               # rec0 d_type@18 = DT_REG
+    memcpy(glb + 19, "alpha", 5);
+    store8(glb + 24, 0);               # NUL
+    store64(glb + 32, 0xBB);           # rec1 d_ino@0 (offset 32)
+    store16(glb + 48, 24);             # rec1 d_reclen@16
+    store8(glb + 50, 4);               # rec1 d_type@18 = DT_DIR
+    memcpy(glb + 51, "beta", 4);
+    store8(glb + 55, 0);               # NUL
+    var gab = alloc(128);
+    var gbytes = getdents_repack(glb, 56, gab, 128);
+    assert_eq(gbytes, 25, "two records repack to 13+12=25 bytes");
+    assert_eq(load16(gab + 0), 13, "rec0 reclen = 8+5");
+    assert_eq(load8(gab + 2), 1, "rec0 type = file");
+    assert_eq(load8(gab + 3), 5, "rec0 namelen = 5");
+    assert_eq(load32(gab + 4), 0x3456789A, "rec0 ino truncated to low 32");
+    assert_eq(memeq(gab + 8, "alpha", 5), 1, "rec0 name = alpha (no NUL)");
+    assert_eq(load16(gab + 13), 12, "rec1 reclen = 8+4");
+    assert_eq(load8(gab + 15), 2, "rec1 type = dir");
+    assert_eq(load8(gab + 16), 4, "rec1 namelen = 4");
+    assert_eq(memeq(gab + 21, "beta", 4), 1, "rec1 name = beta");
+    # Overflow: a tiny cap stops before the first record's 13 bytes.
+    assert_eq(getdents_repack(glb, 56, gab, 10), 0, "cap 10 < 13 -> drop, return 0");
+
     return assert_summary();
 }
 

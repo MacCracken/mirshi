@@ -36,6 +36,7 @@ enum MirshiRegOff {
     REG_RDI = 112;       # a1
     REG_ORIG_RAX = 120;  # the agnos syscall number at a syscall-entry stop
     REG_RIP = 128;       # instruction pointer (reserved; unused in M1 — the kernel dispatches on orig_rax)
+    REG_RSP = 152;       # stack pointer — M2 stages NUL-terminated paths just below it (red zone)
     USER_REGS_SIZE = 216;
 }
 

@@ -67,3 +67,11 @@ jobs:
         # M0->M1 segfault regression gate). Same ptrace requirements as the M0
         # step. Kept separate so a translation regression is diagnosable.
         run: bash scripts/it/m1_run.sh
+
+      - name: M2 fs integration test
+        # The filesystem surface (M2 acceptance): agnos open/read/write/close/
+        # cp/mkdir/rename/link/unlink/stat/getdents run under real translation
+        # against a sandboxed temp rootfs, asserted by HOST EFFECTS. Exercises
+        # the red-zone path staging + process_vm_* + the stat/getdents repacks.
+        # Same ptrace requirements as the M0/M1 steps.
+        run: bash scripts/it/m2_fs.sh

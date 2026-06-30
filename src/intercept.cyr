@@ -39,7 +39,8 @@ include "src/decode.cyr"
 # ----------------------------------------------------------------------------
 enum MirshiPtrace {
     SYS_PTRACE = 101;
-    SYS_PROCESS_VM_READV = 310;       # reserved for M2+ supervisor-side buffer copies
+    SYS_PROCESS_VM_READV = 310;       # M2: read child paths / Linux structs out of child memory
+    SYS_PROCESS_VM_WRITEV = 311;      # M2: stage NUL-terminated paths / agnos structs into child memory
     PTRACE_TRACEME = 0;
     PTRACE_CONT = 7;
     PTRACE_SYSCALL = 24;              # resume + EXECUTE one (rewritten) call, stop at exit
@@ -106,6 +107,7 @@ fn _wait(pid, status): i64 {
 # Included HERE so they see decode.cyr's REG_*, the MirshiPtrace enum, pt(), and
 # _emit/_emit_int defined above, and so _trace_loop below sees translate_dispatch.
 include "src/translate.cyr"
+include "src/scratch.cyr"
 include "src/dispatch.cyr"
 
 # The traced child. Runs the ABSOLUTE MINIMUM between fork and execve — mark
@@ -238,8 +240,11 @@ fn _trace_run(pid): i64 {
                     # Syscall-EXIT: write the agnos-convention return into rax.
                     pt(PTRACE_GETREGS, pid, 0, regs);
                     if (strat == STRAT_EXECUTE) {
+                        # fs_exit_return maps the Linux return AND, for stat/getdents,
+                        # repacks the Linux output struct into the agnos layout in the
+                        # child's saved output buffer. Other calls map only the return.
                         store64(regs + REG_RAX,
-                                linux_ret_to_agnos(agnos_nr, load64(regs + REG_RAX)));
+                                fs_exit_return(pid, agnos_nr, load64(regs + REG_RAX)));
                     } else {
                         # EMULATE / ENOSYS: the syscall was skipped (rax=-ENOSYS);
                         # inject the supervisor-computed return.

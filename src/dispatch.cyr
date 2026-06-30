@@ -35,6 +35,87 @@ enum MirshiXlatNr {
 # child + strict enter/exit alternation make a one-slot global safe here.
 var _xlat_emu_ret = 0;
 
+# Carry state for the M2 stat/getdents OUTPUT repack: the original agnos output
+# pointer the child gave us, its capacity (getdents), the red-zone scratch the
+# Linux struct was written into, and which repack to run. Set at the ENTER stop,
+# consumed at the EXIT stop. Single in-flight call per child + strict enter/exit
+# alternation make these one-slot globals safe (same discipline as _xlat_emu_ret).
+var _m2_out_ptr = 0;    # the agnos output pointer the child gave us (stat/getdents)
+var _m2_out_cap = 0;    # the agnos output capacity (getdents bufsize)
+var _m2_scratch = 0;    # the red-zone scratch the Linux output struct was written into
+
+# Fail a translated fs call without running it: skip the syscall (orig_rax=-1)
+# and inject the agnos error sentinel -1. Used when path staging short-fails.
+fn _m2_fail(pid, regs): i64 {
+    _xlat_emu_ret = 0 - 1;
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EMULATE;
+}
+
+# One-path fs call (rmdir/unlink): stage the path into the child red zone, point
+# rdi at it, renumber to `lnr`. The length arg in rsi is ignored by the 1-arg call.
+fn _m2_one_path(pid, regs, lnr): i64 {
+    var scratch = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                           load64(regs + REG_RSP) - RED_ZONE);
+    if (scratch < 0) { return _m2_fail(pid, regs); }
+    store64(regs + REG_RDI, scratch);
+    store64(regs + REG_ORIG_RAX, lnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# Two-path fs call (rename/link): stage both explicit-length paths into two
+# non-overlapping red-zone slots; Linux takes path1 in rdi, path2 in RSI — the
+# agnos ABI passed path2 in rdx/r10, so this is a register MOVE, not a rewrite.
+fn _m2_two_path(pid, regs, lnr): i64 {
+    var s0 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                      load64(regs + REG_RSP) - RED_ZONE);
+    if (s0 < 0) { return _m2_fail(pid, regs); }
+    var s1 = stage_at(pid, decode_arg(regs, 2), decode_arg(regs, 3), s0);   # below s0
+    if (s1 < 0) { return _m2_fail(pid, regs); }
+    store64(regs + REG_RDI, s0);
+    store64(regs + REG_RSI, s1);
+    store64(regs + REG_ORIG_RAX, lnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# EXIT-stop: stat#33 — the kernel wrote a Linux 144 B struct into the red-zone
+# scratch; pull it out, repack to the agnos 48 B layout, write into the child's
+# saved statbuf. Returns the agnos return (0 ok / -1 on stat error or short copy).
+fn _m2_stat_exit(pid, lret): i64 {
+    if (lret != 0) { return 0 - 1; }                 # Linux stat: 0 ok, -errno fail
+    if (pvm_read(pid, _m2_scratch, _m2_linbuf, 144) != 144) { return 0 - 1; }
+    stat_repack_144_to_48(_m2_linbuf, _m2_agnbuf);
+    if (pvm_write(pid, _m2_out_ptr, _m2_agnbuf, 48) != 48) { return 0 - 1; }
+    return 0;
+}
+
+# EXIT-stop: getdents#29 — the kernel wrote `lret` bytes of Linux getdents64
+# records into the red-zone scratch; pull them out, repack into the agnos dirent
+# layout (bounded by the child's bufsize), write into the child's saved buffer.
+# Returns the agnos byte count (0 = end of dir / -1 on error or short copy).
+fn _m2_getdents_exit(pid, lret): i64 {
+    if (lret < 0) { return 0 - 1; }                  # -errno -> agnos -1
+    if (lret == 0) { return 0; }                     # end of directory
+    if (lret > 4096) { lret = 4096; }                # we capped the Linux read at 4096
+    if (pvm_read(pid, _m2_scratch, _m2_linbuf, lret) != lret) { return 0 - 1; }
+    var cap = _m2_out_cap;
+    if (cap > 4096) { cap = 4096; }                  # bound to _m2_agnbuf
+    var abytes = getdents_repack(_m2_linbuf, lret, _m2_agnbuf, cap);
+    if (pvm_write(pid, _m2_out_ptr, _m2_agnbuf, abytes) != abytes) { return 0 - 1; }
+    return abytes;                                   # agnos return = repacked byte count
+}
+
+# EXIT-stop return mapping for an executed fs call: stat/getdents need an output
+# repack; everything else just maps the Linux return to the agnos convention.
+fn fs_exit_return(pid, agnos_nr, lret): i64 {
+    if (agnos_nr == 33) { return _m2_stat_exit(pid, lret); }
+    if (agnos_nr == 29) { return _m2_getdents_exit(pid, lret); }
+    return linux_ret_to_agnos(agnos_nr, lret);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -82,9 +163,69 @@ fn translate_dispatch(pid, regs): i64 {
         return STRAT_EMULATE;
     }
 
+    # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
+    #     path(s) into the child red zone (NUL-terminated) before executing. ---
+    if (nr == 7) {
+        # open(name,namelen,flags) -> Linux open(path, O_flags, mode 0644).
+        var aflags = decode_arg(regs, 2);
+        var sc7 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                           load64(regs + REG_RSP) - RED_ZONE);
+        if (sc7 < 0) { return _m2_fail(pid, regs); }
+        store64(regs + REG_RDI, sc7);                  # path (NUL-terminated scratch)
+        store64(regs + REG_RSI, ao_to_o(aflags));      # AO_* -> O_*
+        store64(regs + REG_RDX, open_create_mode());   # mode 0644 (consulted only on O_CREAT)
+        store64(regs + REG_ORIG_RAX, 2);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+    if (nr == 9) {
+        # mkdir(path,pathlen) -> Linux mkdir(path, mode 0777).
+        var sc9 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                           load64(regs + REG_RSP) - RED_ZONE);
+        if (sc9 < 0) { return _m2_fail(pid, regs); }
+        store64(regs + REG_RDI, sc9);
+        store64(regs + REG_RSI, mkdir_create_mode());  # mode 0777 (umask in child trims)
+        store64(regs + REG_ORIG_RAX, 83);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+    if (nr == 10) { return _m2_one_path(pid, regs, 84); }   # rmdir
+    if (nr == 30) { return _m2_one_path(pid, regs, 87); }   # unlink
+    if (nr == 31) { return _m2_two_path(pid, regs, 82); }   # rename
+    if (nr == 32) { return _m2_two_path(pid, regs, 86); }   # link (HARDLINK, never symlink)
+    if (nr == 33) {
+        # stat(path,pathlen,statbuf48) -> Linux stat(path, statbuf144); the exit
+        # stop repacks the 144 B Linux struct into the saved agnos 48 B statbuf.
+        var sps = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                           load64(regs + REG_RSP) - RED_ZONE);
+        if (sps < 0) { return _m2_fail(pid, regs); }
+        _m2_scratch = (sps - 144) & (0 - 8);     # 144 B Linux statbuf, below the path
+        _m2_out_ptr = decode_arg(regs, 2);       # the agnos 48 B statbuf (for the exit repack)
+        store64(regs + REG_RDI, sps);
+        store64(regs + REG_RSI, _m2_scratch);
+        store64(regs + REG_ORIG_RAX, 4);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+    if (nr == 29) {
+        # getdents(dir_fd,buf,bufsize) -> Linux getdents64(fd, scratch, cap); the
+        # exit stop repacks the Linux records into the saved agnos buffer.
+        var gcap = decode_arg(regs, 2);
+        if (gcap > 4096) { gcap = 4096; }
+        _m2_scratch = (load64(regs + REG_RSP) - RED_ZONE - 4096) & (0 - 8);  # one-page scratch
+        _m2_out_ptr = decode_arg(regs, 1);       # the agnos dirent buffer
+        _m2_out_cap = decode_arg(regs, 2);       # the agnos bufsize
+        store64(regs + REG_RSI, _m2_scratch);    # dir_fd in rdi passes through
+        store64(regs + REG_RDX, gcap);
+        store64(regs + REG_ORIG_RAX, 217);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg
     # synthesis), run it IN the child. NO rax/rip changes — at the enter stop the
     # kernel dispatches on orig_rax; the loop maps the return at the exit stop.
+    # (close#6/lseek#58/dup#8 are pure renumbers handled here via agnos_to_linux_nr.)
     var lnr = agnos_to_linux_nr(nr);
     if (lnr >= 0) {
         if (nr == 27) {

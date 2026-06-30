@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-29
+
+M2 — filesystem syscalls. agnos coreutils-class tools read+write a real fs, no QEMU.
+
+### Added
+- **M2 filesystem syscalls** — agnos `cat`/`cp`/`ls`/`stat`-class tools now read+
+  write a real fs under mirshi (no QEMU). Adds 13 fs translations:
+  `open#7` (`AO_*`→`O_*` flags + synthesized mode), `close#6`, `read#5`/`write#1`
+  (M1), `lseek#58`, `dup#8`, `mkdir#9`, `rmdir#10`, `unlink#30`, `rename#31`,
+  `link#32` (hardlink), `stat#33`, `getdents#29`.
+  - `src/scratch.cyr` — child red-zone path staging: `process_vm_readv`/`writev`
+    wrappers + `stage_at` (writes the NUL-terminated path below the stopped
+    child's `rsp`, short-transfer-guarded). The fs calls execute in-child so the
+    kernel reads the staged path natively.
+  - `src/dispatch.cyr` — the fs handlers (single-path, two-path register MOVE for
+    `rename`/`link`, and the `stat`/`getdents` exit-stop output repack).
+  - `src/translate.cyr` — pure helpers: `ao_to_o`, `dtype_to_agnos`, the
+    `stat` 144 B→48 B repack, the `getdents` Linux→agnos dirent repack, + the fs
+    number map. Unit-tested (41 new assertions; 105 total).
+  - `tests/fixtures` via `scripts/it/m2_fs.sh` — sandboxed fs integration test
+    asserting HOST EFFECTS (file created/content, cp `cmp`, dir created, rename/
+    hardlink, unlink, stat fields, dir listing). Wired into CI after the M1 step.
+  - [ADR 0003](docs/adr/0003-fs-redzone-path-staging.md) — why red-zone path
+    staging + exit-stop repack (not injected-mmap, not supervisor-side fs).
+- Known gaps (documented): transparent path pass-through (rootfs isolation is M3,
+  `..`/symlink-escape hardening is 0.7.0); `getdents` drops records past the agnos
+  buffer; `getdents` ino truncated u64→u32.
+
 ## [0.2.0] — 2026-06-29
 
 M1 — core translation. agnos binaries run as native Linux processes, no QEMU.

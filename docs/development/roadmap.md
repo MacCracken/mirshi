@@ -38,13 +38,17 @@ Model — execute-in-child via `PTRACE_SYSCALL` register rewrite + emulate the b
 [`../adr/0002-execute-in-child-translation.md`](../adr/0002-execute-in-child-translation.md). Proven by
 `scripts/it/m1_run.sh`.
 
-### M2 — Filesystem syscalls (real agnos CLI tools run) (v0.3.0)
+### M2 — Filesystem syscalls (real agnos CLI tools run) (v0.3.0) — ✅ shipped 2026-06-29
 `open#7`/`close#6`/`read`/`write`/`lseek#58`/`stat#33`/`getdents#29`/`mkdir#9`/`rmdir#10`/`unlink#30`/
 `rename#31`/`link#32`/`dup#8` — map agnos VFS semantics onto a Linux container rootfs: translate agnos
 `AO_*` open flags → Linux `O_*` (values differ — `AO_CREAT=0x100` vs Linux 64), the `a4=r10` 4th-arg ABI,
 and the agnos `dirent` layout. ⚠ **symlink gap** (mirrors the ark-v2 finding): agnos `#32` is hardlink,
-there is **no symlink syscall** — mirshi follows agnos's surface. Acceptance: an agnos coreutils-class tool
-(`kriya` `ls`/`cat`/`cp`, or `owl`) reads+writes the container fs under mirshi.
+there is **no symlink syscall** — mirshi follows agnos's surface. **Acceptance met:** agnos `cat`/`cp`/`ls`/
+`stat`-class fixtures read+write a (sandboxed) rootfs under mirshi — `cp` copies, `ls` lists with types,
+`stat` reports mode/size — proven by `scripts/it/m2_fs.sh`. Mechanism — red-zone path staging
+(`process_vm_*`) + exit-stop struct repack: [`../adr/0003-fs-redzone-path-staging.md`](../adr/0003-fs-redzone-path-staging.md).
+Known gaps: transparent path pass-through (rootfs isolation = M3, escape hardening = 0.7.0); `getdents`
+overflow-drop + ino u64→u32 truncation.
 
 ### M3 — The Docker image + multi-container fan-out (the v1 vehicle) (v0.4.0)
 A `Dockerfile` building an image that carries **mirshi (Linux-target)** + an **agnos userland set

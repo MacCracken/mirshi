@@ -33,7 +33,96 @@ fn agnos_to_linux_nr(agnos_nr): i64 {
     if (agnos_nr == 12) { return 162; }   # sync        -> sync(162)
     if (agnos_nr == 45) { return 318; }   # getrandom   -> getrandom(318) [number DIFFERS]
     if (agnos_nr == 46) { return 201; }   # time_unix   -> time(201, NULL)
+    # --- M2 filesystem peers ---
+    if (agnos_nr == 7) { return 2; }      # open        -> open(2)     [+ path stage + AO->O flags]
+    if (agnos_nr == 6) { return 3; }      # close       -> close(3)
+    if (agnos_nr == 33) { return 4; }     # stat        -> stat(4)     [+ path stage + 144->48 repack]
+    if (agnos_nr == 58) { return 8; }     # lseek       -> lseek(8)
+    if (agnos_nr == 8) { return 32; }     # dup         -> dup(32)
+    if (agnos_nr == 31) { return 82; }    # rename      -> rename(82)  [+ 2 path stages]
+    if (agnos_nr == 9) { return 83; }     # mkdir       -> mkdir(83)   [+ path stage + mode]
+    if (agnos_nr == 10) { return 84; }    # rmdir       -> rmdir(84)   [+ path stage]
+    if (agnos_nr == 32) { return 86; }    # link        -> link(86)    [HARDLINK, NOT symlink]
+    if (agnos_nr == 30) { return 87; }    # unlink      -> unlink(87)  [+ path stage]
+    if (agnos_nr == 29) { return 217; }   # getdents    -> getdents64(217) [+ dirent repack]
     return 0 - 1;                         # no direct peer
+}
+
+# Translate agnos AO_* open flags to Linux O_* (§3.3). The access mode (low 2
+# bits) and TRUNC/APPEND are bit-identical; AO_CREAT and AO_DIRECTORY move bits.
+# Worked example: 0x301 (AO_WRONLY|AO_CREAT|AO_TRUNC) -> 0x241 (O_WRONLY|O_CREAT|O_TRUNC).
+fn ao_to_o(ao): i64 {
+    var o = ao & 3;                              # access mode: AO_RDONLY/WRONLY/RDWR == O_*
+    if ((ao & 0x100) != 0) { o = o | 0x40; }     # AO_CREAT 0x100   -> O_CREAT 0x40     (DIFFERS)
+    if ((ao & 0x200) != 0) { o = o | 0x200; }    # AO_TRUNC 0x200   -> O_TRUNC 0x200    (same)
+    if ((ao & 0x400) != 0) { o = o | 0x400; }    # AO_APPEND 0x400  -> O_APPEND 0x400   (same)
+    if ((ao & 0x800) != 0) { o = o | 0x10000; }  # AO_DIRECTORY 0x800 -> O_DIRECTORY 0x10000 (DIFFERS)
+    return o;
+}
+
+# Creation modes mirshi synthesizes (agnos open/mkdir carry no mode). The child's
+# umask trims them. 0644 = 0x1A4 (rw-r--r--), 0777 = 0x1FF (rwxr-xr-x). Kept as
+# pure helpers so the octal<->hex value is pinned by a unit test (not a literal).
+fn open_create_mode(): i64 { return 0x1A4; }     # 0644
+fn mkdir_create_mode(): i64 { return 0x1FF; }    # 0777
+
+# Map a Linux getdents64 d_type to the agnos AgnosDirent type byte.
+fn dtype_to_agnos(d_type): i64 {
+    if (d_type == 8) { return 1; }    # DT_REG -> file
+    if (d_type == 4) { return 2; }    # DT_DIR -> dir
+    if (d_type == 10) { return 3; }   # DT_LNK -> symlink
+    return 0;                         # DT_UNKNOWN / fifo / chr / blk / sock -> unknown
+}
+
+# Repack a Linux x86_64 `struct stat` (144 B) into an agnos AgnosStat (48 B).
+# All agnos fields are u64. Only st_mode is width-mismatched (u32 -> u64); the
+# POSIX type bits (S_IFREG=0x8000 / S_IFDIR=0x4000 / S_IFLNK=0xA000) and perm
+# bits are identical in both ABIs, so mode passes through verbatim. Pure: reads
+# `lb` (Linux struct), writes `ab` (agnos struct); both supervisor buffers.
+fn stat_repack_144_to_48(lb, ab): i64 {
+    store64(ab + 0, load32(lb + 24) & 0xFFFFFFFF);  # agnos mode@0  <- linux st_mode@24 (u32, zero-extend)
+    store64(ab + 8, load64(lb + 16));               # agnos nlink@8 <- linux st_nlink@16
+    store64(ab + 16, load64(lb + 48));              # agnos size@16 <- linux st_size@48
+    store64(ab + 24, load64(lb + 8));               # agnos ino@24  <- linux st_ino@8
+    store64(ab + 32, load64(lb + 64));              # agnos blocks@32 <- linux st_blocks@64
+    store64(ab + 40, load64(lb + 88));              # agnos mtime@40 <- linux st_mtime@88 (drop nsec@96)
+    return 0;
+}
+
+# Repack a Linux getdents64 record stream (`lb`, `n_linux` bytes) into the agnos
+# AgnosDirent layout (`ab`, capacity `cap` bytes). Walks Linux records by their
+# d_reclen@16; emits packed agnos records (reclen@0 u16 = 8+namelen, type@2 u8,
+# namelen@3 u8, ino@4 u32 = low 32 of d_ino, name@8 raw bytes no-NUL). Stops
+# before overflowing `cap` (overflow entries are dropped — see ADR/risks).
+# Returns the agnos byte count written. Pure: supervisor buffers only.
+fn getdents_repack(lb, n_linux, ab, cap): i64 {
+    var li = 0;
+    var ai = 0;
+    while (li < n_linux) {
+        # Bounds-safety: never read a partial record header past the Linux buffer,
+        # and never get stuck on a malformed (zero) reclen. The host kernel always
+        # returns whole records, so this is defensive depth for a trust boundary.
+        if ((li + 19) > n_linux) { return ai; }
+        var d_ino = load64(lb + li);                # d_ino@0
+        var d_reclen = load16(lb + li + 16);        # d_reclen@16 (u16)
+        if (d_reclen < 1) { return ai; }            # malformed reclen — stop, don't spin
+        var d_type = load8(lb + li + 18);           # d_type@18 (u8)
+        var name = lb + li + 19;                    # d_name@19 (NUL-terminated)
+        var namelen = strlen(name);
+        var avail = n_linux - (li + 19);            # bound the name to the Linux buffer
+        if (namelen > avail) { namelen = avail; }
+        if (namelen > 255) { namelen = 255; }       # agnos namelen is u8
+        var arec = 8 + namelen;                     # agnos fixed header (8) + name
+        if ((ai + arec) > cap) { return ai; }       # would overflow the agnos buffer — stop
+        store16(ab + ai + 0, arec);                 # DIRENT_RECLEN@0 (u16)
+        store8(ab + ai + 2, dtype_to_agnos(d_type));# DIRENT_TYPE@2
+        store8(ab + ai + 3, namelen);               # DIRENT_NAMELEN@3
+        store32(ab + ai + 4, d_ino & 0xFFFFFFFF);   # DIRENT_INO@4 (u32, low 32 bits of d_ino)
+        memcpy(ab + ai + 8, name, namelen);         # DIRENT_NAME@8 (raw, no NUL)
+        ai = ai + arec;
+        li = li + d_reclen;
+    }
+    return ai;
 }
 
 # Round a requested length UP to the agnos 2 MB (0x200000) mmap granularity.
