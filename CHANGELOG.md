@@ -4,7 +4,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-0.7.1 — Supervisor rootfs confinement (the path-escape blocker fix), bites 1+2+3.
+## [0.7.1] — 2026-06-30
+
+Supervisor rootfs confinement — the path-escape blocker fix (audit class-(c)), bites
+1+2+3. `--root <dir>` confines the child's filesystem kernel-enforced + unprivileged;
+the audit's class-(c) blocker tier is closed (confined under `--root` for the bare CLI,
+namespace-bounded for the container vehicle).
 
 ### Security
 - **`--root <dir>` rootfs confinement** ([ADR 0009](docs/adr/0009-rootfs-confinement-openat2-in-child.md)):

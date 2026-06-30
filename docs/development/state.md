@@ -5,14 +5,15 @@
 
 ## Version
 
-**0.7.0** — 2026-06-30. Security sweep (audit + hardening, phased): the
-[audit](../audit/2026-06-30-audit.md) (32 findings; **seccomp proven default-deny**;
-TOCTOU safe-by-design; `mmap` synth hardened) + fail-closed seccomp install, x32-bit
-mask, 0600/0700 create modes. The class-(c) path-escape blocker fix (supervisor rootfs
-confinement) is **0.7.1**. 0.6.0 = hardening (rlimits / group-stop / child-hang, ADRs
-0006-0008); 0.5.0 = M4 seccomp-notify feasibility + benchmark ([ADR 0005](../adr/0005-seccomp-notify-feasibility.md));
-0.4.0 = M3 Docker vehicle (functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1
-translation; 0.1.0 = M0 trap loop.
+**0.7.1** — 2026-06-30. Supervisor rootfs confinement — the path-escape blocker fix
+(audit class-(c), [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)):
+`--root <dir>` confines the child's filesystem via `openat2 RESOLVE_IN_ROOT` (open) +
+the `*at` family with lexical `sanitize_rootrel` (mutation/metadata) + `RESOLVE_NO_MAGICLINKS`;
+the container vehicle stays namespace-confined. 0.7.0 = security sweep (audit + hardening:
+seccomp proven default-deny, x32 mask, fail-closed install); 0.6.0 = hardening (rlimits /
+group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility + benchmark
+([ADR 0005](../adr/0005-seccomp-notify-feasibility.md)); 0.4.0 = M3 Docker vehicle
+(functional v1 surface complete); 0.3.0 = M2 fs; 0.2.0 = M1 translation; 0.1.0 = M0 trap loop.
 
 ## Toolchain
 
@@ -134,7 +135,7 @@ path-escape** (no in-supervisor path confinement; bare-CLI child reaches arbitra
 paths, PoC-confirmed) — bounded by the container mount NS in the v1 vehicle, fixed
 properly by the **0.7.1** supervisor rootfs confinement.
 
-**0.7.1 rootfs confinement** — ✅ complete (in `[Unreleased]`):
+**0.7.1 rootfs confinement** — ✅ shipped 2026-06-30:
 `--root <dir>` confines the full path surface ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)),
 kernel-enforced + unprivileged. Bite 1: `open#7` → `openat2 RESOLVE_IN_ROOT` (abs/traversal/
 symlink clamped; all fd-based ops transitively confined). Bite 2: `mkdir`/`rmdir`/`unlink`/
