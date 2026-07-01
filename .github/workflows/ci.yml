@@ -140,6 +140,13 @@ jobs:
         # agnos -1). Needs python3 + the same-uid ptrace requirement as the M0/M1/M2 steps.
         run: bash scripts/it/net_client.sh
 
+      - name: Net band — send/recv round-trip (v1.1.0)
+        # v1.1.0 net band MVP (docs/adr/0012): an agnos httpget does a full TCP round-trip
+        # under mirshi — connect#47 / send#48 (the GET) / recv#49 loop until EOF (the INVERTED
+        # recv-EOF: 0=WOULD_BLOCK, -1=EOF) / close#50 — against a local HTTP server, and the
+        # response body comes back on stdout. Needs python3 + the same-uid ptrace requirement.
+        run: bash scripts/it/net_io.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

@@ -242,6 +242,8 @@ fn fs_exit_return(pid, agnos_nr, lret): i64 {
 enum MirshiNetSys {
     SYS_SOCKET = 41;
     SYS_CONNECT = 42;
+    SYS_SENDTO = 44;             # send() = sendto() with a NULL addr
+    SYS_RECVFROM = 45;           # recv() = recvfrom() with a NULL addr
     SYS_PPOLL = 271;
     SYS_GETSOCKOPT = 55;
     SOCK_STREAM = 1;
@@ -251,6 +253,9 @@ enum MirshiNetSys {
     SO_ERROR = 4;
     EINPROGRESS = 115;           # non-blocking connect() in progress -> poll for completion
     POLLOUT = 4;
+    MSG_DONTWAIT = 0x40;         # per-call non-blocking recv -> -EAGAIN maps to agnos WOULD_BLOCK
+    MSG_NOSIGNAL = 0x4000;       # send() must NOT raise SIGPIPE (it would kill the SUPERVISOR)
+    NET_IO_CAP = 4096;           # one-page bound on a single send/recv payload (caller loops)
     NET_SLOTS = 8;               # agnos conn_id / listener_id space is 0..7 (the kernel's 8 slots)
     CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
 }
@@ -337,6 +342,70 @@ fn _net_close_conn(pid, regs): i64 {
     syscall(HOST_CLOSE, fd);
     store64(tbl + cid * 8, 0 - 1);                # free the slot
     return _net_emu(pid, regs, 0);
+}
+
+# A one-page I/O buffer for send/recv payloads (lazy-once; one net call in flight at a time,
+# same discipline as the M2 repack buffers). Bounds a single send/recv to NET_IO_CAP.
+var _net_io = 0;
+fn _net_io_buf(): i64 {
+    if (_net_io == 0) { _net_io = alloc(NET_IO_CAP); }
+    return _net_io;
+}
+
+# conn_id -> host fd; -1 if the id is out of range or the slot is free (a hostile/stale id).
+fn _net_fd(cid): i64 {
+    if (cid < 0) { return 0 - 1; }
+    if (cid >= NET_SLOTS) { return 0 - 1; }
+    return load64(_net_tbl() + cid * 8);
+}
+
+# sock_send#48(conn_id, buf, len) -> bytes (<=len) / -1. BLOCKS (agnos). The child buffer is
+# pvm_read into a supervisor page (bounded to NET_IO_CAP), then send()'d with MSG_NOSIGNAL so a
+# peer-closed socket cannot SIGPIPE the SUPERVISOR. The socket is non-blocking (for recv/connect),
+# so a full send buffer (-EAGAIN) is handled by one bounded ppoll(POLLOUT) + retry — emulating the
+# blocking send. A partial send is a valid agnos return (the caller loops).
+fn _net_send(pid, regs): i64 {
+    var fd = _net_fd(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var child_buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    if (len <= 0) { return _net_emu(pid, regs, 0); }        # nothing to send
+    if (len > NET_IO_CAP) { len = NET_IO_CAP; }             # cap; caller loops for the rest
+    var io = _net_io_buf();
+    if (pvm_read(pid, child_buf, io, len) != len) { return _net_emu(pid, regs, 0 - 1); }  # bad child ptr
+    var sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent != (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0 - 1); }   # real error
+    # send buffer full: wait (bounded) for writability, retry once.
+    var sb = _net_scratch_buf();
+    store32(sb + 16, fd);
+    store16(sb + 20, POLLOUT);
+    store16(sb + 22, 0);
+    store64(sb + 24, CONNECT_TIMEOUT_S);
+    store64(sb + 32, 0);
+    syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+    sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    return _net_emu(pid, regs, 0 - 1);
+}
+
+# sock_recv#49(conn_id, buf, maxlen) -> bytes / 0=WOULD_BLOCK / -1=EOF (INVERTED from Linux — see
+# net_recv_to_agnos). Non-blocking recv (MSG_DONTWAIT) into a supervisor page, map the return, then
+# pvm_write the received bytes into the child buffer. A short pvm_write (bad child ptr) -> -1.
+fn _net_recv(pid, regs): i64 {
+    var fd = _net_fd(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var child_buf = decode_arg(regs, 1);
+    var maxlen = decode_arg(regs, 2);
+    if (maxlen <= 0) { return _net_emu(pid, regs, 0); }     # nothing requested
+    if (maxlen > NET_IO_CAP) { maxlen = NET_IO_CAP; }
+    var io = _net_io_buf();
+    var lr = syscall(SYS_RECVFROM, fd, io, maxlen, MSG_DONTWAIT, 0, 0);
+    var aret = net_recv_to_agnos(lr);
+    if (aret > 0) {
+        if (pvm_write(pid, child_buf, io, aret) != aret) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    return _net_emu(pid, regs, aret);
 }
 
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
@@ -490,6 +559,8 @@ fn translate_dispatch(pid, regs): i64 {
     # ENOSYS until its phase. See docs/adr/0012.
     if (_net_active == 1) {
         if (nr == 47) { return _net_connect(pid, regs); }      # sock_connect -> conn_id / -1
+        if (nr == 48) { return _net_send(pid, regs); }         # sock_send -> bytes / -1
+        if (nr == 49) { return _net_recv(pid, regs); }         # sock_recv -> bytes / 0 WB / -1 EOF
         if (nr == 50) { return _net_close_conn(pid, regs); }   # sock_close
     }
 
