@@ -4,6 +4,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-07-01
+
+**Signals — the shell's other half.** agnos `pause#14` / `kill#16` / `sigprocmask#17` / `signalfd#18`
+now run: a process sends a signal to itself or a direct child, masks signals, and reads deliveries via a
+`signalfd` — the notification half of job control that pairs with v1.5.0's `spawn`/`waitpid`. The agnos
+signal model is **signalfd-centric with no async `sa_handler`**, so the whole band is supervisor-emulated
+over the v1.5.0 record table — no real host signals, no real host fds
+([ADR 0014](docs/adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)).
+
+### Added
+- **Pending / blocked masks** (`src/children.cyr`): each child record carries a **pending** mask
+  (`C_PENDING_SIG`, the field reserved in v1.5.0) and a **blocked** mask (`C_SIG_BLOCKED`), both in the
+  agnos `1<<sig` convention (bit N = signal N — **not** libc's `1<<(sig-1)`). Pure, unit-pinned helpers
+  `_sig_valid` (1..63) / `_sig_bit` / `_sig_deliverable` (`pending & ~blocked`) / `_sig_lowest` /
+  `_sig_clear` (`~x` via the `0-x-1` identity — Cyrius has no unary `~`).
+- **`kill#16`** (`_do_kill`, loop-level): OR `1<<sig` into the **target's** pending mask;
+  **self-or-direct-child** scope only, pid 0 protected, `sig ∈ 1..63`. Killing an exited-but-unreaped
+  child is a harmless no-op.
+- **`pause#14`** (`_do_pause`, loop-level): a **bounded yield** — returns 0 immediately if a deliverable
+  signal is pending, else idles one supervisor quantum (1 ms) then returns 0. Never blocks forever.
+- **`sigprocmask#17`** (`_do_sigprocmask`): `SIG_BLOCK` / `SIG_UNBLOCK` / `SIG_SETMASK` over the caller's
+  blocked mask, with the previous mask written to `oldset` (reads `set` first, so `oldset == set` aliasing
+  is safe).
+- **`signalfd#18`** (`_do_signalfd`) + **`read#5` delivery** (`_sigfd_read`): `signalfd` returns an
+  opaque `SIGFD_BASE + slot` fd indexing a per-child 8-slot signalfd table (`{watched_mask, flags}`); a
+  `read` on it delivers the lowest `pending & watched & ~blocked` signal as an **8-byte number** (returns
+  8), else agnos −1 (non-blocking). `read#5` gains a one-compare `fd >= SIGFD_BASE` branch.
+- **New gate**: `scripts/it/signals.sh` — kill scope (self/child 0; pid0/badsig/unknown/cross-tree −1),
+  pause bounded yield, sigprocmask oldset round-trip, and the full `kill → signalfd read` delivery chain
+  incl. the signal-loss regression. CI-wired after `net_icmp` / the v1.5.0 gates.
+
+### Security
+- **`SIGFD_BASE = 0x20000000`, bit 30 clear** — the agnos userland tags its own **socket** fds with
+  `AGNOS_SOCK_TAG = 0x40000000` (bit 30) and routes bit-30 fds to the net band **before** the syscall; a
+  signalfd id with bit 30 set would be swallowed as a socket and never reach `read#5`. Bit 29 avoids the
+  collision (found + fixed during bring-up).
+- **Bounded-yield `pause` — anti-wedge**: `_agnos_sock_recv_block` (the TLS/HTTP blocking read) polls a
+  non-blocking `sock_recv` and yields via `pause`; a block-forever `pause` would wedge every such read.
+  The 1 ms bounded yield protects it and — never parking `CS_BLOCKED` — leaves the v1.5.0 deadlock guard
+  untouched.
+- **Deliver-then-consume** (`_sigfd_read`): the pending bit is cleared **after** a successful delivery
+  write, so a failed child-buffer write never loses the signal (adversarial-review finding + regression
+  test). The signal band was reviewed for signal-loss, mask aliasing, and fd-tag collision — all fixed.
+
+### Changed
+- **Frozen matrix**: rows #14/#16/#17/#18 move ENOSYS → **EMULATE ⁴** (signals). They are intercepted at
+  the loop level / dispatcher **before** `agnos_to_linux_nr`, so the freeze test's values stay pinned
+  (still −1, "no peer").
+- **Toolchain pin → `6.3.23`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.5.0] — 2026-07-01
 
 **Multi-process — the agnsh crown jewel.** agnos `spawn#3` / `waitpid#4` / `getpid#2` now run: a

@@ -44,11 +44,11 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 11 | mount | ENOSYS | — | stub |
 | 12 | sync | EXECUTE | `sync` (162) | |
 | 13 | reboot | ENOSYS | — | |
-| 14 | pause | EMULATE | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
+| 14 | pause | EMULATE ⁴ | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
 | 15 | getuid | ENOSYS | — | |
-| 16 | kill | EMULATE | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
-| 17 | sigprocmask | EMULATE | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
-| 18 | signalfd | EMULATE | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
+| 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
+| 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
+| 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
 | 19 | epoll_create | ENOSYS | — | epoll — post-v1 |
 | 20 | epoll_ctl | ENOSYS | — | epoll — post-v1 |
 | 21 | epoll_wait | ENOSYS | — | epoll — post-v1 |
@@ -119,8 +119,24 @@ until the target exits, then injects its exit code; `getpid#2` returns the calle
 ([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md)). **Known limits** (ADR 0013):
 `sleep_ms#41` + blocking net I/O still run in the supervisor — **head-of-line blocking** across children
 (deferred rework, pairs with v1.6.0 signals); agnos `exit(>255)` is 8-bit-truncated by the host status
-word; a wait deadlock (self-wait / cycle) is **broken to −1**, not diagnosed. `kill#16` + signals are
-v1.6.0.
+word; a wait deadlock (self-wait / cycle) is **broken to −1**, not diagnosed. Signals (`kill#16` et al.)
+shipped in v1.6.0 (footnote ⁴).
+
+⁴ **Signal band (v1.6.0).** `pause#14` / `kill#16` / `sigprocmask#17` / `signalfd#18` are
+**supervisor-EMULATE** ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) over the
+v1.5.0 record table — no real host signals, no real host fds. Each child record carries a **pending** mask
+(`kill#16` ORs `1<<sig`, self/direct-child scope, pid 0 protected, sig 1..63) and a **blocked** mask
+(`sigprocmask#17`); a signal is deliverable iff `pending & ~blocked`. `signalfd#18` returns an opaque
+`SIGFD_BASE + slot` fd (per-child 8-slot table); a `read#5` on it delivers the lowest watched-and-deliverable
+signal as an **8-byte number** (returns 8), clearing the pending bit **after** the write (deliver-then-consume,
+so a failed write never loses the signal), else agnos −1 (non-blocking). Masks are agnos `1<<sig` (bit N =
+signal N, **not** libc's `1<<(sig-1)`). `pause#14` is a **bounded yield** (returns 0; idles a 1 ms supervisor
+quantum if nothing pending) — it never blocks forever, protecting `_agnos_sock_recv_block`'s TLS/HTTP poll
+loop. `SIGFD_BASE = 0x20000000` keeps **bit 30 clear** so it never collides with the agnos userland's own
+socket-fd tag `AGNOS_SOCK_TAG = 0x40000000`. **Known limits**: `pause` head-of-line-blocks other children for
+the 1 ms quantum (the `sleep_ms#41` class); the MVP signalfd is **non-blocking-only** (a read with nothing
+pending returns −1, not a park); `sys_close` on a signalfd does **not** free its mirshi slot (bounded 8/proc,
+freed on exit). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
 
 ## The runnable surface (v1)
 
@@ -130,10 +146,11 @@ v1.6.0.
   `unlink#30`, `rename#31`, `link#32`, `stat#33`, `getdents#29`.
 
 Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47–57, #61, v1.1.0–v1.4.0
-— footnote ²) and **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³)
-shipped as post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see the
-[roadmap](../development/roadmap.md)): signals (#14, #16–18), epoll/timerfd/pipe (#19–25), info getters
-(#15/#34/#35), `flock#59`, and `winsize#60`.
+— footnote ²), **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³), and
+the **signal band** (`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18`, v1.6.0 — footnote ⁴) shipped as
+post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see the
+[roadmap](../development/roadmap.md)): epoll/timerfd/pipe (#19–25), info getters (#15/#34/#35),
+`flock#59`, and `winsize#60`.
 
 ## Known gaps (carried forward, documented not fixed)
 
@@ -146,6 +163,13 @@ shipped as post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see 
   mtime nsec is dropped (agnos has no nsec field).
 - **Multi-process (`spawn#3`/`waitpid#4`, ³)**: `sleep_ms#41` + blocking net I/O run in the
   single-threaded supervisor, so while one child blocks the others don't advance (**head-of-line
-  blocking** — deferred rework, pairs with v1.6.0 signals); agnos `exit(>255)` is 8-bit-truncated by
+  blocking** — deferred rework); agnos `exit(>255)` is 8-bit-truncated by
   the host status word; a wait deadlock (self-wait / cycle) is broken to agnos −1, not diagnosed; the
   process tree is capped at `MAX_CHILDREN=16`. See [ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md).
+- **Signal band (`pause#14`/`signalfd#18`, ⁴)**: `pause#14`'s 1 ms yield **head-of-line-blocks** other
+  children for the quantum (the `sleep_ms#41` class); the signalfd is **non-blocking only** — a `read`
+  with nothing pending returns agnos −1 rather than parking (the poll-with-`pause` idiom is the MVP
+  contract; a blocking/level-triggered signalfd is deferred); `sys_close` on a signalfd does a real
+  (harmless) close but does **not** free the mirshi slot (bounded 8/proc, freed on exit; a `close#6`
+  intercept is a future enhancement). `SIGKILL`/`SIGSTOP` unmaskability is not special-cased (agnos
+  delivers via signalfd, not default actions). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).

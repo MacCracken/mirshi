@@ -20,11 +20,11 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.5.0)
+## Shipped (v0.1.0 → v1.6.0)
 
-The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band, and
-multi-process are **done**. Full per-release detail: [`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen
-per-number contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
+The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
+multi-process, and signals are **done**. Full per-release detail: [`../../CHANGELOG.md`](../../CHANGELOG.md).
+Frozen per-number contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
 
 | Band | Versions | What |
 |---|---|---|
@@ -33,6 +33,7 @@ per-number contract: [`../reference/syscall-coverage.md`](../reference/syscall-c
 | **v1.0 — the clean cut** | v1.0.0 | a representative AGNOS userland in a `FROM scratch` Docker container, **no QEMU**, seccomp-bounded, fan-out-ready |
 | **Net band (post-v1)** | v1.1–v1.4 | TCP client → TCP server → UDP + `net_config` → ICMP: the sovereign net band (#47–57, #61), supervisor-EMULATE, egress default-deny ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)) — **complete** |
 | **Multi-process (post-v1)** | v1.5.0 | `spawn#3`/`waitpid#4`/`getpid#2` — the **agnsh crown jewel**: a parent spawns in-memory-ELF children + waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor; opaque-monotonic pids, `MAX_CHILDREN` storm bound, deadlock guard ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)) |
+| **Signals (post-v1)** | v1.6.0 | `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — the shell's notification half: supervisor-emulated pending/blocked masks over the record table, `kill` self/child-scoped, a **bounded-yield** `pause`, and an opaque `signalfd` whose `read#5` delivers the raw signal number ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) |
 
 ## Planned — post-v1 minors
 
@@ -40,13 +41,6 @@ Each remaining agnos-ABI surface is an additive **minor** (backward-compatible n
 same cadence the net band used). **Ordering is provisional + demand-driven** — a slice gets pulled
 forward when a real agnos consumer needs it. All rows below are **ENOSYS today**
 ([the matrix](../reference/syscall-coverage.md)).
-
-### v1.6.0 — Signals
-`pause#14` / `kill#16`(pid, sig) / `sigprocmask#17` / `signalfd#18`(→ fd). Signal delivery + job
-control — couples naturally with v1.5.0 (a shell needs `kill` + `waitpid`). The supervisor already
-discriminates group-stops from real signals ([ADR 0007](../adr/0007-group-stop-signal-handling.md));
-this exposes the agnos signal ABI on top, `signalfd#18` fitting the existing fd-mediated model.
-*Gate*: an agnos process masks + delivers a signal and reads one via `signalfd`.
 
 ### v1.7.0 — I/O multiplexing
 `epoll_create#19` / `epoll_ctl#20` / `epoll_wait#21`, `timerfd_create#22` / `timerfd_settime#23`,

@@ -5,6 +5,25 @@
 
 ## Version
 
+**1.6.0** — 2026-07-01. **Signals — the shell's other half** ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)).
+agnos `pause#14` / `kill#16` / `sigprocmask#17` / `signalfd#18` now run — the notification half of job control
+pairing with v1.5.0's `spawn`/`waitpid`. The agnos signal model is **signalfd-centric, no async `sa_handler`**,
+so the whole band is **supervisor-emulated** over the v1.5.0 record table (no real host signals, no real host
+fds). Each child record carries a **pending** mask (`kill#16` ORs `1<<sig`; self/direct-child scope, pid 0
+protected, sig 1..63) and a **blocked** mask (`sigprocmask#17`); a signal is deliverable iff `pending &
+~blocked` (agnos `1<<sig` convention — bit N = signal N, **not** libc's `1<<(sig-1)`). `signalfd#18` returns an
+opaque `SIGFD_BASE + slot` fd (per-child 8-slot table); a `read#5` on it delivers the lowest watched-and-
+deliverable signal as an **8-byte number** (returns 8), clearing the pending bit **after** the write
+(deliver-then-consume — a failed write never loses the signal), else agnos −1 (non-blocking). `pause#14` is a
+**bounded yield** (returns 0; idles a 1 ms supervisor quantum if nothing pending) — never a wedge, protecting
+`_agnos_sock_recv_block`'s TLS/HTTP poll loop and leaving the v1.5.0 deadlock guard untouched. `SIGFD_BASE =
+0x20000000` keeps **bit 30 clear** so it never collides with the agnos userland's own socket-fd tag
+`AGNOS_SOCK_TAG = 0x40000000`. The pure mask helpers are unit-pinned; the band was adversarially reviewed
+(signal-loss, mask aliasing, fd-tag collision — all found + fixed). Proven by `scripts/it/signals.sh` (kill
+scope + pause yield + sigprocmask oldset round-trip + the full `kill → signalfd read` delivery chain incl. the
+signal-loss regression). **Known limits**: `pause` head-of-line-blocks for the 1 ms quantum; the signalfd is
+**non-blocking-only**; a signalfd `close` doesn't free its mirshi slot (bounded 8/proc, freed on exit) — all
+documented (ADR 0014). Pin → `6.3.23`.
 **1.5.0** — 2026-07-01. **Multi-process — the agnsh crown jewel** ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)).
 agnos `spawn#3` / `waitpid#4` / `getpid#2` now run: a parent spawns children from **in-memory ELF images** and
 waits their exit codes, to arbitrary depth, under one supervisor. `_trace_run` is now a `wait4(-1, __WALL)`
@@ -50,7 +69,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.22` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.23` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -108,13 +127,23 @@ paths in the child red zone + repack output structs at the exit stop
   (stopped, not the supervisor) until the target exits; `getpid#2` returns the caller's coined agnos pid
   (root=1, opaque monotonic, never reused — bidirectional-ready). `MAX_CHILDREN=16` storm bound + a deadlock
   guard. Known limits: head-of-line blocking (`sleep`/blocking I/O), 8-bit exit truncation (ADR 0013).
+- Signals (1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)):
+  `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` supervisor-emulated over the v1.5.0 record table — no
+  real host signals/fds. Per-child **pending** (`C_PENDING_SIG`) + **blocked** (`C_SIG_BLOCKED`) masks in the
+  agnos `1<<sig` convention; pure helpers `_sig_valid`/`_sig_bit`/`_sig_deliverable`/`_sig_lowest`/`_sig_clear`
+  in `src/children.cyr`. `kill#16` sets `1<<sig` on the target (self/direct-child scope); `pause#14` bounded-
+  yields; `signalfd#18` returns an opaque `SIGFD_BASE+slot` fd (per-child 8-slot table, `SIGFD_BASE=0x20000000`
+  bit-30-clear to dodge `AGNOS_SOCK_TAG`), and `read#5` delivers the lowest watched-deliverable signal as an
+  8-byte number (deliver-then-consume). Known limits: `pause` head-of-line blocking, non-blocking-only
+  signalfd, signalfd-close slot leak (ADR 0014).
 
 ## Tests
 
 - `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer + the M1/M2
   translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
-  the multi-process record table / storm bound / ELF-size bounds (1.5.0); **248 assertions**, hermetic)
+  the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
+  (`signal-mask`: `_sig_valid`/`_bit`/`_deliverable`/`_lowest`/`_clear`, 1.6.0); **267 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -176,6 +205,10 @@ paths in the child red zone + repack output structs at the exit stop
   child sees its own coined pid 2 (per-child pid model).
 - `scripts/it/spawn_storm.sh` — 1.5.0 fork-storm/depth gate (after getpid): spawn past `MAX_CHILDREN=16`
   returns −1 (no host process leak), and a 3-level root→child→grandchild tree proves the flat table.
+- `scripts/it/signals.sh` — 1.6.0 signal-band gate (after spawn_storm): `kill#16` scope (self/child 0;
+  pid0/badsig/unknown/cross-tree −1) + `pause#14` bounded yield; `sigprocmask#17` BLOCK/UNBLOCK/SETMASK
+  oldset round-trip; the full `signalfd#18`+`read#5` `kill → observe` delivery chain (raw signal number,
+  watch-filtered) incl. the signal-loss regression (a failed delivery must not consume the pending bit).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -194,9 +227,9 @@ swallow** layer. None wired yet (scaffold).
 ## Target & boundary
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
-- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4) + multi-process
-  (v1.5.0) shipped post-v1; signals / epoll-timerfd-pipe / winsize / the Linux→AGNOS swallow are the
-  remaining planned minors (see the [roadmap](roadmap.md)).
+- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4), multi-process
+  (v1.5.0), and signals (v1.6.0) shipped post-v1; epoll-timerfd-pipe / info-getters / winsize / the
+  Linux→AGNOS swallow are the remaining planned minors (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
 ## Next
@@ -298,10 +331,11 @@ unprivileged ICMP); the handler adversarially reviewed (**CLEAN** — no fd leak
 sovereign net band (#47–57, #61) is now COMPLETE.**
 
 **Post-v1** (see [`roadmap.md`](roadmap.md) planned minors): the **sovereign net band** #47–57/#61
-(TCP client + server + UDP + net_config + ICMP, 1.1–1.4) **and multi-process** (`spawn#3`/`waitpid#4`/
-`getpid#2` — the agnsh crown jewel, v1.5.0) are **complete**. Remaining planned minors: **signals**
-(`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — v1.6.0, next); **I/O mux** (epoll #19–21 /
-timerfd #22–23 / `pipe#25`); **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`);
+(TCP client + server + UDP + net_config + ICMP, 1.1–1.4), **multi-process** (`spawn#3`/`waitpid#4`/
+`getpid#2` — the agnsh crown jewel, v1.5.0), **and signals** (`pause#14`/`kill#16`/`sigprocmask#17`/
+`signalfd#18` — the shell's other half, v1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md))
+are **complete**. Remaining planned minors: **I/O mux** (epoll #19–21 /
+timerfd #22–23 / `pipe#25`, v1.7.0 next); **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`);
 **`winsize#60`** tty sizing; and **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the
 agnos kernel — the permanent compat layer), v2+. Each is
 its own validation surface; the translation core built here runs from both
