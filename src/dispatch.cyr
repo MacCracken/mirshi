@@ -233,6 +233,112 @@ fn fs_exit_return(pid, agnos_nr, lret): i64 {
     return linux_ret_to_agnos(agnos_nr, lret);
 }
 
+# --- Net band (v1.1.0) — supervisor-EMULATED TCP client (docs/adr/0012). The socket
+#     ops run in the SUPERVISOR's own process (its fds, its unconfined privilege — no
+#     child seccomp-allowlist growth); the child only ever sees the opaque conn_id
+#     (0..7 = the slot index). connect#47 is egress-checked BEFORE the socket exists. ---
+# Linux x86_64 net syscall numbers + constants (verified by compiling C; close(3) reuses
+# MirshiConfine.HOST_CLOSE; AF_INET / SOCKADDR_IN_SIZE / NET_EAGAIN come from MirshiNet).
+enum MirshiNetSys {
+    SYS_SOCKET = 41;
+    SYS_CONNECT = 42;
+    SYS_PPOLL = 271;
+    SYS_GETSOCKOPT = 55;
+    SOCK_STREAM = 1;
+    SOCK_NONBLOCK = 0x800;
+    SOCK_CLOEXEC = 0x80000;      # host socket fd never leaks across an exec
+    SOL_SOCKET = 1;
+    SO_ERROR = 4;
+    EINPROGRESS = 115;           # non-blocking connect() in progress -> poll for completion
+    POLLOUT = 4;
+    NET_SLOTS = 8;               # agnos conn_id / listener_id space is 0..7 (the kernel's 8 slots)
+    CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
+}
+
+# The supervisor-side conn_id(0..7) -> host fd table (lazy-alloc-once, like _how_buf). A slot
+# holds -1 (free) or a connected host fd. The child never sees these fds — only the slot index.
+var _net_conn_fd = 0;
+fn _net_tbl(): i64 {
+    if (_net_conn_fd == 0) {
+        _net_conn_fd = alloc(NET_SLOTS * 8);
+        var i = 0;
+        while (i < NET_SLOTS) { store64(_net_conn_fd + i * 8, 0 - 1); i = i + 1; }
+    }
+    return _net_conn_fd;
+}
+
+# Supervisor scratch for the emulated net calls (lazy-once): sockaddr_in@0(16) + pollfd@16(8)
+# + timespec@24(16) + SO_ERROR optval@40(4)/optlen@48(4). One call in flight at a time.
+var _net_scratch = 0;
+fn _net_scratch_buf(): i64 {
+    if (_net_scratch == 0) { _net_scratch = alloc(64); }
+    return _net_scratch;
+}
+
+# Inject a supervisor-computed return into the child's rax (STRAT_EMULATE): skip the foreign
+# agnos syscall (orig_rax=-1) so it never runs as a Linux call, stash the value for the exit
+# stop. Same discipline as uptime_ms#40 / sleep_ms#41.
+fn _net_emu(pid, regs, ret): i64 {
+    _xlat_emu_ret = ret;
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EMULATE;
+}
+
+# sock_connect#47(dst_ip, dst_port, src_port) -> conn_id 0..7 / -1. Egress-checked, then the
+# supervisor does socket()+non-blocking connect()+bounded ppoll(POLLOUT)+SO_ERROR, and records
+# the fd in a free slot. src_port is ignored in v1 (ephemeral). dst_ip is the agnos kernel-ip4 form.
+fn _net_connect(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    var dst_port = decode_arg(regs, 1);
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) {
+        return _net_emu(pid, regs, 0 - 1);        # egress denied (default-deny / policy)
+    }
+    var tbl = _net_tbl();
+    var slot = 0 - 1;
+    var i = 0;
+    while (i < NET_SLOTS) {
+        if (load64(tbl + i * 8) == (0 - 1)) { slot = i; i = NET_SLOTS; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, dst_port);
+    var r = syscall(SYS_CONNECT, fd, sb, SOCKADDR_IN_SIZE);
+    if (r != 0) {
+        if (r != (0 - EINPROGRESS)) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+        store32(sb + 16, fd);                     # pollfd.fd
+        store16(sb + 20, POLLOUT);                # pollfd.events (offset 4)
+        store16(sb + 22, 0);                      # pollfd.revents (offset 6)
+        store64(sb + 24, CONNECT_TIMEOUT_S);      # timespec.tv_sec
+        store64(sb + 32, 0);                      # timespec.tv_nsec
+        var pr = syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+        if (pr <= 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }   # timeout / error
+        store32(sb + 40, 0);                      # SO_ERROR optval
+        store32(sb + 48, 4);                      # optlen = sizeof(int)
+        syscall(SYS_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, sb + 40, sb + 48);
+        if (load32(sb + 40) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    }
+    store64(tbl + slot * 8, fd);                  # slot now holds the connected fd
+    return _net_emu(pid, regs, slot);             # agnos conn_id = slot index
+}
+
+# sock_close#50(conn_id) -> 0 / -1. Close the host fd and free the slot. (A LISTEN slot reaps
+# children in agnos — that path lands with sock_listen/accept in the server bite.)
+fn _net_close_conn(pid, regs): i64 {
+    var cid = decode_arg(regs, 0);
+    if (cid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (cid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _net_tbl();
+    var fd = load64(tbl + cid * 8);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
+    syscall(HOST_CLOSE, fd);
+    store64(tbl + cid * 8, 0 - 1);                # free the slot
+    return _net_emu(pid, regs, 0);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -376,6 +482,15 @@ fn translate_dispatch(pid, regs): i64 {
         store64(regs + REG_ORIG_RAX, 217);
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EXECUTE;
+    }
+
+    # Net band (v1.1.0): under --net, the supervisor-emulated handlers translate the
+    # connection ops (supervisor-side sockets + the conn_id table + the egress policy).
+    # sock_send#48 / sock_recv#49 land in the follow-up bite; the rest of the band stays
+    # ENOSYS until its phase. See docs/adr/0012.
+    if (_net_active == 1) {
+        if (nr == 47) { return _net_connect(pid, regs); }      # sock_connect -> conn_id / -1
+        if (nr == 50) { return _net_close_conn(pid, regs); }   # sock_close
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg

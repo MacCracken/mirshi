@@ -133,6 +133,13 @@ jobs:
         # requirements as the M0/M1/M2 steps (one assertion forks a child).
         run: bash scripts/it/cli.sh
 
+      - name: Net band — TCP client (v1.1.0)
+        # v1.1.0 net band (docs/adr/0012): the supervisor-emulated sock_connect#47 /
+        # sock_close#50 establish + tear down a real TCP connection to a local server,
+        # and the --net-allow egress policy is enforced (an un-allowed dst is DENIED ->
+        # agnos -1). Needs python3 + the same-uid ptrace requirement as the M0/M1/M2 steps.
+        run: bash scripts/it/net_client.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
