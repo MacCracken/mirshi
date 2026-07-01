@@ -287,6 +287,37 @@ fn main() {
     memcpy(sb, "..", 2); store8(sb + 2, 0);
     assert_eq(sanitize_rootrel(sb), 0 - 1, ".. -> reject (bare)");
 
+    # --- Net band (v1.1.0) pure helpers (docs/adr/0012) --------------------
+    test_group("net-htons");
+    assert_eq(net_htons(80), 0x5000, "htons(80)=0x5000");
+    assert_eq(net_htons(0x1234), 0x3412, "htons(0x1234)=0x3412");
+    assert_eq(net_htons(443), 0xBB01, "htons(443)=0xBB01");
+    assert_eq(net_htons(0), 0, "htons(0)=0");
+
+    # kernel-ip4 form (oct1<<24|...) -> sin_addr network-order value; the loopback
+    # 0x7F000001 <-> 0x0100007F case is THE endianness trap (lib/net.cyr bswap32's it).
+    test_group("net-ip4-to-inaddr");
+    assert_eq(net_ip4_to_inaddr(0x7F000001), 0x0100007F, "127.0.0.1 (loopback trap)");
+    assert_eq(net_ip4_to_inaddr(0x08080808), 0x08080808, "8.8.8.8 (palindrome)");
+    assert_eq(net_ip4_to_inaddr(0x01020304), 0x04030201, "1.2.3.4 byteswap");
+    assert_eq(net_ip4_to_inaddr(0xC0A80101), 0x0101A8C0, "192.168.1.1");
+
+    test_group("net-sockaddr-in");
+    var sa = alloc(SOCKADDR_IN_SIZE);
+    build_sockaddr_in(sa, 0x7F000001, 80);
+    assert_eq(load16(sa + 0), 2, "sin_family = AF_INET(2)");
+    assert_eq(load16(sa + 2), 0x5000, "sin_port = htons(80)");
+    assert_eq(load32(sa + 4), 0x0100007F, "sin_addr = 127.0.0.1 network order");
+    assert_eq(load64(sa + 8), 0, "sin_zero = 0");
+
+    # THE subtle one: agnos recv is INVERTED vs Linux (0=WOULD_BLOCK/-1=EOF).
+    test_group("net-recv-inversion");
+    assert_eq(net_recv_to_agnos(5), 5, "recv 5 bytes passes");
+    assert_eq(net_recv_to_agnos(1460), 1460, "recv full MSS passes");
+    assert_eq(net_recv_to_agnos(0), 0 - 1, "Linux EOF 0 -> agnos EOF -1 [INVERTED]");
+    assert_eq(net_recv_to_agnos(0 - 11), 0, "-EAGAIN -> agnos WOULD_BLOCK 0 [INVERTED]");
+    assert_eq(net_recv_to_agnos(0 - 104), 0 - 1, "-ECONNRESET -> agnos error -1");
+
     return assert_summary();
 }
 

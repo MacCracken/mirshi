@@ -227,3 +227,56 @@ fn synth_mmap_regs(regs, length): i64 {
     store64(regs + REG_R9, 0);                         # off   = 0
     return 0;
 }
+
+# ----------------------------------------------------------------------------
+# Net band (v1.1.0) — PURE helpers for the supervisor-emulated socket translation
+# ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). Byte order
+# and the INVERTED recv-EOF convention are the subtlest correctness points in the
+# whole band, so they live here as pure, unit-tested transforms (no ptrace, no
+# sockets), same discipline as ao_to_o / linux_ret_to_agnos. x86_64 little-endian.
+# ----------------------------------------------------------------------------
+enum MirshiNet {
+    AF_INET = 2;              # sockaddr_in.sin_family (NATIVE byte order — not a network field)
+    NET_EAGAIN = 11;          # Linux EAGAIN == EWOULDBLOCK
+    SOCKADDR_IN_SIZE = 16;    # sizeof(struct sockaddr_in) {u16 family; u16 port; u32 addr; u8 zero[8]}
+}
+
+# 16-bit host -> network byte swap (htons): 80 (0x0050) -> 0x5000 (mem bytes 00 50). Pure.
+fn net_htons(p): i64 {
+    return ((p & 0xff) << 8) | ((p >> 8) & 0xff);
+}
+
+# The agnos net band passes dst_ip in the kernel "ip4()" form (oct1<<24 | oct2<<16 |
+# oct3<<8 | oct4 — e.g. 127.0.0.1 = 0x7F000001; lib/net.cyr bswap32's the sockaddr
+# 0x0100007F form BEFORE issuing #47). A Linux sockaddr_in.sin_addr wants the
+# network-order BYTES (oct1,oct2,oct3,oct4 in memory), which on little-endian x86 is
+# the u32 VALUE 0x0100007F. So sin_addr = bswap32(dst_ip). Pure + unit-pinned (the
+# loopback 0x7F000001 <-> 0x0100007F case is the canonical endianness trap).
+fn net_ip4_to_inaddr(ip): i64 {
+    return ((ip & 0xff) << 24) | ((ip & 0xff00) << 8) | ((ip >> 8) & 0xff00) | ((ip >> 24) & 0xff);
+}
+
+# Build a 16-byte struct sockaddr_in {sin_family, sin_port(net), sin_addr(net), zero[8]}
+# into a caller-owned buffer (>= 16 B). dst_ip is the agnos kernel-ip4 form; port is host
+# order. Pure buffer write (no syscall) — the dispatcher stages this for the emulated
+# connect/sendto (ADR 0012), same shape as synth_mmap_regs writing a caller buffer.
+fn build_sockaddr_in(buf, dst_ip, port): i64 {
+    store16(buf + 0, AF_INET);                       # sin_family (native u16 = 2)
+    store16(buf + 2, net_htons(port));               # sin_port  (network order)
+    store32(buf + 4, net_ip4_to_inaddr(dst_ip));     # sin_addr  (network-order bytes)
+    store64(buf + 8, 0);                             # sin_zero[8]
+    return 0;
+}
+
+# Map a raw Linux recv/recvfrom return to the agnos sock_recv#49 convention, which is
+# INVERTED from Linux: agnos wants >0=bytes / 0=WOULD_BLOCK / -1=EOF, while Linux gives
+# >0 / 0=EOF / -EAGAIN=would-block. Reusing linux_ret_to_agnos would pass Linux's
+# 0-means-EOF through as agnos-0-means-WOULD_BLOCK — a silent infinite-read spin in the
+# agnos poll loops (lib/http.cyr / lib/ws_server.cyr). Requires a NON-BLOCKING host
+# socket so -EAGAIN is produced (a blocking socket never returns it). Pure + unit-pinned.
+fn net_recv_to_agnos(lr): i64 {
+    if (lr > 0) { return lr; }                       # bytes received
+    if (lr == 0) { return 0 - 1; }                   # Linux EOF (0)  -> agnos EOF (-1)
+    if (lr == (0 - NET_EAGAIN)) { return 0; }        # -EAGAIN        -> agnos WOULD_BLOCK (0)
+    return 0 - 1;                                     # any other -errno -> agnos error (-1)
+}
