@@ -20,6 +20,7 @@ agnos redefines the `Sys` enum to its own numbers — `exit`=0 on agnos vs 60 on
 - **Process + console** — `exit`/`write`/`read`/`getpid`/`mmap`/timers/`getrandom`.
 - **Filesystem** — `open`/`read`/`write`/`stat`/`getdents`/`mkdir`/`rename`/`link`/… on a container rootfs, with optional kernel-enforced `--root` confinement ([ADR 0009](docs/adr/0009-rootfs-confinement-openat2-in-child.md)).
 - **Network** — the sovereign net band is **complete**: TCP client + server, UDP, ICMP, and `net_config`, supervisor-emulated with **default-deny egress** (`--net` / `--net-allow`), [ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md).
+- **Multi-process** — `spawn#3`/`waitpid#4`/`getpid#2`: a parent spawns children from in-memory ELF images and waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor (per-child record table, opaque-monotonic pids, `MAX_CHILDREN` storm bound), [ADR 0013](docs/adr/0013-multiprocess-supervisor-fork-record-table.md).
 - **The Docker vehicle** — a `FROM scratch` `agnos-mirshi` image runs agnos tools with **no QEMU**, seccomp-bounded and fan-out-ready.
 
 See the [syscall-coverage matrix](docs/reference/syscall-coverage.md) for the frozen per-number contract, the [CLI reference](docs/reference/cli.md) for flags, and the [roadmap](docs/development/roadmap.md) for what's next.
@@ -30,7 +31,7 @@ mirshi-in-Docker runs agnos userland on the **host** Linux kernel — it validat
 
 ## Status
 
-**Direction 1 (AGNOS→Linux) is feature-complete through the net band.** v1.0 cut the hardened / audited / optimized / frozen foundation (agnos userland in Docker, no QEMU); v1.1–v1.4 added the full net band (TCP client + server, UDP, ICMP). The authoritative version is [`VERSION`](VERSION) + [`CHANGELOG.md`](CHANGELOG.md); the live state snapshot is [`docs/development/state.md`](docs/development/state.md). Next up — multi-process (agnsh), signals, and the direction-2 swallow — see the [roadmap](docs/development/roadmap.md).
+**Direction 1 (AGNOS→Linux) runs the net band and multi-process.** v1.0 cut the hardened / audited / optimized / frozen foundation (agnos userland in Docker, no QEMU); v1.1–v1.4 added the full net band (TCP client + server, UDP, ICMP); v1.5.0 added **multi-process** — `spawn#3`/`waitpid#4`/`getpid#2`, so an agnsh-class parent spawns children from in-memory ELFs and waits their exit codes, to arbitrary depth, under one supervisor. The authoritative version is [`VERSION`](VERSION) + [`CHANGELOG.md`](CHANGELOG.md); the live state snapshot is [`docs/development/state.md`](docs/development/state.md). Next up — signals (`kill`/`sigprocmask`/`signalfd`) and the direction-2 swallow — see the [roadmap](docs/development/roadmap.md).
 
 ## Build
 

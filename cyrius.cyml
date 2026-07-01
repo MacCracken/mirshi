@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "mirshi — mirror-shim: bidirectional AGNOS↔Linux syscall-ABI translation. v1 = run agnos-compiled userland as native Linux processes in a plain Docker container (no QEMU, shared host kernel)."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.3.16"
+cyrius = "6.3.22"
 
 [build]
 entry = "src/main.cyr"

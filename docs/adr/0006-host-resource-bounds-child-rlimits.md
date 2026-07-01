@@ -27,6 +27,12 @@ the bounding seccomp allowlist ([ADR 0004](0004-docker-vehicle-bounding-seccomp.
 has no Linux peer so it dispatches `STRAT_ENOSYS` — a process storm cannot reach a
 host `clone` at all.
 
+> **Amended by [ADR 0013](0013-multiprocess-supervisor-fork-record-table.md) (v1.5.0).** `spawn#3`
+> is now **EMULATE**: the *supervisor* forks a traced grandchild (the child bound still carries no
+> `clone`/`fork` — the fork is supervisor-side). This reopens the process-storm vector supervisor-
+> side, re-closed by the `MAX_CHILDREN` cap (checked before each fork). The child-side reasoning
+> below is unchanged; only "`spawn#3` is ENOSYS" no longer holds.
+
 So the real choice is **how** to bound the two reachable vectors: enforce in the
 kernel, or account per-syscall in the supervisor.
 

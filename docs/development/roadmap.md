@@ -20,11 +20,11 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.4.0)
+## Shipped (v0.1.0 → v1.5.0)
 
-The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, and the post-v1 net band are
-**done**. Full per-release detail: [`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen per-number
-contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
+The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band, and
+multi-process are **done**. Full per-release detail: [`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen
+per-number contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
 
 | Band | Versions | What |
 |---|---|---|
@@ -32,6 +32,7 @@ contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md)
 | **Pre-1.0 quality arc** | v0.6–v0.9 | hardening → security sweep (default-deny seccomp proven) → rootfs confinement (`--root`) → optimizations (exit-stop single-register I/O) → freeze + docs |
 | **v1.0 — the clean cut** | v1.0.0 | a representative AGNOS userland in a `FROM scratch` Docker container, **no QEMU**, seccomp-bounded, fan-out-ready |
 | **Net band (post-v1)** | v1.1–v1.4 | TCP client → TCP server → UDP + `net_config` → ICMP: the sovereign net band (#47–57, #61), supervisor-EMULATE, egress default-deny ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)) — **complete** |
+| **Multi-process (post-v1)** | v1.5.0 | `spawn#3`/`waitpid#4`/`getpid#2` — the **agnsh crown jewel**: a parent spawns in-memory-ELF children + waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor; opaque-monotonic pids, `MAX_CHILDREN` storm bound, deadlock guard ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)) |
 
 ## Planned — post-v1 minors
 
@@ -39,16 +40,6 @@ Each remaining agnos-ABI surface is an additive **minor** (backward-compatible n
 same cadence the net band used). **Ordering is provisional + demand-driven** — a slice gets pulled
 forward when a real agnos consumer needs it. All rows below are **ENOSYS today**
 ([the matrix](../reference/syscall-coverage.md)).
-
-### v1.5.0 — Multi-process (the agnsh crown jewel)
-`spawn#3`(elf_addr, elf_size → pid — an **in-memory** ELF image, not a path) + `waitpid#4`(pid →
-exit_code). Runs agnos tools that fork+exec children — most importantly **agnsh** (the agnos shell).
-The supervisor must trace a **second child** (fork a new ptrace tracee from the in-memory ELF, e.g.
-`memfd_create` + `execveat AT_EMPTY_PATH`) and make the per-call translation state **per-child** — the
-net-band slot tables + the `--root` rootfd are single-child globals in v1 and must become per-child.
-Run-to-completion `waitpid` semantics. The **largest** post-v1 lift: it turns the supervisor from
-one-child into a small process tree. *Gate*: an agnos parent `spawn`s a child ELF, both run under
-mirshi, and the parent `waitpid`s the child's exit code.
 
 ### v1.6.0 — Signals
 `pause#14` / `kill#16`(pid, sig) / `sigprocmask#17` / `signalfd#18`(→ fd). Signal delivery + job

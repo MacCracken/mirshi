@@ -5,13 +5,21 @@
 
 ## Version
 
-**1.4.0** — 2026-06-30. **Net band — ICMP (the arc's finale)** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
-agnos `icmp_echo#55` (yo/ping) round-trips through mirshi via an **unprivileged** `SOCK_DGRAM`+`IPPROTO_ICMP`
-ping socket (**never** `SOCK_RAW`/`CAP_NET_RAW`): a **pure** supervisor op (no child buffer) — egress-check →
-send one echo request → bounded ~3s `ppoll(POLLIN)` → return the monotonic-clock RTT ms (≥0; sub-ms reads 0);
-fail-closed to −1 on any error (`ping_group_range` denial, send fail, timeout). Proven live
-(`scripts/it/net_icmp.sh`; `icmp_echo(1.1.1.1)`=6 ms vs host `ping`=6.48 ms). **The sovereign net band
-(#47–57, #61) is now complete** — no net-band number remains ENOSYS. Pin stays `6.3.16` (no drift).
+**1.5.0** — 2026-07-01. **Multi-process — the agnsh crown jewel** ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)).
+agnos `spawn#3` / `waitpid#4` / `getpid#2` now run: a parent spawns children from **in-memory ELF images** and
+waits their exit codes, to arbitrary depth, under one supervisor. `_trace_run` is now a `wait4(-1, __WALL)`
+demux over a fixed 16-slot **per-child record table**; `spawn#3` supervisor-forks a traced grandchild
+(`process_vm_readv` the ELF → `memfd` → `execveat AT_EMPTY_PATH`; the child seccomp bound gains only
+`execveat`); `waitpid#4` **parks** the caller (stopped, not the supervisor) until the target exits; `getpid#2`
+returns the caller's **coined agnos pid** (root=1, opaque monotonic, never reused — bidirectional-ready).
+A `MAX_CHILDREN=16` cap re-closes the process-storm vector (ADR 0006); a deadlock guard stops a self-wait/
+cycle from wedging the single-threaded supervisor. Proven by `scripts/it/spawn.sh` / `waitpid.sh` / `getpid.sh`
+/ `spawn_storm.sh` (cap + no-leak + 3-level grandchild depth); `spawn#3` + `waitpid#4` adversarially reviewed
+(the deadlock wedge was found + fixed). **Known limits**: head-of-line blocking (`sleep`/blocking I/O in the
+supervisor), 8-bit exit truncation, deadlock-break-to-−1 — all documented (ADR 0013). Pin → `6.3.22`.
+**1.4.0** — Net band ICMP (the arc's finale): agnos `icmp_echo#55` round-trips via an **unprivileged**
+`SOCK_DGRAM`+`IPPROTO_ICMP` ping socket (never `SOCK_RAW`/`CAP_NET_RAW`); egress-checked; RTT ms; fail-closed.
+**The sovereign net band (#47–57, #61) is complete.**
 **1.3.0** — Net band UDP + net_config: `udp_bind#51`/`send#52`/`recv#53`/`unbind#54` supervisor-emulated (a
 `SLOT_UDP` in the unified slot table; per-datagram egress on send; the sender `addr_out` repack on recv);
 `net_config#61` reads the **real container-netns config** (gateway from `/proc/net/route`, DNS from
@@ -42,7 +50,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.16` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.22` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -93,13 +101,20 @@ paths in the child red zone + repack output structs at the exit stop
   under a bounded ~3s `ppoll`, and returns the RTT ms (no slot). Egress default-deny (`--net`/`--net-allow`,
   per-datagram on UDP, per-destination on ICMP); ingress loopback-default (`--net-listen-any`). **The net band
   is complete** — no net-band number (#47–57, #61) remains ENOSYS.
+- Multi-process (1.5.0, [ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)):
+  `spawn#3`/`waitpid#4`/`getpid#2` supervisor-emulated over a `wait4(-1, __WALL)` demux loop + a fixed
+  16-slot per-child record table. `spawn#3` supervisor-forks a traced grandchild from the in-memory ELF
+  (`process_vm_readv` → `memfd` → `execveat`; child bound gains only `execveat`); `waitpid#4` parks the caller
+  (stopped, not the supervisor) until the target exits; `getpid#2` returns the caller's coined agnos pid
+  (root=1, opaque monotonic, never reused — bidirectional-ready). `MAX_CHILDREN=16` storm bound + a deadlock
+  guard. Known limits: head-of-line blocking (`sleep`/blocking I/O), 8-bit exit truncation (ADR 0013).
 
 ## Tests
 
 - `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer + the M1/M2
   translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
-  0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0);
-  **225 assertions**, hermetic)
+  0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
+  the multi-process record table / storm bound / ELF-size bounds (1.5.0); **248 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -153,6 +168,14 @@ paths in the child red zone + repack output structs at the exit stop
   pings 127.0.0.1 under mirshi via the unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` path (RTT ≥ 0) and
   per-destination egress is enforced; SKIPs gracefully where `net.ipv4.ping_group_range` / the sandbox
   forbids unprivileged ICMP. Needs python3.
+- `scripts/it/spawn.sh` — 1.5.0 spawn#3 gate (CI step, after net_icmp): an agnos parent reads a child
+  ELF and `sys_spawn#3`s it (memfd + execveat of the in-memory ELF); both run under one supervisor.
+- `scripts/it/waitpid.sh` — 1.5.0 waitpid#4 gate (after spawn): parent spawns + `waitpid#4`s the exact
+  exit code via both park+wake (live child) and the zombie fast-path; reaped-pid + self-wait → −1.
+- `scripts/it/getpid.sh` — 1.5.0 getpid#2 gate (after waitpid): the root sees agnos pid 1, a spawned
+  child sees its own coined pid 2 (per-child pid model).
+- `scripts/it/spawn_storm.sh` — 1.5.0 fork-storm/depth gate (after getpid): spawn past `MAX_CHILDREN=16`
+  returns −1 (no host process leak), and a 3-level root→child→grandchild tree proves the flat table.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -171,9 +194,9 @@ swallow** layer. None wired yet (scaffold).
 ## Target & boundary
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
-- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band shipped post-v1
-  (v1.1–v1.4); multi-proc / signals / winsize / the Linux→AGNOS swallow are the planned minors
-  (see the [roadmap](roadmap.md)).
+- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4) + multi-process
+  (v1.5.0) shipped post-v1; signals / epoll-timerfd-pipe / winsize / the Linux→AGNOS swallow are the
+  remaining planned minors (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
 ## Next
@@ -274,12 +297,13 @@ fail-closed to −1 on any error (`ping_group_range` denial / send fail / timeou
 unprivileged ICMP); the handler adversarially reviewed (**CLEAN** — no fd leak on any exit, fail-closed). **The
 sovereign net band (#47–57, #61) is now COMPLETE.**
 
-**Post-v1** (see [`roadmap.md`](roadmap.md) planned minors): the **sovereign net band** #47–57/#61 is
-**complete** — TCP client + server + UDP + net_config + ICMP shipped (1.1–1.4). Remaining planned minors:
-**multi-process** (`spawn#3`/`waitpid#4` — the agnsh target, v1.5.0); **signals** (`pause#14`/`kill#16`/
-`sigprocmask#17`/`signalfd#18`); **I/O mux** (epoll #19–21 / timerfd #22–23 / `pipe#25`); **info getters +
-`flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`); **`winsize#60`** tty sizing; and **direction 2** — the
-Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent compat layer), v2+. Each is
+**Post-v1** (see [`roadmap.md`](roadmap.md) planned minors): the **sovereign net band** #47–57/#61
+(TCP client + server + UDP + net_config + ICMP, 1.1–1.4) **and multi-process** (`spawn#3`/`waitpid#4`/
+`getpid#2` — the agnsh crown jewel, v1.5.0) are **complete**. Remaining planned minors: **signals**
+(`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — v1.6.0, next); **I/O mux** (epoll #19–21 /
+timerfd #22–23 / `pipe#25`); **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`);
+**`winsize#60`** tty sizing; and **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the
+agnos kernel — the permanent compat layer), v2+. Each is
 its own validation surface; the translation core built here runs from both
 sides. The mirshi/QEMU/iron discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md))
 holds: mirshi owns userland + Linux-compat-at-scale, never the agnos kernel or hardware truth.

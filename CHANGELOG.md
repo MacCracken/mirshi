@@ -4,6 +4,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-07-01
+
 **Multi-process — the agnsh crown jewel.** agnos `spawn#3` / `waitpid#4` / `getpid#2` now run: a
 parent spawns children from in-memory ELF images and waits their exit codes, to arbitrary depth, all
 under one supervisor. mirshi grows from a single-child tracer into a small process tree
@@ -47,6 +49,7 @@ under one supervisor. mirshi grows from a single-child tracer into a small proce
   monotonic agnos pids (root=1, never reused), a two-way guest↔host mapping — bidirectional-ready for
   the v2+ swallow. Known limits documented: head-of-line blocking (`sleep`/blocking I/O), 8-bit exit
   truncation, deadlock-break-to-−1.
+- **Toolchain pin → `6.3.22`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
 
 ## [1.4.0] — 2026-06-30
 
