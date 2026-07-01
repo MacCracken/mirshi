@@ -168,6 +168,14 @@ jobs:
         # the environment's own files. Needs python3 + the same-uid ptrace requirement.
         run: bash scripts/it/net_config.sh
 
+      - name: Net band — ICMP (v1.4.0)
+        # v1.4.0 net band (docs/adr/0012): an agnos client under mirshi does icmp_echo#55 to
+        # 127.0.0.1 via an UNPRIVILEGED ping socket (SOCK_DGRAM+IPPROTO_ICMP — never SOCK_RAW/
+        # CAP_NET_RAW) and gets an RTT >= 0; per-destination egress is enforced. Unprivileged ICMP
+        # is environment-sensitive (net.ipv4.ping_group_range) so the gate SKIPs where it is
+        # forbidden. Needs python3 + the same-uid ptrace requirement.
+        run: bash scripts/it/net_icmp.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

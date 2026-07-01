@@ -9,8 +9,8 @@
 > `agnos_to_linux_nr` for every number 0–61 + boundaries). Changing a row is a
 > deliberate contract change — update the code, this doc, **and** the freeze test together.
 > The v1.0 **core is frozen**; the **net band** (#47–50 TCP client / #56–57 TCP server / #51–54 UDP /
-> `net_config#61`) is a documented **post-v1 extension** (v1.1.0–v1.3.0, EMULATE under `--net` — footnote ²); only `icmp_echo#55`
-> remains ENOSYS, pending v1.4.0.
+> `icmp_echo#55` / `net_config#61`) is a documented **post-v1 extension** (v1.1.0–v1.4.0, EMULATE
+> under `--net` — footnote ²), now **complete** — no net-band number remains ENOSYS.
 
 ## Dispositions
 
@@ -80,7 +80,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 52 | udp_send | EMULATE ² | — | net band UDP (v1.3.0): per-datagram egress; packed `(sport<<16)\|dport` |
 | 53 | udp_recv | EMULATE ² | — | net band UDP (v1.3.0): sender `addr_out` {ip@0, port@8}; no EOF |
 | 54 | udp_unbind | EMULATE ² | — | net band UDP (v1.3.0): free the SLOT_UDP |
-| 55 | icmp_echo | ENOSYS | — | net band — pending v1.4.0 (ICMP) |
+| 55 | icmp_echo | EMULATE ² | — | net band ICMP (v1.4.0): unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping; RTT ms (≥0, sub-ms=0) / −1; bounded ~3s |
 | 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
@@ -99,13 +99,15 @@ lexically sanitized (`sanitize_rootrel`). The fd-based ops (`read`/`write`/`lsee
 Without `--root`, the peers in the table above apply (transparent pass-through).
 
 ² **Net band (post-v1 extension, `--net`).** #47–50 (TCP client, v1.1.0), #56/#57 (TCP server,
-v1.2.0), #51–54 (UDP) + `net_config#61` (v1.3.0) are **supervisor-EMULATE**
-([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)): the supervisor owns the sockets
-via an 8-slot `{fd,kind,parent}` table (TCP conn / TCP listen / UDP); the child never holds a socket
-fd. Enabled by `--net` / `--net-allow` (egress default-deny) / `--net-listen-any` (ingress
-loopback-default). **Without
-`--net` they return ENOSYS** (agnos `-1`). Only `icmp_echo#55` remains ENOSYS, pending v1.4.0 (see
-the [roadmap net band arc](../development/roadmap.md)).
+v1.2.0), #51–54 (UDP) + `net_config#61` (v1.3.0), and `icmp_echo#55` (ICMP, v1.4.0) are
+**supervisor-EMULATE** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)): the
+supervisor owns the sockets via an 8-slot `{fd,kind,parent}` table (TCP conn / TCP listen / UDP);
+the child never holds a socket fd. (`icmp_echo#55` takes no slot — it opens a transient
+unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket, round-trips one echo under a bounded ~3s
+`ppoll`, and closes it.) Enabled by `--net` / `--net-allow` (egress default-deny) /
+`--net-listen-any` (ingress loopback-default). **Without `--net` they return ENOSYS** (agnos `-1`).
+The net band is now **complete** — no net-band number remains ENOSYS (see the
+[roadmap net band arc](../development/roadmap.md)).
 
 ## The runnable surface (v1)
 

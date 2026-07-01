@@ -277,6 +277,11 @@ enum MirshiNetSys {
     LISTEN_BACKLOG = 128;
     LOOPBACK_IP = 0x7F000001;    # 127.0.0.1 in the agnos kernel-ip4 form (build_sockaddr_in bswaps it)
     INADDR_ANY_IP = 0;           # 0.0.0.0 — the --net-listen-any bind (all interfaces)
+    IPPROTO_ICMP = 1;            # unprivileged ping socket: socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+    ICMP_ECHO = 8;               # ICMP type: echo request (the ping-socket kernel demands type==8, code==0)
+    ICMP_HDR_LEN = 8;            # sizeof(struct icmphdr) — the minimum a ping socket will send
+    ICMP_TIMEOUT_S = 3;          # bound the supervisor echo-reply wait to agnos's ~3s budget
+    POLLIN = 1;                  # ppoll event: the echo reply is readable
 }
 
 # The supervisor-side conn_id/listener_id(0..7) slot table (lazy-alloc-once, like _how_buf).
@@ -632,6 +637,60 @@ fn _net_udp_unbind(pid, regs): i64 {
     return _net_emu(pid, regs, 0);
 }
 
+# Monotonic clock in ms, read supervisor-side (the host CLOCK_MONOTONIC is shared). Reuses the
+# timer scratch (_emu_ts_buf), same one-call-in-flight discipline as uptime_ms#40 — used to
+# bracket the icmp_echo#55 round-trip.
+fn _mono_ms(): i64 {
+    var ts = _emu_ts_buf();
+    store64(ts, 0);
+    store64(ts + 8, 0);
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, ts);
+    return ms_from_timespec(load64(ts), load64(ts + 8));
+}
+
+# icmp_echo#55(dst_ip) -> RTT in ms (>=0; a sub-ms reply reads 0) / -1 (timeout / host down / no
+# permission). A PURE supervisor op — icmp_echo carries no child buffer, so no process_vm. Egress
+# is checked first (default-deny), then the supervisor opens an UNPRIVILEGED ping socket
+# (SOCK_DGRAM+IPPROTO_ICMP — NEVER SOCK_RAW/CAP_NET_RAW, a privilege a sandbox deputy must not
+# hold; ADR 0012), sends one echo request, and bounded-ppoll(POLLIN)s for the reply, measuring the
+# monotonic-clock delta. dst_ip is the agnos kernel-ip4 form. Fail-closed to -1 on ANY error
+# (socket denied by net.ipv4.ping_group_range, send failure, timeout, spurious wake).
+fn _net_icmp(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) { return _net_emu(pid, regs, 0 - 1); }
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # ping_group_range denies -> fail-closed
+    var io = _net_io_buf();
+    # ICMP echo request header (8 B): the ping-socket kernel overrides the id with the socket's
+    # source port and computes the checksum, so we only supply type=8 / code=0 / a sequence.
+    store8(io + 0, ICMP_ECHO);                   # type = 8 (echo request)
+    store8(io + 1, 0);                           # code = 0
+    store16(io + 2, 0);                          # checksum (kernel fills)
+    store16(io + 4, 0);                          # id (kernel overrides with the source port)
+    store16(io + 6, 1);                          # sequence
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, 0);            # ICMP has no port; sin_port is ignored
+    var t0 = _mono_ms();
+    var sent = syscall(SYS_SENDTO, fd, io, ICMP_HDR_LEN, 0, sb, SOCKADDR_IN_SIZE);
+    if (sent < 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    store32(sb + 16, fd);                        # pollfd.fd
+    store16(sb + 20, POLLIN);                    # pollfd.events (offset 4) = POLLIN
+    store16(sb + 22, 0);                         # pollfd.revents (offset 6)
+    store64(sb + 24, ICMP_TIMEOUT_S);            # timespec.tv_sec
+    store64(sb + 32, 0);                         # timespec.tv_nsec
+    var pr = syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+    if (pr <= 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }   # timeout / down
+    # Any datagram readable on this fresh, private ping socket IS our reply: the kernel delivers
+    # only echo-replies whose ICMP id matches our source port (it set the id), and ICMP errors ride
+    # the error queue (MSG_ERRQUEUE), not this path — so no type/seq re-check is needed here.
+    var got = syscall(SYS_RECVFROM, fd, io, NET_IO_CAP, MSG_DONTWAIT, 0, 0);
+    var rtt = _mono_ms() - t0;
+    syscall(HOST_CLOSE, fd);
+    if (got < 0) { return _net_emu(pid, regs, 0 - 1); }   # spurious wake, no datagram -> no reply
+    if (rtt < 0) { rtt = 0; }                    # monotonic never rewinds; clamp as a guard
+    return _net_emu(pid, regs, rtt);
+}
+
 # --- net_config#61 (v1.3.0): a supervisor EMULATE getter that reads the REAL container-netns
 #     interface config (host IP / gateway / DNS) from /proc + /etc/resolv.conf and returns it as
 #     a packed kernel-ip4. A minor infoleak (the child sees the container's gateway/DNS), accepted.
@@ -883,6 +942,7 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 52) { return _net_udp_send(pid, regs); }     # udp_send -> bytes / 0 / -1
         if (nr == 53) { return _net_udp_recv(pid, regs); }     # udp_recv -> bytes / 0 none / -1
         if (nr == 54) { return _net_udp_unbind(pid, regs); }   # udp_unbind -> 0 / -1
+        if (nr == 55) { return _net_icmp(pid, regs); }         # icmp_echo -> RTT ms (>=0) / -1
         if (nr == 56) { return _net_listen(pid, regs); }       # sock_listen -> listen_id / -1
         if (nr == 57) { return _net_accept(pid, regs); }       # sock_accept -> conn_id / -1
         if (nr == 61) { return _net_config(pid, regs); }       # net_config -> packed ip / 0 / -1

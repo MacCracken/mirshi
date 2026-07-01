@@ -81,11 +81,14 @@ paths in the child red zone + repack output structs at the exit stop
   `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
   default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
   The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
-- Net band (1.1.0 client + 1.2.0 server + 1.3.0 UDP/net_config, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
-  `sock_*#47–50/56/57` + `udp_*#51–54` supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table
-  (TCP conn / TCP listen / UDP; `close#50` reaps a listener's children). `net_config#61` reads the real netns
-  gateway/DNS/host-IP. Egress default-deny (`--net`/`--net-allow`, per-datagram on UDP); ingress loopback-default
-  (`--net-listen-any`). Only `icmp_echo#55` remains (v1.4.0).
+- Net band (1.1.0 client + 1.2.0 server + 1.3.0 UDP/net_config + ICMP [v1.4.0, in-flight/unreleased],
+  [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)): `sock_*#47–50/56/57` + `udp_*#51–54`
+  supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table (TCP conn / TCP listen / UDP;
+  `close#50` reaps a listener's children). `net_config#61` reads the real netns gateway/DNS/host-IP.
+  `icmp_echo#55` opens a transient unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket, round-trips one echo
+  under a bounded ~3s `ppoll`, and returns the RTT ms (no slot). Egress default-deny (`--net`/`--net-allow`,
+  per-datagram on UDP, per-destination on ICMP); ingress loopback-default (`--net-listen-any`). **The net band
+  is now complete in-code** — no net-band number remains ENOSYS (the v1.4.0 cut is pending).
 
 ## Tests
 
@@ -142,6 +145,10 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/net_config.sh` — 1.3.0 net_config#61 gate (CI step, after net_udp): mirshi's netns
   gateway/DNS (from `/proc/net/route` + `/etc/resolv.conf`) match the environment's own files; netmask
   0-unset, bad field -1, `--net` gating. Needs python3.
+- `scripts/it/net_icmp.sh` — 1.4.0 net-band ICMP gate (CI step, after net_config): an agnos client
+  pings 127.0.0.1 under mirshi via the unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` path (RTT ≥ 0) and
+  per-destination egress is enforced; SKIPs gracefully where `net.ipv4.ping_group_range` / the sandbox
+  forbids unprivileged ICMP. Needs python3.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 

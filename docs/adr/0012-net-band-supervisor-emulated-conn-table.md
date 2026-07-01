@@ -1,6 +1,6 @@
 # 0012 — Net band: supervisor-emulated conn_id table + recv-EOF inversion + default-deny egress
 
-**Status**: Accepted (TCP client v1.1.0; TCP server v1.2.0; UDP + net_config v1.3.0; ICMP pending v1.4.0)
+**Status**: Accepted (TCP client v1.1.0; TCP server v1.2.0; UDP + net_config v1.3.0; ICMP v1.4.0 — net band complete)
 **Date**: 2026-06-30
 
 ## Context

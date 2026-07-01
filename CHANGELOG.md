@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**Net band — ICMP (the arc's finale).** agnos `icmp_echo#55` (yo/ping) now round-trips through
+mirshi via an **unprivileged** ping socket, completing the sovereign net band (#47–57, #61).
+Supervisor-emulated ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)).
+
+### Added
+- **`icmp_echo#55`** (`src/dispatch.cyr`, `_net_icmp`): a **pure** supervisor op (no child buffer)
+  — egress-check → open an **unprivileged** socket (`SOCK_DGRAM`+`IPPROTO_ICMP`, **never**
+  `SOCK_RAW`/`CAP_NET_RAW`) → send one echo request → **bounded `ppoll(POLLIN)`** (~3s) for the
+  reply, returning the monotonic-clock RTT in ms (≥0; a sub-ms reply reads 0). Fail-closed to −1 on
+  any error (socket denied by `net.ipv4.ping_group_range`, send failure, timeout). New helper
+  `_mono_ms` (monotonic ms, reuses the timer scratch). dst_ip is the agnos kernel-ip4 form.
+- **New gate**: `scripts/it/net_icmp.sh` — an agnos client pings 127.0.0.1 under mirshi (RTT ≥ 0)
+  and proves per-destination egress; **SKIPs gracefully** where the kernel forbids unprivileged
+  ICMP (`ping_group_range` / sandbox). CI-wired. (Live-verified: `icmp_echo(1.1.1.1)` = 6 ms vs the
+  host's own `ping` = 6.48 ms.)
+
+### Security
+- `icmp_echo#55` is **egress-checked** (`--net-allow`, default-deny) before the socket, and uses
+  **only** the unprivileged datagram-ICMP path — a privilege a sandbox-class deputy must not hold
+  or grant. The handler was adversarially reviewed (no fd leak on any exit path, fail-closed).
+
 ## [1.3.0] — 2026-06-30
 
 **Net band — UDP + net_config.** agnos UDP tools (dig/DNS-class) can now send + receive datagrams
