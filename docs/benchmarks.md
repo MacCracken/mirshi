@@ -80,7 +80,7 @@ emulatable hot path, ptrace for the renumber/`mmap` residue).
 
 CI runs the harness **non-gating** (absolute µs drifts with the runner); the
 **0-alloc-per-syscall** assertion and fixture correctness are the gating parts
-(see roadmap 0.8.0).
+(the `scripts/it/alloc_clean.sh` gate).
 
 ## Results log
 

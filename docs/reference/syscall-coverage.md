@@ -116,9 +116,10 @@ The net band is now **complete** — no net-band number remains ENOSYS (see the
 - **M2 — filesystem**: `open#7`, `close#6`, `lseek#58`, `dup#8`, `mkdir#9`, `rmdir#10`,
   `unlink#30`, `rename#31`, `link#32`, `stat#33`, `getdents#29`.
 
-Everything else is **ENOSYS** by design for v1 — the net band (#47–57, #61), multi-process
-(#3/#4), signals (#14, #16–18), epoll/timerfd/pipe (#19–25), and graphics (#60) are post-v1
-(see [roadmap "Out of scope"](../development/roadmap.md)).
+Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47–57, #61) shipped as a
+post-v1 extension under `--net` (v1.1.0–v1.4.0 — footnote ²). Still ENOSYS, as **planned post-v1 minors**
+(see the [roadmap](../development/roadmap.md)): multi-process (#3/#4), signals (#14, #16–18),
+epoll/timerfd/pipe (#19–25), info getters (#15/#34/#35), `flock#59`, and `winsize#60`.
 
 ## Known gaps (carried forward, documented not fixed)
 

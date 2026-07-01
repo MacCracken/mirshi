@@ -13,6 +13,7 @@ cyrius test                              # run [build].test + tests/*.tcyr
 ```sh
 build/mirshi ./hello                     # translate + execute an agnos ELF (seccomp on, fs unconfined)
 build/mirshi --root ./rootfs ./ls /      # confine the child's filesystem to ./rootfs
+build/mirshi --net-allow 10.0.0.0/8 ./httpget   # enable the net band, egress limited to 10/8 (default-deny)
 build/mirshi --selftest-trace ./hello    # M0 trap-log: print the agnos syscall stream, no translation
 ```
 

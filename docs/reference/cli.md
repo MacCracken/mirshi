@@ -1,14 +1,16 @@
 # mirshi — CLI contract (frozen)
 
-> **Frozen at v0.9.0.** The command-line surface of the `mirshi` supervisor. Source of
-> truth is `src/main.cyr` (parsing + `usage`) and the `MirshiPtrace` exit-code constants
-> in `src/intercept.cyr`; pinned by `scripts/it/cli.sh`. Changing a flag, the synopsis, or
-> an exit code is a deliberate contract change — update the code, this doc, and the pin.
+> **Frozen at v0.9.0**, with the **net-band flags** (`--net` / `--net-allow` / `--net-listen-any`)
+> added as a documented extension across the v1.1.0–v1.4.0 net band arc
+> ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). Source of truth is
+> `src/main.cyr` (parsing + `usage`) and the `MirshiPtrace` exit-code constants in
+> `src/intercept.cyr`; pinned by `scripts/it/cli.sh`. Changing a flag, the synopsis, or an exit
+> code is a deliberate contract change — update the code, this doc, and the pin.
 
 ## Synopsis
 
 ```
-mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] <agnos-elf>
+mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] [--net | --net-allow <cidrs>] [--net-listen-any] <agnos-elf>
 ```
 
 Runs `<agnos-elf>` (an agnos-target static ELF) as a native Linux process by trapping +
@@ -25,6 +27,9 @@ mirshi does not forward a child argv in v1).
 | `--selftest-trace` | **Trap-log mode (M0)**: `PTRACE_SYSEMU`-trap every syscall and emit the bare agnos syscall stream (`name#nr(args)`) to **stdout**; translate/execute **nothing**. seccomp and `--root` do not apply in this mode (the child's syscalls never reach the kernel). Tears down on agnos `exit#0`. |
 | `--no-seccomp` | Disable the bounding seccomp allowlist on the child (default: **on**). Measures/debugs the raw trap+translate path; the child is then bounded only by the rlimits + (if set) `--root`. |
 | `--root <dir>` | **Confine** the child's filesystem to `<dir>`, kernel-enforced + unprivileged ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)): `open#7`→`openat2 RESOLVE_IN_ROOT`, the `*at` family for mutation/metadata, anchored at a per-child rootfd. Requires a `<dir>` argument (else `usage`). Run mode only. **Fail-closed**: if `<dir>` won't open, the child is aborted (`BOUND_FAILED`), never run unconfined. |
+| `--net` | **Enable the net band** (`sock_*`/`udp_*`/`icmp_echo`/`net_config`, #47–57/#61) with egress **deny-all** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). Without it the net band is **ENOSYS** (agnos `-1`). With `--net` but no `--net-allow`, all egress is denied (a loud stderr warning) — the band is on, but every destination is blocked until allowed. |
+| `--net-allow <cidrs>` | Enable the net band **and** allow egress to `<cidrs>` = `CIDR[,CIDR…]` (e.g. `10.0.0.0/8,127.0.0.1/32`). **Default-deny**: only listed prefixes are reachable (metadata `169.254.169.254`, RFC1918, loopback are blocked unless explicitly listed — SSRF-hardened). Validated **before fork**; a malformed list **aborts** (`usage`, exit `2`), never runs with a half-parsed policy. Implies `--net`. |
+| `--net-listen-any` | `sock_listen#56` binds **all interfaces** (`0.0.0.0`) instead of the default **loopback-only** (`127.0.0.1`) — the ingress posture. Only meaningful with the net band on; a sandboxed child's server is not network-reachable unless this is given. |
 
 ## Modes at a glance
 
@@ -32,6 +37,8 @@ mirshi does not forward a child argv in v1).
   mount namespace is the fs boundary for the v1 Docker vehicle.
 - **`mirshi --root <dir> <elf>`** — run, seccomp-bounded, fs confined to `<dir>` (the
   bare-CLI confinement; the Docker vehicle does not need it).
+- **`mirshi --net-allow <cidrs> <elf>`** — run with the net band on, egress restricted to
+  `<cidrs>` (default-deny). `--net` alone enables the band with all egress denied.
 - **`mirshi --selftest-trace <elf>`** — trap-log only, no translation (the M0 proof).
 - **`mirshi --no-seccomp <elf>`** — run without the bounding filter (benchmark/debug).
 
@@ -42,10 +49,13 @@ mirshi does not forward a child argv in v1).
 - mirshi's own diagnostics go to **stderr**, including:
   - `mirshi: WARNING — no --root: child has UNCONFINED host filesystem access` (run mode,
     no `--root`).
+  - `mirshi: WARNING — --net with no --net-allow: all egress DENIED (default-deny)` (the
+    net band is on, but every destination is blocked until listed in `--net-allow`).
   - `mirshi: ENOSYS agnos#<n> -> -1` (an out-of-surface syscall degraded to the agnos
     error sentinel; see [the syscall matrix](syscall-coverage.md)).
-  - fail-closed aborts: `--root open failed …`, `seccomp bound failed to install …`,
-    `execve failed`, `fork failed`, `waitpid failed`.
+  - fail-closed aborts: `--root open failed …`, `--net-allow policy malformed — refusing to
+    run` (exits `usage`), `seccomp bound failed to install …`, `execve failed`, `fork
+    failed`, `waitpid failed`.
 
 ## Exit codes
 
@@ -64,10 +74,12 @@ mirshi propagates the child's fate; its own failures use a high reserved band.
 ## Examples
 
 ```sh
-mirshi ./hello                      # run an agnos hello-world (seccomp on, fs unconfined + warning)
-mirshi --root ./rootfs ./ls /       # run confined to ./rootfs
-mirshi --selftest-trace ./hello     # log the agnos syscall stream, translate nothing
-mirshi --no-seccomp ./catbig.agnos  # run unbounded (benchmark/debug)
+mirshi ./hello                              # run an agnos hello-world (seccomp on, fs unconfined + warning)
+mirshi --root ./rootfs ./ls /               # run confined to ./rootfs
+mirshi --net-allow 10.0.0.0/8 ./httpget     # net band on, egress limited to 10/8
+mirshi --net-allow 127.0.0.1/32 --net-listen-any ./server   # loopback egress + bind all ifaces
+mirshi --selftest-trace ./hello             # log the agnos syscall stream, translate nothing
+mirshi --no-seccomp ./catbig.agnos          # run unbounded (benchmark/debug)
 ```
 
 In the **Docker vehicle** the image's `ENTRYPOINT` is `mirshi`, so `docker run agnos-mirshi

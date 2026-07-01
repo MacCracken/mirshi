@@ -171,8 +171,9 @@ swallow** layer. None wired yet (scaffold).
 ## Target & boundary
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
-- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. Net band / multi-proc /
-  graphics / the Linux→AGNOS swallow direction are post-v1 (see roadmap "Out of scope").
+- v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band shipped post-v1
+  (v1.1–v1.4); multi-proc / signals / winsize / the Linux→AGNOS swallow are the planned minors
+  (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
 ## Next
@@ -273,10 +274,12 @@ fail-closed to −1 on any error (`ping_group_range` denial / send fail / timeou
 unprivileged ICMP); the handler adversarially reviewed (**CLEAN** — no fd leak on any exit, fail-closed). **The
 sovereign net band (#47–57, #61) is now COMPLETE.**
 
-**Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 is
-**complete** — TCP client + server + UDP + net_config + ICMP shipped (1.1–1.4); **multi-process** agnos
-(`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
-**direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
-compat layer), v2+. Each is its own validation surface; the translation core built here runs from both
+**Post-v1** (see [`roadmap.md`](roadmap.md) planned minors): the **sovereign net band** #47–57/#61 is
+**complete** — TCP client + server + UDP + net_config + ICMP shipped (1.1–1.4). Remaining planned minors:
+**multi-process** (`spawn#3`/`waitpid#4` — the agnsh target, v1.5.0); **signals** (`pause#14`/`kill#16`/
+`sigprocmask#17`/`signalfd#18`); **I/O mux** (epoll #19–21 / timerfd #22–23 / `pipe#25`); **info getters +
+`flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`); **`winsize#60`** tty sizing; and **direction 2** — the
+Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent compat layer), v2+. Each is
+its own validation surface; the translation core built here runs from both
 sides. The mirshi/QEMU/iron discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md))
 holds: mirshi owns userland + Linux-compat-at-scale, never the agnos kernel or hardware truth.

@@ -8,28 +8,39 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius), zero external depende
 
 mirshi is a **userland syscall-translation supervisor** — the WSL1 / Wine / gVisor "pico-process" model, **not** kernel emulation and **not** a VM. One translation core, run from either side:
 
-- **Direction 1 — AGNOS→Linux** (v1, build-first): supervise an **agnos-compiled static ELF running as a native Linux process**, intercept its agnos-ABI syscalls, and map them onto host Linux syscalls. **No QEMU, shared host kernel.** → agnos userland runs in a plain Docker container: multi-container test fan-out at scale + cloud-deployability (agnos presents as an ordinary Linux container).
+- **Direction 1 — AGNOS→Linux** (v1, shipped): supervise an **agnos-compiled static ELF running as a native Linux process**, intercept its agnos-ABI syscalls, and map them onto host Linux syscalls. **No QEMU, shared host kernel.** → agnos userland runs in a plain Docker container: multi-container test fan-out at scale + cloud-deployability (agnos presents as an ordinary Linux container).
 - **Direction 2 — Linux→AGNOS** (v2+, the "swallow" stage): run Linux binaries **on the agnos kernel**, the permanent compat layer.
 
 ### Why it's needed (not a number remap)
 
-agnos redefines the `Sys` enum to its own numbers — `exit`=0 on agnos vs 60 on Linux, the net band `#45-#57` is a sovereign `sock_*`/`udp_*`/`icmp` ABI, `mmap#27` is 2 MB-granular. So an agnos static ELF doing `syscall(0,…)` hits Linux `read` without translation. Each agnos syscall gets a per-number **handler** that maps-with-arg-translation, **emulates** in userspace, or returns `ENOSYS`. agnos bins are static (no libc) → no `LD_PRELOAD`; interception is supervisor-side (ptrace → seccomp-user-notify).
+agnos redefines the `Sys` enum to its own numbers — `exit`=0 on agnos vs 60 on Linux, the net band `#47–57` + `net_config#61` is a sovereign `sock_*`/`udp_*`/`icmp` ABI, `mmap#27` is 2 MB-granular. So an agnos static ELF doing `syscall(0,…)` hits Linux `read` without translation. Each agnos syscall gets a per-number **handler** that maps-with-arg-translation, **emulates** in userspace, or returns `ENOSYS`. agnos bins are static (no libc) → no `LD_PRELOAD`; interception is supervisor-side (ptrace).
+
+## Runs today (direction 1)
+
+- **Process + console** — `exit`/`write`/`read`/`getpid`/`mmap`/timers/`getrandom`.
+- **Filesystem** — `open`/`read`/`write`/`stat`/`getdents`/`mkdir`/`rename`/`link`/… on a container rootfs, with optional kernel-enforced `--root` confinement ([ADR 0009](docs/adr/0009-rootfs-confinement-openat2-in-child.md)).
+- **Network** — the sovereign net band is **complete**: TCP client + server, UDP, ICMP, and `net_config`, supervisor-emulated with **default-deny egress** (`--net` / `--net-allow`), [ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md).
+- **The Docker vehicle** — a `FROM scratch` `agnos-mirshi` image runs agnos tools with **no QEMU**, seccomp-bounded and fan-out-ready.
+
+See the [syscall-coverage matrix](docs/reference/syscall-coverage.md) for the frozen per-number contract, the [CLI reference](docs/reference/cli.md) for flags, and the [roadmap](docs/development/roadmap.md) for what's next.
 
 ## Discipline (what mirshi is NOT)
 
-mirshi-in-Docker runs agnos userland on the **host** Linux kernel — it validates **userland concurrency + Linux-app compat at scale**, but does **not** exercise the agnos kernel's own SMP scheduler or net stack. It **complements, never replaces** QEMU+KVM (real kernel) + iron (hardware truth). Each surface owns a distinct bug class.
+mirshi-in-Docker runs agnos userland on the **host** Linux kernel — it validates **userland concurrency + Linux-app compat at scale**, but does **not** exercise the agnos kernel's own SMP scheduler or net stack. It **complements, never replaces** QEMU+KVM (real kernel) + iron (hardware truth). Each surface owns a distinct bug class ([ADR 0011](docs/adr/0011-mirshi-qemu-iron-boundary-discipline.md)).
 
 ## Status
 
-**v0.1.0 — scaffold.** v1 target = *AGNOS + mirshi runs in a plain Docker container, no QEMU.* See [docs/development/roadmap.md](docs/development/roadmap.md).
+**Direction 1 (AGNOS→Linux) is feature-complete through the net band.** v1.0 cut the hardened / audited / optimized / frozen foundation (agnos userland in Docker, no QEMU); v1.1–v1.4 added the full net band (TCP client + server, UDP, ICMP). The authoritative version is [`VERSION`](VERSION) + [`CHANGELOG.md`](CHANGELOG.md); the live state snapshot is [`docs/development/state.md`](docs/development/state.md). Next up — multi-process (agnsh), signals, and the direction-2 swallow — see the [roadmap](docs/development/roadmap.md).
 
 ## Build
 
 ```sh
-cyrius deps                              # resolve stdlib deps
+cyrius deps                               # resolve stdlib / sibling deps
 cyrius build src/main.cyr build/mirshi    # compile (Linux-target supervisor)
-cyrius test                              # run tests
+cyrius test                               # run [build].test + tests/*.tcyr
 ```
+
+Then run an agnos ELF: `build/mirshi ./hello` (see [getting started](docs/guides/getting-started.md)).
 
 ## License
 
