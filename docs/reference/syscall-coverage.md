@@ -32,9 +32,9 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 |--:|------|:-----:|-----------:|-------|
 | 0 | exit | EXIT | `exit_group` (231) | code in a1; terminates, no exit stop |
 | 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
-| 2 | getpid | EMULATE | — | multi-process (v1.5.0): returns the caller's **coined agnos pid** (root=1), not host `getpid`(39) — else children would see clashing host pids; loop-supplied `_cur_rec` |
-| 3 | spawn | EMULATE | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
-| 4 | waitpid | EMULATE | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
+| 2 | getpid | EMULATE ³ | — | multi-process (v1.5.0): returns the caller's **coined agnos pid** (root=1), not host `getpid`(39) — else children would see clashing host pids; loop-supplied `_cur_rec` |
+| 3 | spawn | EMULATE ³ | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
+| 4 | waitpid | EMULATE ³ | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
 | 6 | close | EXECUTE | `close` (3) | |
 | 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../../src/translate.cyr)); mode 0600 on `O_CREAT` |
@@ -109,6 +109,19 @@ unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket, round-trips one echo under
 The net band is now **complete** — no net-band number remains ENOSYS (see the
 [roadmap net band arc](../development/roadmap.md)).
 
+³ **Multi-process (v1.5.0).** `spawn#3` / `waitpid#4` / `getpid#2` are **supervisor-EMULATE**
+([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)): the supervisor traces a small
+process tree via a `wait4(-1)` demux loop + a fixed 16-slot per-child record table. `spawn#3` forks a
+grandchild from the in-memory ELF (memfd + `execveat`; the child seccomp bound gains only `execveat`,
+the fork stays supervisor-side); `waitpid#4` **parks** the caller (left stopped — *not* the supervisor)
+until the target exits, then injects its exit code; `getpid#2` returns the caller's **coined agnos pid**
+(root = 1, monotonic, never reused). A `MAX_CHILDREN=16` cap re-closes the process-storm vector
+([ADR 0006](../adr/0006-host-resource-bounds-child-rlimits.md)). **Known limits** (ADR 0013):
+`sleep_ms#41` + blocking net I/O still run in the supervisor — **head-of-line blocking** across children
+(deferred rework, pairs with v1.6.0 signals); agnos `exit(>255)` is 8-bit-truncated by the host status
+word; a wait deadlock (self-wait / cycle) is **broken to −1**, not diagnosed. `kill#16` + signals are
+v1.6.0.
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -116,10 +129,11 @@ The net band is now **complete** — no net-band number remains ENOSYS (see the
 - **M2 — filesystem**: `open#7`, `close#6`, `lseek#58`, `dup#8`, `mkdir#9`, `rmdir#10`,
   `unlink#30`, `rename#31`, `link#32`, `stat#33`, `getdents#29`.
 
-Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47–57, #61) shipped as a
-post-v1 extension under `--net` (v1.1.0–v1.4.0 — footnote ²). Still ENOSYS, as **planned post-v1 minors**
-(see the [roadmap](../development/roadmap.md)): multi-process (#3/#4), signals (#14, #16–18),
-epoll/timerfd/pipe (#19–25), info getters (#15/#34/#35), `flock#59`, and `winsize#60`.
+Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47–57, #61, v1.1.0–v1.4.0
+— footnote ²) and **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³)
+shipped as post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see the
+[roadmap](../development/roadmap.md)): signals (#14, #16–18), epoll/timerfd/pipe (#19–25), info getters
+(#15/#34/#35), `flock#59`, and `winsize#60`.
 
 ## Known gaps (carried forward, documented not fixed)
 
@@ -130,3 +144,8 @@ epoll/timerfd/pipe (#19–25), info getters (#15/#34/#35), `flock#59`, and `wins
   surface (mirrors the ark-v2 finding).
 - **`stat#33`**: the agnos 48 B struct carries mode/nlink/size/ino/blocks/mtime; sub-second
   mtime nsec is dropped (agnos has no nsec field).
+- **Multi-process (`spawn#3`/`waitpid#4`, ³)**: `sleep_ms#41` + blocking net I/O run in the
+  single-threaded supervisor, so while one child blocks the others don't advance (**head-of-line
+  blocking** — deferred rework, pairs with v1.6.0 signals); agnos `exit(>255)` is 8-bit-truncated by
+  the host status word; a wait deadlock (self-wait / cycle) is broken to agnos −1, not diagnosed; the
+  process tree is capped at `MAX_CHILDREN=16`. See [ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md).

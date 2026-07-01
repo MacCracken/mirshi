@@ -197,6 +197,13 @@ jobs:
         # pid, matching what spawn returns to the parent. Needs the same-uid ptrace requirement.
         run: bash scripts/it/getpid.sh
 
+      - name: Multi-process — fork-storm bound + grandchild depth (v1.5.0)
+        # v1.5.0 multi-process (BITE 10): the fork-storm bound (spawn past MAX_CHILDREN=16 returns
+        # agnos -1, no host process leak — re-closing the ADR 0006 vector that EMULATE spawn reopens)
+        # and 3-level process-tree depth (root -> child -> grandchild, proving the flat record table
+        # handles nesting). Needs the same-uid ptrace requirement.
+        run: bash scripts/it/spawn_storm.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

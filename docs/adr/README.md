@@ -31,3 +31,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0010 — ptrace exit-stop single-register I/O (the ptrace optimization ceiling)](0010-ptrace-exit-stop-single-register-io.md) — *Accepted*
 - [0011 — The mirshi / QEMU / iron boundary discipline](0011-mirshi-qemu-iron-boundary-discipline.md) — *Accepted*
 - [0012 — Net band: supervisor-emulated conn_id table + recv-EOF inversion + default-deny egress](0012-net-band-supervisor-emulated-conn-table.md) — *Accepted*
+- [0013 — Multi-process: supervisor-driven fork + memfd/execveat, a per-child record table, opaque-monotonic pids](0013-multiprocess-supervisor-fork-record-table.md) — *Accepted*

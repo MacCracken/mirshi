@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**Multi-process — the agnsh crown jewel.** agnos `spawn#3` / `waitpid#4` / `getpid#2` now run: a
+parent spawns children from in-memory ELF images and waits their exit codes, to arbitrary depth, all
+under one supervisor. mirshi grows from a single-child tracer into a small process tree
+([ADR 0013](docs/adr/0013-multiprocess-supervisor-fork-record-table.md)).
+
+### Added
+- **Multi-tracee supervisor** (`src/intercept.cyr`): `_trace_run` is now a `wait4(-1, __WALL)` demux —
+  it services one ptrace stop per iteration keyed on a per-child record, resumes that child, and
+  returns only when the root exits. Single-stop-per-iteration keeps dispatch non-reentrant, so the
+  pure staging buffers stay shared; only the enter→exit carry + the net-slot table went per-child.
+- **Per-child record table** (`src/children.cyr`): a fixed `MAX_CHILDREN=16` lazy-alloc-once table
+  (pid mapping, state, exit code, wait target, `needs_attach`, the carry, the net table).
+- **`spawn#3`** (`_do_spawn`): supervisor reads the caller's in-memory ELF (`process_vm_readv`,
+  bounds-checked to `SPAWN_ELF_MAX=8 MB`), stages it into a `memfd`, `fork`s a traced grandchild that
+  runs the same rlimits/rootfd/seccomp gauntlet then `execveat(memfd, AT_EMPTY_PATH)`, and injects a
+  coined agnos pid. **Not** `PTRACE_O_TRACEFORK` (the child never forks); the fork stays
+  supervisor-side, so the child seccomp bound grows by **only** `execveat`.
+- **`waitpid#4`** (`_do_waitpid`): parks the caller *stopped* (not the supervisor) until the target
+  exits, then injects its exit code; an already-exited target is claimed via a zombie fast-path;
+  unknown/reaped → −1. The `WIFEXITED` handler wakes parked waiters and frees the slot.
+- **`getpid#2`** EXECUTE→EMULATE: returns the caller's coined agnos pid (root=1) instead of host
+  `getpid#39`, so each process sees *its* pid (matching what spawn returns).
+- **New gates**: `scripts/it/spawn.sh`, `waitpid.sh`, `getpid.sh`, `spawn_storm.sh` (fork-storm cap +
+  no-leak + 3-level grandchild depth). All CI-wired.
+
+### Security
+- **Process-storm bound**: flipping `spawn#3` to EMULATE reopens the process-exhaustion vector
+  ([ADR 0006](docs/adr/0006-host-resource-bounds-child-rlimits.md) had closed it via the child bound +
+  spawn=ENOSYS). Re-closed by the `MAX_CHILDREN` cap, checked before each fork (never `RLIMIT_NPROC` —
+  per-uid + container-hostile). **Deadlock guard**: a self-wait / wait-cycle can't wedge the
+  single-threaded supervisor — parked waiters are failed to −1 rather than blocking `wait4(-1)` forever.
+  `spawn#3` + `waitpid#4` were adversarially reviewed (fd/memfd leaks, use-after-free of slots,
+  lost-wakeups, privilege — all clean; the deadlock wedge was found and fixed here).
+
+### Changed
+- **Frozen matrix**: rows #2/#3/#4 move ENOSYS/EXECUTE → **EMULATE ³** (multi-process). The freeze
+  test's `agnos_to_linux_nr` *values* stay pinned (these are intercepted at the loop level / dispatcher,
+  before it); `getpid#2` drops its `→39` peer. The `alloc_clean` gate's EXECUTE representative moved
+  from getpid#2 to the bufferless `time_unix#46`.
+- **Pid model** ([ADR 0013](docs/adr/0013-multiprocess-supervisor-fork-record-table.md)): opaque
+  monotonic agnos pids (root=1, never reused), a two-way guest↔host mapping — bidirectional-ready for
+  the v2+ swallow. Known limits documented: head-of-line blocking (`sleep`/blocking I/O), 8-bit exit
+  truncation, deadlock-break-to-−1.
+
 ## [1.4.0] — 2026-06-30
 
 **Net band — ICMP (the arc's finale).** agnos `icmp_echo#55` (yo/ping) now round-trips through
