@@ -257,19 +257,44 @@ enum MirshiNetSys {
     MSG_NOSIGNAL = 0x4000;       # send() must NOT raise SIGPIPE (it would kill the SUPERVISOR)
     NET_IO_CAP = 4096;           # one-page bound on a single send/recv payload (caller loops)
     NET_SLOTS = 8;               # agnos conn_id / listener_id space is 0..7 (the kernel's 8 slots)
+    NET_SLOT_SIZE = 24;          # per-slot entry {i64 fd; i64 kind; i64 parent}
+    SLOT_FREE = 0;               # slot kind: free / a live conn / a listener
+    SLOT_CONN = 1;
+    SLOT_LISTEN = 2;
     CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
 }
 
-# The supervisor-side conn_id(0..7) -> host fd table (lazy-alloc-once, like _how_buf). A slot
-# holds -1 (free) or a connected host fd. The child never sees these fds — only the slot index.
-var _net_conn_fd = 0;
+# The supervisor-side conn_id/listener_id(0..7) slot table (lazy-alloc-once, like _how_buf).
+# Each 24-byte slot is {i64 fd; i64 kind; i64 parent}: fd = host fd or -1; kind = SLOT_FREE /
+# SLOT_CONN / SLOT_LISTEN; parent = for an accepted conn, the listen slot it came from (so
+# closing a listener reaps its children), else -1. The child only ever sees the slot INDEX
+# (the opaque agnos conn_id / listen_id), never a host fd. ONE unified 0..7 space (mirroring
+# the agnos kernel's, so sock_close#50(id) is unambiguous whether id is a conn or a listen).
+var _net_slots = 0;
 fn _net_tbl(): i64 {
-    if (_net_conn_fd == 0) {
-        _net_conn_fd = alloc(NET_SLOTS * 8);
+    if (_net_slots == 0) {
+        _net_slots = alloc(NET_SLOTS * NET_SLOT_SIZE);
         var i = 0;
-        while (i < NET_SLOTS) { store64(_net_conn_fd + i * 8, 0 - 1); i = i + 1; }
+        while (i < NET_SLOTS) {
+            var b = _net_slots + i * NET_SLOT_SIZE;
+            store64(b + 0, 0 - 1);         # fd = -1
+            store64(b + 8, SLOT_FREE);     # kind
+            store64(b + 16, 0 - 1);        # parent = -1
+            i = i + 1;
+        }
     }
-    return _net_conn_fd;
+    return _net_slots;
+}
+
+# First free slot index, or -1 if the 8-slot table is full.
+fn _net_slot_alloc(): i64 {
+    var tbl = _net_tbl();
+    var i = 0;
+    while (i < NET_SLOTS) {
+        if (load64(tbl + i * NET_SLOT_SIZE + 8) == SLOT_FREE) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
 }
 
 # Supervisor scratch for the emulated net calls (lazy-once): sockaddr_in@0(16) + pollfd@16(8)
@@ -299,13 +324,7 @@ fn _net_connect(pid, regs): i64 {
     if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) {
         return _net_emu(pid, regs, 0 - 1);        # egress denied (default-deny / policy)
     }
-    var tbl = _net_tbl();
-    var slot = 0 - 1;
-    var i = 0;
-    while (i < NET_SLOTS) {
-        if (load64(tbl + i * 8) == (0 - 1)) { slot = i; i = NET_SLOTS; }
-        else { i = i + 1; }
-    }
+    var slot = _net_slot_alloc();
     if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
     var fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
@@ -326,21 +345,26 @@ fn _net_connect(pid, regs): i64 {
         syscall(SYS_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, sb + 40, sb + 48);
         if (load32(sb + 40) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
     }
-    store64(tbl + slot * 8, fd);                  # slot now holds the connected fd
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);                           # slot now holds the connected fd
+    store64(b + 8, SLOT_CONN);                    # kind = live client conn
+    store64(b + 16, 0 - 1);                       # no listener parent
     return _net_emu(pid, regs, slot);             # agnos conn_id = slot index
 }
 
-# sock_close#50(conn_id) -> 0 / -1. Close the host fd and free the slot. (A LISTEN slot reaps
-# children in agnos — that path lands with sock_listen/accept in the server bite.)
+# sock_close#50(conn_id | listen_id) -> 0 / -1. Close the host fd and free the slot. (When the
+# slot is a LISTEN, agnos also reaps its accepted children — that reap lands with sock_listen/
+# accept in the server bite; here every live slot is a SLOT_CONN, closed generically.)
 fn _net_close_conn(pid, regs): i64 {
     var cid = decode_arg(regs, 0);
     if (cid < 0) { return _net_emu(pid, regs, 0 - 1); }
     if (cid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
-    var tbl = _net_tbl();
-    var fd = load64(tbl + cid * 8);
-    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
-    syscall(HOST_CLOSE, fd);
-    store64(tbl + cid * 8, 0 - 1);                # free the slot
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) == SLOT_FREE) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
+    syscall(HOST_CLOSE, load64(b + 0));
+    store64(b + 0, 0 - 1);
+    store64(b + 8, SLOT_FREE);                    # free the slot
+    store64(b + 16, 0 - 1);
     return _net_emu(pid, regs, 0);
 }
 
@@ -352,11 +376,15 @@ fn _net_io_buf(): i64 {
     return _net_io;
 }
 
-# conn_id -> host fd; -1 if the id is out of range or the slot is free (a hostile/stale id).
-fn _net_fd(cid): i64 {
+# conn_id -> host fd, but ONLY for a live client/accepted connection (SLOT_CONN). -1 if the id
+# is out of range, free, or a LISTEN slot (you cannot send/recv on a listener). Blocks a hostile
+# or stale id and a send/recv aimed at a listen slot.
+fn _net_fd_conn(cid): i64 {
     if (cid < 0) { return 0 - 1; }
     if (cid >= NET_SLOTS) { return 0 - 1; }
-    return load64(_net_tbl() + cid * 8);
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) != SLOT_CONN) { return 0 - 1; }
+    return load64(b + 0);
 }
 
 # sock_send#48(conn_id, buf, len) -> bytes (<=len) / -1. BLOCKS (agnos). The child buffer is
@@ -365,7 +393,7 @@ fn _net_fd(cid): i64 {
 # so a full send buffer (-EAGAIN) is handled by one bounded ppoll(POLLOUT) + retry — emulating the
 # blocking send. A partial send is a valid agnos return (the caller loops).
 fn _net_send(pid, regs): i64 {
-    var fd = _net_fd(decode_arg(regs, 0));
+    var fd = _net_fd_conn(decode_arg(regs, 0));
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
     var child_buf = decode_arg(regs, 1);
     var len = decode_arg(regs, 2);
@@ -393,7 +421,7 @@ fn _net_send(pid, regs): i64 {
 # net_recv_to_agnos). Non-blocking recv (MSG_DONTWAIT) into a supervisor page, map the return, then
 # pvm_write the received bytes into the child buffer. A short pvm_write (bad child ptr) -> -1.
 fn _net_recv(pid, regs): i64 {
-    var fd = _net_fd(decode_arg(regs, 0));
+    var fd = _net_fd_conn(decode_arg(regs, 0));
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
     var child_buf = decode_arg(regs, 1);
     var maxlen = decode_arg(regs, 2);
