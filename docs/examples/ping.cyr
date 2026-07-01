@@ -1,0 +1,41 @@
+# docs/examples/ping.cyr — agnos ICMP ping over the mirshi net band (v1.4.0, --net).
+# Pings 127.0.0.1 via an UNPRIVILEGED ping socket and prints the round-trip time in ms.
+#
+#   cyrius build --agnos docs/examples/ping.cyr /tmp/ping
+#   build/mirshi --net-allow 127.0.0.1/32 /tmp/ping
+#
+# Unprivileged ICMP is environment-gated (net.ipv4.ping_group_range); where the kernel
+# forbids it, mirshi fails closed to -1 and this prints "unreachable". Demonstrates
+# icmp_echo#55 (RTT ms >= 0, sub-ms reads 0; -1 on timeout/denied) + per-destination egress.
+include "lib/syscalls.cyr"
+
+# Print a non-negative integer as decimal, followed by a newline.
+fn put_uint(v): i64 {
+    var buf[24];
+    var i = 22;
+    store8(&buf + 23, 10);                          # trailing '\n'
+    if (v == 0) { store8(&buf + i, 48); i = i - 1; }   # '0'
+    while (v > 0) {
+        store8(&buf + i, 48 + (v % 10));            # least-significant digit first
+        v = v / 10;
+        i = i - 1;
+    }
+    sys_write(1, &buf + i + 1, 23 - i);
+    return 0;
+}
+
+fn main(): i64 {
+    var rtt = sys_icmp_echo(0x7F000001);            # ping 127.0.0.1 (agnos kernel-ip4 form)
+    if (rtt < 0) {
+        var m = "unreachable\n";
+        sys_write(1, m, strlen(m));
+        return 1;                                   # timeout / host down / no permission
+    }
+    var p = "rtt_ms=";
+    sys_write(1, p, strlen(p));
+    put_uint(rtt);
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

@@ -20,7 +20,9 @@ build/mirshi --selftest-trace ./hello    # M0 trap-log: print the agnos syscall 
 The full flag set, modes, and exit codes are the **frozen CLI contract**
 ([`../reference/cli.md`](../reference/cli.md)); which agnos syscalls are mapped / emulated /
 ENOSYS is the **syscall-coverage matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md)).
-To run in a container with fan-out, see [`docker-fanout.md`](docker-fanout.md).
+For end-to-end **runnable examples** (console, confined fs, net-band HTTP client, ICMP ping), see
+[`../examples/`](../examples/README.md). To run in a container with fan-out, see
+[`docker-fanout.md`](docker-fanout.md).
 
 ## Layout
 

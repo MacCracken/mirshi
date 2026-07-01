@@ -1,0 +1,33 @@
+# docs/examples/httpget.cyr — agnos HTTP client over the mirshi net band (post-v1, --net).
+# Connects to 127.0.0.1:8080, sends an HTTP/1.0 GET, prints the response, and closes.
+#
+#   cyrius build --agnos docs/examples/httpget.cyr /tmp/httpget
+#   python3 -m http.server 8080 >/dev/null 2>&1 &      # a throwaway server on :8080
+#   build/mirshi --net-allow 127.0.0.1/32 /tmp/httpget
+#
+# Demonstrates sock_connect#47 / sock_send#48 / sock_recv#49 (the INVERTED recv-EOF:
+# 0 = WOULD_BLOCK, -1 = EOF) / sock_close#50, and the default-deny egress gate — drop
+# --net-allow (or point it elsewhere) and sock_connect returns agnos -1. See ADR 0012.
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    # dst_ip is the agnos kernel-ip4 form: 127.0.0.1 = 0x7F000001. src_port 0 = ephemeral.
+    var c = sys_sock_connect(0x7F000001, 8080, 0);
+    if (c < 0) { return 1; }                        # connect failed / egress denied
+    var req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    sys_sock_send(c, req, strlen(req));
+    var buf[512];
+    var got = 0;
+    while (1 == 1) {
+        var n = sys_sock_recv(c, &buf, 512);
+        if (n == (0 - 1)) { break; }                # agnos EOF (-1) — the server closed
+        if (n > 0) { sys_write(1, &buf, n); got = got + n; }
+        else { syscall(41, 2); }                    # WOULD_BLOCK (0) -> sleep 2ms, retry
+    }
+    sys_sock_close(c);
+    if (got > 0) { return 0; }
+    return 2;                                        # no bytes received
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

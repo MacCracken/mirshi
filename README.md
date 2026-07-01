@@ -40,7 +40,8 @@ cyrius build src/main.cyr build/mirshi    # compile (Linux-target supervisor)
 cyrius test                               # run [build].test + tests/*.tcyr
 ```
 
-Then run an agnos ELF: `build/mirshi ./hello` (see [getting started](docs/guides/getting-started.md)).
+Then run an agnos ELF: `build/mirshi ./hello` (see [getting started](docs/guides/getting-started.md)
+and the [runnable examples](docs/examples/README.md)).
 
 ## License
 
