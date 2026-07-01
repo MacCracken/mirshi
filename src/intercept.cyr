@@ -303,10 +303,14 @@ fn _trace_run(pid): i64 {
     var a = _attach(pid, status);
     if (a >= 0) { return a; }
 
+    # v1.5.0 BITE 2: the enter->exit carry (phase / captured nr / dispatcher verdict / the
+    # EMULATE return + M2 repack staging) lives in the child's RECORD, not loop locals + dispatch
+    # globals — so it survives other children's stops once the loop goes multi-tracee (BITE 4).
+    # Still single-child here (wait4(pid)) -> byte-identical. The dispatch globals
+    # (_xlat_emu_ret / _m2_out_*) stay transient per-stop scratch: saved into the record right
+    # after the enter dispatch, restored right before the exit stop consumes them.
+    var rec = _child_find_by_host(pid);
     var pending_sig = 0;
-    var at_entry = 1;        # PTRACE_SYSCALL alternates enter/exit — track the phase
-    var agnos_nr = 0;        # captured at enter, used to map the return at exit
-    var strat = 0;           # the dispatcher's verdict at enter, applied at exit
     while (1 == 1) {
         pt(PTRACE_SYSCALL, pid, 0, pending_sig);
         pending_sig = 0;
@@ -318,12 +322,18 @@ fn _trace_run(pid): i64 {
         if (WIFSTOPPED(st) == 1) {
             var sig = WSTOPSIG(st);
             if (sig == SYSCALL_STOP_SIG) {
-                if (at_entry == 1) {
+                if (load64(rec + C_AT_ENTRY) == 1) {
                     # Syscall-ENTER: read regs, classify, rewrite for the kernel.
                     pt(PTRACE_GETREGS, pid, 0, regs);
-                    agnos_nr = decode_nr(regs);
-                    strat = translate_dispatch(pid, regs);
-                    at_entry = 0;
+                    store64(rec + C_AGNOS_NR, decode_nr(regs));
+                    store64(rec + C_STRAT, translate_dispatch(pid, regs));
+                    # Save this child's dispatch carry into its record; the globals are then
+                    # free for the next child's stop (BITE 4 makes this isolation load-bearing).
+                    store64(rec + C_XLAT_EMU_RET, _xlat_emu_ret);
+                    store64(rec + C_M2_OUT_PTR, _m2_out_ptr);
+                    store64(rec + C_M2_OUT_CAP, _m2_out_cap);
+                    store64(rec + C_M2_SCRATCH, _m2_scratch);
+                    store64(rec + C_AT_ENTRY, 0);
                 } else {
                     # Syscall-EXIT (0.8.0 hot-path opt; docs/benchmarks.md). The exit stop
                     # needs exactly ONE register: rax (the raw kernel return). So read just
@@ -344,19 +354,25 @@ fn _trace_run(pid): i64 {
                     # (PEEKUSER's raw ABI writes the word to the data pointer and returns
                     # 0/-errno; POKEUSER takes the value in data. REG_RAX=80 is the offset
                     # into struct user too — user_regs_struct is its leading member.)
+                    # Restore this child's carry into the dispatch globals before the exit
+                    # stop consumes them (agret reads _xlat_emu_ret; fs_exit_return reads _m2_*).
+                    _xlat_emu_ret = load64(rec + C_XLAT_EMU_RET);
+                    _m2_out_ptr = load64(rec + C_M2_OUT_PTR);
+                    _m2_out_cap = load64(rec + C_M2_OUT_CAP);
+                    _m2_scratch = load64(rec + C_M2_SCRATCH);
                     pt(PTRACE_PEEKUSER, pid, REG_RAX, raxbuf);
                     var raw = load64(raxbuf);
                     var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
-                    if (strat == STRAT_EXECUTE) {
+                    if (load64(rec + C_STRAT) == STRAT_EXECUTE) {
                         # fs_exit_return maps the return AND, for stat/getdents, repacks the
                         # Linux output struct into the child's saved buffer — a child-MEMORY
                         # write, independent of the rax write-back conditionally done below.
-                        agret = fs_exit_return(pid, agnos_nr, raw);
+                        agret = fs_exit_return(pid, load64(rec + C_AGNOS_NR), raw);
                     }
                     if (agret != raw) {
                         pt(PTRACE_POKEUSER, pid, REG_RAX, agret);
                     }
-                    at_entry = 1;
+                    store64(rec + C_AT_ENTRY, 1);
                 }
             } else {
                 # Non-syscall signal stop; the enter/exit phase is unchanged (a signal
