@@ -43,6 +43,17 @@ enum MirshiChild {
     CS_RUNNING = 1;            # live, being traced
     CS_BLOCKED = 2;            # parked in waitpid#4 (left stopped at its enter-stop)
     CS_EXITED = 3;             # exited; exit_code retained until reaped
+    SPAWN_ELF_MAX = 8388608;   # 8 MB spawn#3 ELF read cap — matches lib/process_agnos.cyr's
+                               # _AGNOS_ELF_MAX (the agnos-side spawn helper's own read buffer)
+}
+
+# True (1) iff `size` is a plausible spawn#3 ELF size: positive and within the SPAWN_ELF_MAX cap
+# (the supervisor reads exactly this many bytes from the child before memfd + execveat). PURE —
+# the bounds gate for _spawn_read_elf (intercept.cyr), unit-tested hermetically.
+fn _spawn_size_ok(size): i64 {
+    if (size <= 0) { return 0; }
+    if (size > SPAWN_ELF_MAX) { return 0; }
+    return 1;
 }
 
 # The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.

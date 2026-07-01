@@ -422,6 +422,14 @@ fn main() {
     _child_alloc(1, 0);
     assert_eq(load64(_child_alloc(2, 0) + C_AGNOS_PID), 2, "agnos pids monotonic across allocs");
 
+    # --- v1.5.0 spawn#3 ELF-size bounds (src/children.cyr _spawn_size_ok) -----------------
+    test_group("spawn-elf-size");
+    assert_eq(_spawn_size_ok(0), 0, "size 0 -> reject");
+    assert_eq(_spawn_size_ok(0 - 1), 0, "negative size -> reject");
+    assert_eq(_spawn_size_ok(1), 1, "size 1 -> ok");
+    assert_eq(_spawn_size_ok(SPAWN_ELF_MAX), 1, "size == cap -> ok");
+    assert_eq(_spawn_size_ok(SPAWN_ELF_MAX + 1), 0, "size > cap -> reject");
+
     return assert_summary();
 }
 
