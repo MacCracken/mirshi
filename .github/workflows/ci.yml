@@ -161,6 +161,13 @@ jobs:
         # Needs python3 + the same-uid ptrace requirement.
         run: bash scripts/it/net_udp.sh
 
+      - name: Net band — net_config (v1.3.0)
+        # v1.3.0 net_config#61 (docs/adr/0012): mirshi reads the real container-netns config —
+        # gateway from /proc/net/route, DNS from /etc/resolv.conf, host IP via a getsockname
+        # trick (netmask 0-unset) — and returns the kernel-ip4 values. The gate compares against
+        # the environment's own files. Needs python3 + the same-uid ptrace requirement.
+        run: bash scripts/it/net_config.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

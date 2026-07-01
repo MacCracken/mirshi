@@ -281,6 +281,64 @@ fn net_recv_to_agnos(lr): i64 {
     return 0 - 1;                                     # any other -errno -> agnos error (-1)
 }
 
+# --- net_config#61 parsing helpers (v1.3.0) — PURE. The handler reads the container-netns
+#     config files (/etc/resolv.conf, /proc/net/route) in the supervisor; these parse the
+#     fields it finds. Unit-tested (docs/adr/0012). ---
+
+# Parse a dotted-quad "a.b.c.d" at the start of `buf` (reading at most `maxlen` bytes) into the
+# agnos kernel-ip4 form (oct1<<24|…|oct4). Stops at the first non-digit-non-dot (trailing text is
+# fine). Returns the packed ip, or -1 on malformed / out-of-range octet.
+fn net_parse_dotquad(buf, maxlen): i64 {
+    var ip = 0;
+    var i = 0;
+    var oct_i = 0;
+    while (oct_i < 4) {
+        var have = 0;
+        var val = 0;
+        while (i < maxlen) {
+            var c = load8(buf + i);
+            if (c < 48) { break; }
+            if (c > 57) { break; }
+            val = val * 10 + (c - 48);
+            if (val > 255) { return 0 - 1; }
+            have = 1;
+            i = i + 1;
+        }
+        if (have == 0) { return 0 - 1; }
+        ip = (ip << 8) | val;
+        oct_i = oct_i + 1;
+        if (oct_i < 4) {
+            if (i >= maxlen) { return 0 - 1; }
+            if (load8(buf + i) != 46) { return 0 - 1; }   # expect '.'
+            i = i + 1;
+        }
+    }
+    return ip;
+}
+
+# Parse up to 8 hex digits at `buf` into a u32 (the little-endian hex form /proc/net/route uses
+# for the Gateway column, e.g. "0101A8C0" = the network-order sin_addr value 0x0101A8C0). Stops at
+# the first non-hex. Returns the value, or -1 if there is no hex digit. The caller byte-swaps this
+# network-order value into the agnos kernel-ip4 form.
+fn net_parse_hex32(buf): i64 {
+    var v = 0;
+    var i = 0;
+    var have = 0;
+    while (i < 8) {
+        var c = load8(buf + i);
+        var d = 0 - 1;
+        if (c >= 48) { if (c <= 57) { d = c - 48; } }        # 0-9
+        if (c >= 65) { if (c <= 70) { d = c - 55; } }        # A-F  (c - 65 + 10)
+        if (c >= 97) { if (c <= 102) { d = c - 87; } }       # a-f  (c - 97 + 10)
+        if (d < 0) { break; }
+        v = (v << 4) | d;
+        have = 1;
+        i = i + 1;
+    }
+    if (have == 0) { return 0 - 1; }
+    return v;
+}
+
 # ----------------------------------------------------------------------------
 # Net egress policy (v1.1.0, --net-allow) — PURE ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
 # DEFAULT-DENY: a dst is reachable only if it matches a configured --net-allow CIDR.

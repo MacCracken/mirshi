@@ -369,6 +369,23 @@ fn main() {
     assert_eq(net_parse_allow("1.2.3.4/24x", ent, NET_ALLOW_MAX), 0 - 1, "trailing junk rejected");
     assert_eq(net_parse_allow("99999999999999999999.0.0.0/8", ent, NET_ALLOW_MAX), 0 - 1, "overflow octet rejected (in-loop bound)");
 
+    # net_config#61 parsing helpers (v1.3.0): dotted-quad + /proc/net/route hex.
+    test_group("net-config-parse");
+    var dq = alloc(32);
+    memcpy(dq, "127.0.0.53", 10); store8(dq + 10, 0);
+    assert_eq(net_parse_dotquad(dq, 10), 0x7F000035, "127.0.0.53 -> kernel-ip4");
+    memcpy(dq, "8.8.8.8 x", 9); store8(dq + 9, 0);
+    assert_eq(net_parse_dotquad(dq, 9), 0x08080808, "8.8.8.8 (stops at trailing space)");
+    memcpy(dq, "1.2.3.4", 7); store8(dq + 7, 0);
+    assert_eq(net_parse_dotquad(dq, 7), 0x01020304, "1.2.3.4");
+    memcpy(dq, "256.0.0.1", 9); store8(dq + 9, 0);
+    assert_eq(net_parse_dotquad(dq, 9), 0 - 1, "256.0.0.1 -> reject");
+    memcpy(dq, "0101A8C0", 8); store8(dq + 8, 0);
+    assert_eq(net_parse_hex32(dq), 0x0101A8C0, "route hex 0101A8C0 (LE sin_addr)");
+    assert_eq(net_ip4_to_inaddr(net_parse_hex32(dq)), 0xC0A80101, "…bswapped -> 192.168.1.1 kernel-ip4");
+    memcpy(dq, "00000000", 8); store8(dq + 8, 0);
+    assert_eq(net_parse_hex32(dq), 0, "route hex 00000000 -> 0");
+
     return assert_summary();
 }
 
