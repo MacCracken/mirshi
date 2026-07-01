@@ -4,6 +4,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-30
+
+**Net band — UDP + net_config.** agnos UDP tools (dig/DNS-class) can now send + receive datagrams
+through mirshi, and `net_config#61` exposes the real container-netns config — so a ring-3 resolver
+can target the on-subnet DNS. Supervisor-emulated over the same slot table ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)).
+
+### Added
+- **UDP** (`src/dispatch.cyr`): `udp_bind#51` (a bound non-blocking DGRAM socket, `SLOT_UDP`, the
+  bound port stashed so `udp_send` can find it), `udp_send#52` (**per-datagram egress check** →
+  `sendto` from the socket bound to the packed source port), `udp_recv#53` (`recvfrom` + the
+  **sender `addr_out` repack** `{ip@0, port@8}`, no EOF inversion — UDP has none), `udp_unbind#54`.
+  Ingress loopback-default like TCP listen (`--net-listen-any` binds all interfaces).
+- **`net_config#61`** (`src/dispatch.cyr`): a supervisor EMULATE getter that reads the **real
+  container-netns config** — field 2 (gateway) from `/proc/net/route`, field 3 (DNS) from
+  `/etc/resolv.conf`, field 0 (host IP) via a `getsockname` trick; field 1 (netmask) is 0-unset;
+  a bad field → −1; any missing file / parse failure → 0 (unset). `--net`-gated. Minor infoleak
+  (the child sees the container's gateway/DNS), accepted.
+- **Pure parsers** (`src/translate.cyr`, +7 unit assertions): `net_parse_dotquad` (dotted-quad →
+  kernel-ip4) and `net_parse_hex32` (the `/proc/net/route` little-endian gateway hex).
+- **New gates**: `scripts/it/net_udp.sh` (an agnos UDP round-trip against a python echo server,
+  verifying the payload **and** the `addr_out` `{ip,port}` + per-datagram egress denial) and
+  `scripts/it/net_config.sh` (mirshi's gateway/DNS compared against the environment's own files).
+  Both CI-wired.
+
+### Security
+- UDP `udp_send#52` is **egress-checked per datagram** (`--net-allow`, default-deny) — the dst can
+  change every call, so each is re-checked (SSRF-hardened, same policy as TCP connect). The UDP +
+  net_config handlers were adversarially reviewed (no fd/slot leak, OOB, buffer over-read, or crash).
+
+### Changed
+- **Toolchain pin → `6.3.16`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.2.0] — 2026-06-30
 
 **Net band — TCP server.** agnos server tools can now accept inbound TCP connections through

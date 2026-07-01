@@ -5,13 +5,15 @@
 
 ## Version
 
-**1.2.0** — 2026-06-30. **Net band — TCP server** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
-agnos server tools can accept inbound TCP through mirshi: `sock_listen#56` (merges bind+listen) /
-`sock_accept#57`, supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table (conn / listen);
-`sock_close#50` on a listener **reaps its accepted children**. Ingress is **loopback-only by default**
-(`--net-listen-any` binds all interfaces) — the sandboxed child's server isn't network-reachable unless
-asked. Proven by an agnos server accepting a real client (`scripts/it/net_server.sh`, both bind modes).
-UDP / ICMP / `net_config#61` follow in v1.3.0–v1.4.0. **1.1.0** — Net band TCP client (the first post-v1
+**1.3.0** — 2026-06-30. **Net band — UDP + net_config** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
+agnos UDP tools (dig/DNS-class) send + receive datagrams through mirshi: `udp_bind#51`/`send#52`/`recv#53`/
+`unbind#54` supervisor-emulated (a `SLOT_UDP` in the unified slot table; per-datagram egress on send; the
+sender `addr_out` repack on recv). `net_config#61` reads the **real container-netns config** (gateway from
+`/proc/net/route`, DNS from `/etc/resolv.conf`, host-IP via a getsockname trick; netmask 0-unset). Proven by
+an agnos UDP round-trip + net_config matching the netns config (`scripts/it/net_udp.sh` + `net_config.sh`).
+Only ICMP (#55) remains, in **v1.4.0**. **1.2.0** — Net band TCP server: `sock_listen#56`/`accept#57`
+supervisor-emulated; `close#50` on a listener reaps its children; ingress loopback-default (`--net-listen-any`
+to expose). **1.1.0** — Net band TCP client (the first post-v1
 expansion): `sock_connect#47`/`send#48`/`recv#49`/`close#50` supervisor-emulated (the conn_id slot table;
 child never holds a socket fd; seccomp allowlist unchanged); egress **default-deny** (`--net`/`--net-allow`,
 SSRF-hardened, brute-force-verified over all 2³²); proven by an agnos HTTP-GET round-trip. **1.0.0** — the
@@ -36,7 +38,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.15` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.16` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -79,16 +81,18 @@ paths in the child red zone + repack output structs at the exit stop
   `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
   default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
   The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
-- Net band (1.1.0 client + 1.2.0 server, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
-  `sock_connect#47`/`send#48`/`recv#49`/`close#50` + `sock_listen#56`/`accept#57` supervisor-emulated over a
-  unified 8-slot `{fd, kind, parent}` table (conn / listen; `close#50` reaps a listener's children). Egress
-  default-deny via `--net`/`--net-allow`; ingress loopback-default via `--net-listen-any`. UDP/ICMP/`net_config#61` are v1.3–1.4.
+- Net band (1.1.0 client + 1.2.0 server + 1.3.0 UDP/net_config, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
+  `sock_*#47–50/56/57` + `udp_*#51–54` supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table
+  (TCP conn / TCP listen / UDP; `close#50` reaps a listener's children). `net_config#61` reads the real netns
+  gateway/DNS/host-IP. Egress default-deny (`--net`/`--net-allow`, per-datagram on UDP); ingress loopback-default
+  (`--net-listen-any`). Only `icmp_echo#55` remains (v1.4.0).
 
 ## Tests
 
 - `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer + the M1/M2
   translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
-  0–61's disposition) + the pure net helpers/egress policy (1.1.0); **218 assertions**, hermetic)
+  0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0);
+  **225 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -132,6 +136,12 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/net_server.sh` — 1.2.0 net-band TCP-server gate (CI step, after net_io): an agnos
   server (`sock_listen#56`/`accept#57`/recv/send/`close#50`-reap) accepts a real python client and
   replies, in both bind modes (loopback default + `--net-listen-any`). Needs python3.
+- `scripts/it/net_udp.sh` — 1.3.0 net-band UDP gate (CI step, after net_server): an agnos UDP client
+  (`udp_bind#51`/`send#52`/`recv#53`/`unbind#54`) round-trips against a python echo server — the reply
+  + the sender `addr_out` {ip,port} + per-datagram egress denial. Needs python3.
+- `scripts/it/net_config.sh` — 1.3.0 net_config#61 gate (CI step, after net_udp): mirshi's netns
+  gateway/DNS (from `/proc/net/route` + `/etc/resolv.conf`) match the environment's own files; netmask
+  0-unset, bad field -1, `--net` gating. Needs python3.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -233,11 +243,18 @@ mirshi — `sock_listen#56` (bind+listen) / `sock_accept#57`, supervisor-emulate
 Ingress is **loopback-only by default** (`--net-listen-any` binds all interfaces) — the safe posture, so a
 sandboxed child's server isn't network-reachable unless asked. Proven by an agnos server accepting a real
 client (`scripts/it/net_server.sh`, both bind modes); the server + reap handlers adversarially reviewed (no
-fd/slot leak, double/cross-close, or OOB; the reap invariant pinned in a comment). Next: **v1.3.0** UDP +
-`net_config#61`, then **v1.4.0** ICMP.
+fd/slot leak, double/cross-close, or OOB; the reap invariant pinned in a comment).
+
+**1.3.0 — net band, UDP + net_config** — ✅ shipped 2026-06-30: agnos UDP tools (dig/DNS-class) send +
+receive datagrams — `udp_bind#51`/`send#52`/`recv#53`/`unbind#54` supervisor-emulated (a `SLOT_UDP` in the
+unified table; **per-datagram egress** on send; the sender `addr_out` {ip,port} repack on recv; no EOF).
+`net_config#61` reads the **real container-netns config** (gateway from `/proc/net/route`, DNS from
+`/etc/resolv.conf`, host-IP via a getsockname trick; netmask 0-unset; bad field -1). Proven by an agnos UDP
+round-trip + net_config matching the environment's files (`scripts/it/net_udp.sh` + `net_config.sh`); the UDP
++ net_config handlers adversarially reviewed (no leak/OOB/over-read/crash). Only **v1.4.0** ICMP remains.
 
 **Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 —
-TCP client + server shipped (1.1.0/1.2.0), UDP/ICMP ongoing (v1.3–1.4); **multi-process** agnos
+TCP client + server + UDP + net_config shipped (1.1–1.3), only ICMP remains (v1.4.0); **multi-process** agnos
 (`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
 **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
 compat layer), v2+. Each is its own validation surface; the translation core built here runs from both

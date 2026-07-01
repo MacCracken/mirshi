@@ -8,9 +8,9 @@
 > tests** (`tests/mirshi.tcyr`: `xlat-nr`, `fs-nr`, `xlat-coverage` assert
 > `agnos_to_linux_nr` for every number 0–61 + boundaries). Changing a row is a
 > deliberate contract change — update the code, this doc, **and** the freeze test together.
-> The v1.0 **core is frozen**; the **net band** (#47–50 client / #56–57 server) is a documented
-> **post-v1 extension** (v1.1.0 / v1.2.0, EMULATE under `--net` — footnote ²), the remaining
-> net numbers (#51–55, #61) still ENOSYS pending v1.3.0–v1.4.0.
+> The v1.0 **core is frozen**; the **net band** (#47–50 TCP client / #56–57 TCP server / #51–54 UDP /
+> `net_config#61`) is a documented **post-v1 extension** (v1.1.0–v1.3.0, EMULATE under `--net` — footnote ²); only `icmp_echo#55`
+> remains ENOSYS, pending v1.4.0.
 
 ## Dispositions
 
@@ -76,17 +76,17 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 48 | sock_send | EMULATE ² | — | net band client (v1.1.0): pvm-staged `send` (`MSG_NOSIGNAL`) |
 | 49 | sock_recv | EMULATE ² | — | net band client (v1.1.0): **inverted EOF** (0=WOULD_BLOCK, −1=EOF) |
 | 50 | sock_close | EMULATE ² | — | net band (v1.1.0): free the slot; a LISTEN slot reaps children (v1.2.0) |
-| 51 | udp_bind | ENOSYS | — | net band — pending v1.3.0 (UDP) |
-| 52 | udp_send | ENOSYS | — | net band — pending v1.3.0 (UDP) |
-| 53 | udp_recv | ENOSYS | — | net band — pending v1.3.0 (UDP) |
-| 54 | udp_unbind | ENOSYS | — | net band — pending v1.3.0 (UDP) |
+| 51 | udp_bind | EMULATE ² | — | net band UDP (v1.3.0): bound DGRAM socket; loopback-default |
+| 52 | udp_send | EMULATE ² | — | net band UDP (v1.3.0): per-datagram egress; packed `(sport<<16)\|dport` |
+| 53 | udp_recv | EMULATE ² | — | net band UDP (v1.3.0): sender `addr_out` {ip@0, port@8}; no EOF |
+| 54 | udp_unbind | EMULATE ² | — | net band UDP (v1.3.0): free the SLOT_UDP |
 | 55 | icmp_echo | ENOSYS | — | net band — pending v1.4.0 (ICMP) |
 | 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
 | 59 | flock | ENOSYS | — | |
 | 60 | winsize | ENOSYS | — | graphics — post-v1 |
-| 61 | net_config | ENOSYS | — | net band — pending v1.3.0 (netns config read) |
+| 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
 
 Any number > 61 (and the undefined gaps) → **ENOSYS**.
 
@@ -98,12 +98,14 @@ lexically sanitized (`sanitize_rootrel`). The fd-based ops (`read`/`write`/`lsee
 `close`/`getdents`) ride a fd from a confined `open`, so they are transitively confined.
 Without `--root`, the peers in the table above apply (transparent pass-through).
 
-² **Net band (post-v1 extension, `--net`).** #47–50 (TCP client, v1.1.0) and #56/#57 (TCP server,
-v1.2.0) are **supervisor-EMULATE** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
-the supervisor owns the sockets via an 8-slot `conn_id/listener_id → host fd` table; the child never
-holds a socket fd. Enabled by `--net` / `--net-allow` (egress default-deny) / `--net-listen-any` (ingress
-loopback-default). **Without `--net` they return ENOSYS** (agnos `-1`). UDP #51–54, ICMP #55, and
-`net_config#61` remain ENOSYS pending v1.3.0–v1.4.0 (see the [roadmap net band arc](../development/roadmap.md)).
+² **Net band (post-v1 extension, `--net`).** #47–50 (TCP client, v1.1.0), #56/#57 (TCP server,
+v1.2.0), #51–54 (UDP) + `net_config#61` (v1.3.0) are **supervisor-EMULATE**
+([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)): the supervisor owns the sockets
+via an 8-slot `{fd,kind,parent}` table (TCP conn / TCP listen / UDP); the child never holds a socket
+fd. Enabled by `--net` / `--net-allow` (egress default-deny) / `--net-listen-any` (ingress
+loopback-default). **Without
+`--net` they return ENOSYS** (agnos `-1`). Only `icmp_echo#55` remains ENOSYS, pending v1.4.0 (see
+the [roadmap net band arc](../development/roadmap.md)).
 
 ## The runnable surface (v1)
 
