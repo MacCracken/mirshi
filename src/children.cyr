@@ -27,12 +27,14 @@ enum MirshiChild {
     C_STATE = 24;             # CS_FREE / CS_RUNNING / CS_BLOCKED / CS_EXITED
     C_EXIT_CODE = 32;          # agnos exit code, retained until waitpid#4 claims it
     C_WAIT_TARGET = 40;        # the agnos_pid this child is parked in waitpid#4 on
-    C_REAPED = 48;             # 1 once waitpid#4 has claimed the exit code
+    C_REAPED = 48;             # RESERVED (unused): waitpid#4 reaping frees the slot via _child_free
+                               # (-> CS_FREE) rather than a flag; C_STATE is authoritative, not this
     C_NEEDS_ATTACH = 56;       # 1 = a freshly-forked grandchild awaiting its first-stop attach
     C_AT_ENTRY = 64;           # enter/exit ptrace toggle (was a _trace_run local)
     C_AGNOS_NR = 72;           # agnos syscall nr captured at enter (was a _trace_run local)
     C_STRAT = 80;              # dispatcher verdict at enter (was a _trace_run local)
-    C_PENDING_SIG = 88;        # signal to inject on the next PTRACE_SYSCALL resume
+    C_PENDING_SIG = 88;        # RESERVED (unused in v1.5.0): the resume-immediately loop delivers a
+                               # signal inline, no cross-iteration carry; reserved for v1.6.0 signals
     C_XLAT_EMU_RET = 96;       # enter->exit EMULATE/ENOSYS return carry (was _xlat_emu_ret)
     C_M2_OUT_PTR = 104;        # fs exit-stop repack carry (was _m2_out_ptr)
     C_M2_OUT_CAP = 112;        #   "     (was _m2_out_cap)
@@ -69,6 +71,29 @@ fn _child_count(): i64 {
         i = i + 1;
     }
     return c;
+}
+
+# Free a record slot after its exit code has been claimed (waitpid#4 reaped it), so the slot index
+# is reusable. The agnos pid is NEVER reused (the monotonic coiner), so a later waitpid on the freed
+# pid finds no record -> agnos -1 (correctly "already reaped / unknown pid").
+fn _child_free(t): i64 {
+    store64(t + C_STATE, CS_FREE);
+    return 0;
+}
+
+# True (1) iff at least one record is CS_RUNNING — a tracee that can still generate a wait event.
+# If NONE are running but some are BLOCKED (all parked in waitpid#4), no target can ever exit to
+# wake them, so wait4(-1) would block forever and wedge the single-threaded supervisor — a self-wait
+# or wait-cycle. The loop checks this before each wait4 to break such a deadlock (0.6.0 hardening: a
+# misbehaving/hostile child must degrade gracefully, never wedge the sandbox deputy).
+fn _any_running(): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        if (load64(tbl + i * CHILD_REC_SIZE + C_STATE) == CS_RUNNING) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.

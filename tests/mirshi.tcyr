@@ -151,7 +151,7 @@ fn main() {
     test_group("xlat-coverage");
     assert_eq(agnos_to_linux_nr(0), 0 - 1, "exit#0 -> no peer (EXIT: exit_group, special)");
     assert_eq(agnos_to_linux_nr(3), 0 - 1, "spawn#3 has no Linux peer (EMULATE at the loop level, v1.5.0)");
-    assert_eq(agnos_to_linux_nr(4), 0 - 1, "waitpid#4 -> ENOSYS (multi-proc)");
+    assert_eq(agnos_to_linux_nr(4), 0 - 1, "waitpid#4 has no Linux peer (EMULATE at the loop level, v1.5.0)");
     assert_eq(agnos_to_linux_nr(11), 0 - 1, "mount#11 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(13), 0 - 1, "reboot#13 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(14), 0 - 1, "pause#14 -> ENOSYS");

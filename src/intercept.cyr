@@ -297,6 +297,92 @@ fn _do_spawn(pid, regs, rec): i64 {
     return _net_emu(pid, regs, load64(crec + C_AGNOS_PID));
 }
 
+# The agnos-visible exit code for an EXITED target record `t`: its retained exit_code — EXCEPT a
+# child that died BEFORE it ever attached (execveat failed / killed pre-first-stop, so needs_attach
+# is still set) surfaces as agnos -1, since its stashed code is a mirshi-internal EXECVE_FAILED/
+# BOUND_FAILED, not a real agnos exit code. (WIFSIGNALED targets already carry exit_code -1.)
+fn _wait_code(t): i64 {
+    if (load64(t + C_NEEDS_ATTACH) == 1) { return 0 - 1; }
+    return load64(t + C_EXIT_CODE);
+}
+
+# waitpid#4(pid) -> exit_code / -1. A SUPERVISOR-CONTROL op (may PARK the caller — leave it stopped —
+# which needs loop cooperation, so handled at the loop level like spawn#3). If the target already
+# EXITED, claim it (inject its code, free its slot). If still alive, PARK the caller (BLOCKED, left
+# stopped at its enter-stop) until the target exits — the WIFEXITED handler (_wake_waiters) injects
+# the code into this record's carry + releases it. Unknown / already-reaped target -> agnos -1. MVP:
+# waits on ANY known pid (not scoped to direct children). `rec` is the CALLER's record.
+fn _do_waitpid(pid, regs, rec): i64 {
+    var target = decode_arg(regs, 0);
+    var t = _child_find_by_agnos(target);
+    if (t == 0) { return _net_emu(pid, regs, 0 - 1); }         # unknown / already reaped
+    if (load64(t + C_STATE) == CS_EXITED) {
+        # Zombie-claim fast path: inject the retained code, free the target slot.
+        var code = _wait_code(t);
+        _child_free(t);
+        return _net_emu(pid, regs, code);
+    }
+    # Target still alive: PARK the caller. Skip the syscall (orig_rax=-1) so on resume it lands at
+    # its exit stop; mark BLOCKED so the loop leaves it stopped. The code is injected into
+    # C_XLAT_EMU_RET by _wake_waiters and written to rax at the caller's exit stop.
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    store64(rec + C_STATE, CS_BLOCKED);
+    store64(rec + C_WAIT_TARGET, target);
+    return STRAT_EMULATE;
+}
+
+# When agnos pid `target` exits, release any waiters parked in waitpid#4 on it: for EACH BLOCKED
+# record whose wait_target == target, stash the target's agnos-visible exit code into the waiter's
+# carry, mark it RUNNING, and PTRACE_SYSCALL it — the waiter resumes to its waitpid exit stop where
+# the loop injects the code into rax. Fan-out (many waiters on one pid all wake). Once claimed, the
+# target's slot is freed (its host zombie was already reaped by the wait4(-1) that drove us here).
+fn _wake_waiters(target): i64 {
+    var t = _child_find_by_agnos(target);
+    if (t == 0) { return 0; }
+    var code = _wait_code(t);
+    var tbl = _child_tbl();
+    var i = 0;
+    var woke = 0;
+    while (i < MAX_CHILDREN) {
+        var w = tbl + i * CHILD_REC_SIZE;
+        if (load64(w + C_STATE) == CS_BLOCKED) {
+            if (load64(w + C_WAIT_TARGET) == target) {
+                store64(w + C_XLAT_EMU_RET, code);          # the waitpid#4 return (injected at exit)
+                store64(w + C_STATE, CS_RUNNING);
+                pt(PTRACE_SYSCALL, load64(w + C_HOST_PID), 0, 0);   # release the parked waiter
+                woke = 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (woke == 1) { _child_free(t); }   # all parked waiters claimed the target -> free its slot
+    return 0;
+}
+
+# Break a wait deadlock — a self-wait (a child waitpids its own agnos pid) or a wait-cycle (A waits
+# B, B waits A), or the last runnable child exiting with only parked waiters left. In all of these no
+# CS_RUNNING tracee remains, so no target can ever exit to wake a parker, and wait4(-1) would block
+# forever, WEDGING the single-threaded supervisor (worse than a hung program — the sandbox deputy
+# itself hangs, holding host resources). The loop calls this when _any_running()==0: FAIL every
+# parked waiter with agnos -1 and resume it to its waitpid exit stop. A program that then busy-retries
+# waitpid just spins in userspace (bounded by rlimits / external kill), never wedging the supervisor.
+# (0.6.0 hardening: a misbehaving/hostile child degrades gracefully, never wedges mirshi.)
+fn _break_deadlock(): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        var w = tbl + i * CHILD_REC_SIZE;
+        if (load64(w + C_STATE) == CS_BLOCKED) {
+            store64(w + C_XLAT_EMU_RET, 0 - 1);                 # waitpid -> agnos -1 (target never wakes)
+            store64(w + C_STATE, CS_RUNNING);
+            pt(PTRACE_SYSCALL, load64(w + C_HOST_PID), 0, 0);   # resume to its waitpid exit stop
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Consume the post-execve SIGTRAP stop (delivered BEFORE options are set, so no
 # 0x80 bit) and set ptrace options ONCE. Returns -1 when attached OK (proceed),
 # else a >= 0 mirshi exit code to propagate immediately (the child died or
@@ -434,6 +520,10 @@ fn _trace_run(root_pid): i64 {
     pt(PTRACE_SYSCALL, root_pid, 0, 0);
 
     while (1 == 1) {
+        # Deadlock guard: if no child is left running, no wait event will ever arrive and wait4(-1)
+        # would wedge the supervisor (a self-wait / wait-cycle). Break parked waiters (-> agnos -1)
+        # before blocking. Cheap (a MAX_CHILDREN scan) vs the ptrace-stop cost it precedes.
+        if (_any_running() == 0) { _break_deadlock(); }
         var wpid = _wait_any(status);
         if (wpid < 0) { _emit(2, "mirshi: waitpid failed\n"); return WAIT_FAILED; }
         var rec = _child_find_by_host(wpid);
@@ -447,12 +537,13 @@ fn _trace_run(root_pid): i64 {
                 store64(rec + C_EXIT_CODE, WEXITSTATUS(st));   # incl. exit#0 -> exit_group
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return WEXITSTATUS(st); }   # ROOT -> supervisor exit
-                # non-root: record kept (BITE 8 wakes waitpid#4 waiters); the child is gone, no resume.
+                _wake_waiters(load64(rec + C_AGNOS_PID));      # release any waitpid#4 parkers on it
             }
             if (WIFSIGNALED(st) == 1) {
-                store64(rec + C_EXIT_CODE, 0 - 1);   # killed by signal -> agnos -1 (BITE 8 refines)
+                store64(rec + C_EXIT_CODE, 0 - 1);   # killed by signal -> agnos -1 (waitpid#4 sees -1)
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return 128 + WTERMSIG(st); }
+                _wake_waiters(load64(rec + C_AGNOS_PID));
             }
             if (WIFSTOPPED(st) == 1) {
                 if (load64(rec + C_NEEDS_ATTACH) == 1) {
@@ -473,13 +564,16 @@ fn _trace_run(root_pid): i64 {
                         pt(PTRACE_GETREGS, wpid, 0, regs);
                         var enr = decode_nr(regs);
                         store64(rec + C_AGNOS_NR, enr);
-                        # spawn#3 is a SUPERVISOR-CONTROL op (fork a new tracee), handled here at the
-                        # loop level not in translate_dispatch (BITE 7); all else -> normal translation.
-                        if (enr == 3) {
-                            store64(rec + C_STRAT, _do_spawn(wpid, regs, rec));
-                        } else {
-                            store64(rec + C_STRAT, translate_dispatch(wpid, regs));
-                        }
+                        # spawn#3 + waitpid#4 are SUPERVISOR-CONTROL ops (fork a new tracee / park the
+                        # caller), handled here at the loop level not in translate_dispatch — they need
+                        # loop cooperation (a new tracee to attach; the caller left stopped). Everything
+                        # else -> normal per-syscall translation.
+                        var verdict = 0;
+                        var handled = 0;
+                        if (enr == 3) { verdict = _do_spawn(wpid, regs, rec); handled = 1; }
+                        if (enr == 4) { verdict = _do_waitpid(wpid, regs, rec); handled = 1; }
+                        if (handled == 0) { verdict = translate_dispatch(wpid, regs); }
+                        store64(rec + C_STRAT, verdict);
                         # Save this child's dispatch carry into its record; the globals are then
                         # free for the next child's stop (the isolation this whole arc buys).
                         store64(rec + C_XLAT_EMU_RET, _xlat_emu_ret);
@@ -527,7 +621,11 @@ fn _trace_run(root_pid): i64 {
                         }
                         store64(rec + C_AT_ENTRY, 1);
                     }
-                    pt(PTRACE_SYSCALL, wpid, 0, 0);   # resume the serviced child (syscall stop: no signal)
+                    # Resume the serviced child — UNLESS waitpid#4 just PARKED it (BLOCKED; left
+                    # stopped at its enter-stop until its target exits, when _wake_waiters releases it).
+                    if (load64(rec + C_STATE) != CS_BLOCKED) {
+                        pt(PTRACE_SYSCALL, wpid, 0, 0);
+                    }
                 } else {
                     # Non-syscall signal stop: SUPPRESS a group-stop (resume with no signal, the
                     # ptrace-correct restart), FORWARD a genuine signal-delivery stop. Resumed

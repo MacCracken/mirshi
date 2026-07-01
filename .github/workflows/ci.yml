@@ -183,6 +183,14 @@ jobs:
         # small process tree. Needs the same-uid ptrace requirement.
         run: bash scripts/it/spawn.sh
 
+      - name: Multi-process — waitpid#4 (v1.5.0)
+        # v1.5.0 multi-process (BITE 8, milestone): an agnos parent sys_spawn#3's a child and
+        # sys_waitpid#4's it, getting the exact exit code via BOTH the park+wake path (the parent is
+        # left stopped — not blocking the supervisor — until the child exits) and the zombie fast-path
+        # (claim an already-exited child's retained code); waiting on a reaped pid returns -1. Needs
+        # the same-uid ptrace requirement.
+        run: bash scripts/it/waitpid.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

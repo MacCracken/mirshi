@@ -34,7 +34,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
 | 2 | getpid | EXECUTE | `getpid` (39) | number differs |
 | 3 | spawn | EMULATE | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
-| 4 | waitpid | ENOSYS | — | multi-process — post-v1 |
+| 4 | waitpid | EMULATE | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
 | 6 | close | EXECUTE | `close` (3) | |
 | 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../../src/translate.cyr)); mode 0600 on `O_CREAT` |
