@@ -64,6 +64,15 @@ enum MirshiConfine {
 # in the supervisor BEFORE fork; read by the dispatcher to choose openat2 vs open(2).
 var _confine_active = 0;
 
+# Net band (v1.1.0, docs/adr/0012): whether the band is enabled (--net / --net-allow) + the
+# parsed egress allow-list (a packed {u64 net, u64 prefix} array + count) the emulated
+# connect/udp handlers check via net_egress_ok BEFORE opening a socket. Set by intercept_run
+# in the supervisor (run mode only). Deny-all when _net_count == 0 (default-deny). The
+# handlers that read these land in the follow-up bite; the plumbing is established here.
+var _net_active = 0;
+var _net_entries = 0;
+var _net_count = 0;
+
 # A supervisor-side 24-byte struct open_how staging buffer (lazily allocated once —
 # never per call, same discipline as _emu_ts_buf), filled then staged into the child.
 var _how_buf = 0;

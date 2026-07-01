@@ -34,11 +34,13 @@ include "src/intercept.cyr"
 
 fn usage(): i64 {
     _emit(2, "mirshi — AGNOS↔Linux mirror-shim\n");
-    _emit(2, "usage: mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] <agnos-elf>\n");
+    _emit(2, "usage: mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] [--net | --net-allow <cidrs>] <agnos-elf>\n");
     _emit(2, "  runs <agnos-elf> by translating + executing its agnos syscalls (no QEMU).\n");
     _emit(2, "  --selftest-trace  trap-log mode: emit the bare agnos syscall stream, no translation.\n");
     _emit(2, "  --no-seccomp      disable the bounding seccomp policy on the child (default: on).\n");
     _emit(2, "  --root <dir>      confine the child's filesystem to <dir> (openat2 RESOLVE_IN_ROOT).\n");
+    _emit(2, "  --net             enable the net band (v1.1.0); default egress: deny-all.\n");
+    _emit(2, "  --net-allow <c>   enable the net band + allow egress to <c> = CIDR[,CIDR...] (e.g. 10.0.0.0/8).\n");
     _emit(2, "  flags, if given, must precede <agnos-elf>.\n");
     return 2;
 }
@@ -51,6 +53,8 @@ fn main(): i64 {
     var selftest = 0;
     var bound = 1;                 # bounding seccomp policy on the child — default ON
     var rootpath = 0;             # 0 = no path confinement (transparent pass-through)
+    var net_enabled = 0;          # --net / --net-allow: enable the net band (v1.1.0)
+    var net_policy = 0;           # --net-allow <cidrs> string (0 = deny-all default)
     var i = 1;
     # Consume leading flags; stop (break) at the first non-flag = the target.
     while (i < n) {
@@ -68,7 +72,19 @@ fn main(): i64 {
                     rootpath = argv(i + 1);
                     i = i + 2;
                 } else {
-                    break;
+                    if (streq(a, "--net") == 1) {
+                        net_enabled = 1;
+                        i = i + 1;
+                    } else {
+                        if (streq(a, "--net-allow") == 1) {
+                            if (i + 1 >= n) { return usage(); }   # --net-allow needs a <cidrs> argument
+                            net_enabled = 1;
+                            net_policy = argv(i + 1);
+                            i = i + 2;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -83,8 +99,29 @@ fn main(): i64 {
         }
     }
 
+    # Net band (v1.1.0): validate + load the egress allow-list FAIL-CLOSED before running —
+    # a malformed --net-allow must abort, never run with a broken / half-parsed policy
+    # (docs/adr/0012). The entries buffer lives in the supervisor heap (read by the net
+    # handlers after fork). --net with no --net-allow leaves _net_count = 0 = deny-all.
+    var net_active = 0;
+    var net_entries = 0;
+    var net_count = 0;
+    if (net_enabled == 1) {
+        net_active = 1;
+        net_entries = alloc(NET_ALLOW_MAX * ENTRY_SIZE);
+        if (net_policy != 0) {
+            net_count = net_parse_allow(net_policy, net_entries, NET_ALLOW_MAX);
+            if (net_count < 0) {
+                _emit(2, "mirshi: --net-allow policy malformed — refusing to run\n");
+                return usage();
+            }
+        } else {
+            _emit(2, "mirshi: WARNING — --net with no --net-allow: all egress DENIED (default-deny)\n");
+        }
+    }
+
     var target = argv(i);
-    return intercept_run(target, selftest, bound, rootpath);
+    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count);
 }
 
 var r = main();

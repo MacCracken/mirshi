@@ -40,5 +40,14 @@ else
     echo "FAIL: missing target -> rc=$rc (want 127)" >&2; fail=1
 fi
 
+# (4) malformed --net-allow -> FAIL-CLOSED usage + exit 2 (never run with a broken egress
+#     policy; the v1.1.0 net band, docs/adr/0012). The policy is validated before fork.
+run --net-allow "not-a-cidr" "$sbox/x"
+if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q "malformed"; then
+    echo "OK: malformed --net-allow -> fail-closed exit 2"
+else
+    echo "FAIL: malformed --net-allow -> rc=$rc (want 2) / stderr missing 'malformed'" >&2; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "cli: FAILED" >&2; exit 1; fi
 echo "OK: cli — frozen CLI contract (usage on misuse + exit-code map)"
