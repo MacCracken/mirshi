@@ -147,6 +147,13 @@ jobs:
         # response body comes back on stdout. Needs python3 + the same-uid ptrace requirement.
         run: bash scripts/it/net_io.sh
 
+      - name: Net band — TCP server (v1.2.0)
+        # v1.2.0 net band (docs/adr/0012): an agnos server under mirshi does sock_listen#56
+        # (loopback bind by default; --net-listen-any binds all ifaces), sock_accept#57 an
+        # incoming connection, recv/send, and sock_close#50 the listener (reaping the accepted
+        # conn) — a python client gets the reply. Needs python3 + the same-uid ptrace requirement.
+        run: bash scripts/it/net_server.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

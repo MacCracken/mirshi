@@ -373,7 +373,7 @@ fn _trace_run(pid): i64 {
 }
 
 # Public entry: fork the agnos child, trace it to completion, return its code.
-fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_count): i64 {
+fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any): i64 {
     # Confinement (and the child rootfd setup) applies only in RUN mode — selftest
     # (SYSEMU) executes nothing, so the child's paths never reach the kernel.
     var rp = rootpath;
@@ -388,6 +388,7 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
         _net_active = 1;
         _net_entries = net_entries;
         _net_count = net_count;
+        _net_listen_any = net_listen_any;
     }
     var pid = sys_fork();
     if (pid < 0) {

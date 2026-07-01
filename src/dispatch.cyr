@@ -72,6 +72,9 @@ var _confine_active = 0;
 var _net_active = 0;
 var _net_entries = 0;
 var _net_count = 0;
+# --net-listen-any: sock_listen#56 binds INADDR_ANY (all interfaces, the faithful agnos behavior)
+# instead of the safe loopback-only default. Ingress posture (docs/adr/0012). Set by intercept_run.
+var _net_listen_any = 0;
 
 # A supervisor-side 24-byte struct open_how staging buffer (lazily allocated once —
 # never per call, same discipline as _emu_ts_buf), filled then staged into the child.
@@ -262,6 +265,14 @@ enum MirshiNetSys {
     SLOT_CONN = 1;
     SLOT_LISTEN = 2;
     CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
+    SYS_BIND = 49;
+    SYS_LISTEN = 50;
+    SYS_ACCEPT4 = 288;           # accept4 (not accept) — take the SOCK_NONBLOCK|CLOEXEC flags
+    SYS_SETSOCKOPT = 54;
+    SO_REUSEADDR = 2;
+    LISTEN_BACKLOG = 128;
+    LOOPBACK_IP = 0x7F000001;    # 127.0.0.1 in the agnos kernel-ip4 form (build_sockaddr_in bswaps it)
+    INADDR_ANY_IP = 0;           # 0.0.0.0 — the --net-listen-any bind (all interfaces)
 }
 
 # The supervisor-side conn_id/listener_id(0..7) slot table (lazy-alloc-once, like _how_buf).
@@ -361,6 +372,24 @@ fn _net_close_conn(pid, regs): i64 {
     if (cid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
     var b = _net_tbl() + cid * NET_SLOT_SIZE;
     if (load64(b + 8) == SLOT_FREE) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
+    # A LISTEN slot reaps its accepted children first (agnos #50 semantics): close + free every
+    # SLOT_CONN whose parent is this listener, so a server that closes its listener doesn't leak.
+    if (load64(b + 8) == SLOT_LISTEN) {
+        var tbl = _net_tbl();
+        var i = 0;
+        while (i < NET_SLOTS) {
+            var cb = tbl + i * NET_SLOT_SIZE;
+            if (load64(cb + 8) == SLOT_CONN) {
+                if (load64(cb + 16) == cid) {         # a child accepted from this listener
+                    syscall(HOST_CLOSE, load64(cb + 0));
+                    store64(cb + 0, 0 - 1);
+                    store64(cb + 8, SLOT_FREE);
+                    store64(cb + 16, 0 - 1);
+                }
+            }
+            i = i + 1;
+        }
+    }
     syscall(HOST_CLOSE, load64(b + 0));
     store64(b + 0, 0 - 1);
     store64(b + 8, SLOT_FREE);                    # free the slot
@@ -434,6 +463,52 @@ fn _net_recv(pid, regs): i64 {
         if (pvm_write(pid, child_buf, io, aret) != aret) { return _net_emu(pid, regs, 0 - 1); }
     }
     return _net_emu(pid, regs, aret);
+}
+
+# sock_listen#56(port) -> listen_id 0..7 / -1. Merges bind+listen. The supervisor creates a
+# non-blocking listening socket bound to LOOPBACK by default (safe: reachable only from
+# localhost / the same container); `--net-listen-any` binds INADDR_ANY (the faithful agnos
+# behavior, network-exposed — the ingress posture, docs/adr/0012). Recorded as a SLOT_LISTEN.
+fn _net_listen(pid, regs): i64 {
+    var port = decode_arg(regs, 0);
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    store32(sb + 40, 1);                                   # SO_REUSEADDR optval = 1 (reuse optval slot)
+    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, sb + 40, 4);   # optlen is by VALUE for setsockopt
+    var bind_ip = LOOPBACK_IP;
+    if (_net_listen_any == 1) { bind_ip = INADDR_ANY_IP; }
+    build_sockaddr_in(sb, bind_ip, port);
+    if (syscall(SYS_BIND, fd, sb, SOCKADDR_IN_SIZE) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    if (syscall(SYS_LISTEN, fd, LISTEN_BACKLOG) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);
+    store64(b + 8, SLOT_LISTEN);
+    store64(b + 16, 0 - 1);
+    return _net_emu(pid, regs, slot);                     # listen_id = slot index
+}
+
+# sock_accept#57(listen_id) -> conn_id / -1 (WOULD_BLOCK or bad id). Non-blocking. Verifies the
+# slot is a LISTEN, accept4()s the next pending connection (non-blocking + CLOEXEC), and records
+# the accepted fd in a FRESH SLOT_CONN whose parent is the listener (so close#50 reaps it). No
+# pending connection (-EAGAIN) or a bad listen_id -> agnos -1 (the server loops on -1).
+fn _net_accept(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var lb = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(lb + 8) != SLOT_LISTEN) { return _net_emu(pid, regs, 0 - 1); }   # not a listener
+    var cfd = syscall(SYS_ACCEPT4, load64(lb + 0), 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (cfd < 0) { return _net_emu(pid, regs, 0 - 1); }   # WOULD_BLOCK / error -> agnos -1
+    var slot = _net_slot_alloc();
+    if (slot < 0) { syscall(HOST_CLOSE, cfd); return _net_emu(pid, regs, 0 - 1); }   # table full
+    var cb = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(cb + 0, cfd);
+    store64(cb + 8, SLOT_CONN);
+    store64(cb + 16, lid);                               # parent = the listener (reap on close#50)
+    return _net_emu(pid, regs, slot);                    # conn_id = the new slot
 }
 
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
@@ -589,7 +664,9 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 47) { return _net_connect(pid, regs); }      # sock_connect -> conn_id / -1
         if (nr == 48) { return _net_send(pid, regs); }         # sock_send -> bytes / -1
         if (nr == 49) { return _net_recv(pid, regs); }         # sock_recv -> bytes / 0 WB / -1 EOF
-        if (nr == 50) { return _net_close_conn(pid, regs); }   # sock_close
+        if (nr == 50) { return _net_close_conn(pid, regs); }   # sock_close (reaps LISTEN children)
+        if (nr == 56) { return _net_listen(pid, regs); }       # sock_listen -> listen_id / -1
+        if (nr == 57) { return _net_accept(pid, regs); }       # sock_accept -> conn_id / -1
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg

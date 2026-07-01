@@ -41,6 +41,7 @@ fn usage(): i64 {
     _emit(2, "  --root <dir>      confine the child's filesystem to <dir> (openat2 RESOLVE_IN_ROOT).\n");
     _emit(2, "  --net             enable the net band (v1.1.0); default egress: deny-all.\n");
     _emit(2, "  --net-allow <c>   enable the net band + allow egress to <c> = CIDR[,CIDR...] (e.g. 10.0.0.0/8).\n");
+    _emit(2, "  --net-listen-any  sock_listen binds ALL interfaces (default: loopback only).\n");
     _emit(2, "  flags, if given, must precede <agnos-elf>.\n");
     return 2;
 }
@@ -55,6 +56,7 @@ fn main(): i64 {
     var rootpath = 0;             # 0 = no path confinement (transparent pass-through)
     var net_enabled = 0;          # --net / --net-allow: enable the net band (v1.1.0)
     var net_policy = 0;           # --net-allow <cidrs> string (0 = deny-all default)
+    var net_listen_any = 0;       # --net-listen-any: sock_listen binds all ifaces (default: loopback)
     var i = 1;
     # Consume leading flags; stop (break) at the first non-flag = the target.
     while (i < n) {
@@ -82,7 +84,13 @@ fn main(): i64 {
                             net_policy = argv(i + 1);
                             i = i + 2;
                         } else {
-                            break;
+                            if (streq(a, "--net-listen-any") == 1) {
+                                net_enabled = 1;
+                                net_listen_any = 1;
+                                i = i + 1;
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
@@ -121,7 +129,7 @@ fn main(): i64 {
     }
 
     var target = argv(i);
-    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count);
+    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any);
 }
 
 var r = main();
