@@ -19,7 +19,16 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
                                 # that flipping spawn#3 to EMULATE reopens (deliberately NOT
                                 # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 144;       # 18 x i64 fields
+    CHILD_REC_SIZE = 152;       # 19 x i64 fields
+    # --- v1.6.0 signalfd#18 constants ---
+    SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
+                                # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
+                                # write/close route bit-30-tagged fds to the net band BEFORE the
+                                # syscall, so a signalfd MUST clear bit 30 to reach mirshi's read#5.
+                                # Still way above any real child fd (rlimit caps them < 1024).
+    SIGNALFD_SLOTS = 8;         # per-child signalfd table size (a process rarely needs > 1-2)
+    SIGFD_SLOT_SIZE = 16;       # per slot {i64 watched_mask; i64 flags} — flags == -1 marks FREE
+    SFD_NONBLOCK = 2048;        # signalfd flag (agnos SFD_NONBLOCK); the MVP read is always non-blocking
     # --- record field offsets (all i64) ---
     C_AGNOS_PID = 0;            # the opaque guest-facing pid mirshi coined (root = 1)
     C_HOST_PID = 8;            # the real Linux pid (the wait4 / ptrace target)
@@ -43,6 +52,7 @@ enum MirshiChild {
     C_NET_TBL = 128;           # this child's net slot-table ptr (0 = not yet alloc'd)
     C_SIG_BLOCKED = 136;       # v1.6.0: the per-child BLOCKED signal mask (sigprocmask#17, `1<<sig`);
                                # a signal is deliverable iff (C_PENDING_SIG & ~C_SIG_BLOCKED) has it
+    C_SIGFD_TBL = 144;         # v1.6.0: this child's signalfd slot-table ptr (0 = not yet alloc'd)
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
@@ -132,6 +142,11 @@ fn _sig_lowest(mask): i64 {
     return 0;
 }
 
+# `mask` with signal `sig`'s bit CLEARED (signalfd#18 delivery consumes the pending bit). Pure.
+fn _sig_clear(mask, sig): i64 {
+    return mask & (0 - (1 << sig) - 1);   # mask & ~(1<<sig)
+}
+
 # The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.
 var _children = 0;
 var _next_agnos_pid = 1;        # 0 reserved (getppid=0 stays distinct); root child = 1
@@ -213,6 +228,7 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_M2_SCRATCH, 0);
             store64(b + C_NET_TBL, 0);
             store64(b + C_SIG_BLOCKED, 0);
+            store64(b + C_SIGFD_TBL, 0);
             return b;
         }
         i = i + 1;

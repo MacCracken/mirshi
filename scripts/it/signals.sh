@@ -70,5 +70,79 @@ else
     fail=1
 fi
 
+# ---- (2) sigprocmask#17 — the blocked-mask oldset round-trip (directly observable) ----------
+cat > "$sbox/sigmask.cyr" <<'EOF'
+include "lib/syscalls.cyr"
+fn main(): i64 {
+    var m15 = sigset_new(); sigset_add(m15, 15);   # SIGTERM
+    var m2 = sigset_new(); sigset_add(m2, 2);       # SIGINT
+    var empty = sigset_new();
+    var old = sigset_new();
+    var cur = sigset_new();
+    # SETMASK to {SIGTERM}; oldset must be the initial mask (0)
+    if (sys_sigprocmask(2, m15, old) != 0) { return 30; }
+    if (load64(old) != 0) { return 31; }
+    # BLOCK {SIGINT}; oldset must be {SIGTERM}; current must be {SIGTERM,SIGINT}
+    if (sys_sigprocmask(0, m2, old) != 0) { return 32; }
+    if (load64(old) != (1 << 15)) { return 33; }
+    if (sys_sigprocmask(0, empty, cur) != 0) { return 34; }        # BLOCK empty = no-op, cur = current
+    if (load64(cur) != ((1 << 15) | (1 << 2))) { return 35; }
+    # UNBLOCK {SIGTERM}; oldset must be {SIGTERM,SIGINT}; current must be {SIGINT}
+    if (sys_sigprocmask(1, m15, old) != 0) { return 36; }
+    if (load64(old) != ((1 << 15) | (1 << 2))) { return 37; }
+    if (sys_sigprocmask(0, empty, cur) != 0) { return 38; }
+    if (load64(cur) != (1 << 2)) { return 39; }
+    var msg = "SIGMASK-OK\n";
+    sys_write(1, msg, strlen(msg));
+    return 0;
+}
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/sigmask.cyr" "$sbox/sigmask" >/dev/null 2>&1
+set +e; out2="$(timeout 20 "$mirshi" "$sbox/sigmask" 2>/dev/null)"; rc2=$?; set -e
+if [ "$rc2" -eq 0 ] && printf '%s' "$out2" | grep -q "SIGMASK-OK"; then
+    echo "OK: sigprocmask#17 — BLOCK/UNBLOCK/SETMASK + oldset round-trips the previous mask"
+else
+    echo "FAIL: sigprocmask rc=$rc2 out='$(printf '%s' "$out2")' (30-39 = wrong mask/oldset at that step)" >&2
+    fail=1
+fi
+
+# ---- (3) signalfd#18 + read#5 delivery — the full kill -> observe chain ----------------------
+cat > "$sbox/sigfd.cyr" <<'EOF'
+include "lib/syscalls.cyr"
+fn main(): i64 {
+    var m = sigset_new(); sigset_add(m, 10);        # watch SIGUSR1 (10)
+    var sfd = sys_signalfd(0 - 1, m, 0);            # new signalfd
+    if (sfd < 0) { return 30; }
+    var buf[8];
+    if (sys_read(sfd, &buf, 8) != (0 - 1)) { return 31; }   # nothing pending -> non-blocking -1
+    if (sys_kill(1, 10) != 0) { return 32; }        # kill self (root) with SIGUSR1 -> pending
+    if (sys_read(sfd, &buf, 8) != 8) { return 33; }        # deliver: 8 bytes
+    if (load64(&buf) != 10) { return 34; }                 # ...the raw signal number 10
+    if (sys_read(sfd, &buf, 8) != (0 - 1)) { return 35; }   # bit consumed -> -1 again
+    if (sys_kill(1, 15) != 0) { return 36; }        # SIGTERM pending but NOT watched by this signalfd
+    if (sys_read(sfd, &buf, 8) != (0 - 1)) { return 37; }   # ...so not delivered -> -1
+    # a FAILED delivery (bad buffer) must NOT consume the pending bit -> the signal is not lost
+    if (sys_kill(1, 10) != 0) { return 40; }        # SIGUSR1 pending again
+    if (sys_read(sfd, 0, 8) != (0 - 1)) { return 41; }      # NULL buffer -> pvm_write fails -> -1
+    if (sys_read(sfd, &buf, 8) != 8) { return 42; }        # signal preserved -> now delivered
+    if (load64(&buf) != 10) { return 43; }
+    var msg = "SIGNALFD-OK\n";
+    sys_write(1, msg, strlen(msg));
+    return 0;
+}
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/sigfd.cyr" "$sbox/sigfd" >/dev/null 2>&1
+set +e; out3="$(timeout 20 "$mirshi" "$sbox/sigfd" 2>/dev/null)"; rc3=$?; set -e
+if [ "$rc3" -eq 0 ] && printf '%s' "$out3" | grep -q "SIGNALFD-OK"; then
+    echo "OK: signalfd#18 + read#5 — kill sets pending, read delivers the raw signal number (10), watch-filtered"
+else
+    echo "FAIL: signalfd rc=$rc3 out='$(printf '%s' "$out3")' (31=empty-not--1, 33/34=delivery, 35=not-consumed, 37=watch-filter)" >&2
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "signals: FAILED" >&2; exit 1; fi
-echo "OK: signals — kill#16 scope/validation + pause#14 bounded-yield (BITE 1)"
+echo "OK: signals — kill#16 + pause#14 + sigprocmask#17 + signalfd#18 read delivery (v1.6.0 complete)"

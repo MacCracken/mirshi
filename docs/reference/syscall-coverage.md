@@ -44,11 +44,11 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 11 | mount | ENOSYS | — | stub |
 | 12 | sync | EXECUTE | `sync` (162) | |
 | 13 | reboot | ENOSYS | — | |
-| 14 | pause | ENOSYS | — | signals — post-v1 |
+| 14 | pause | EMULATE | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
 | 15 | getuid | ENOSYS | — | |
-| 16 | kill | ENOSYS | — | signals — post-v1 |
-| 17 | sigprocmask | ENOSYS | — | signals — post-v1 |
-| 18 | signalfd | ENOSYS | — | signals — post-v1 |
+| 16 | kill | EMULATE | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
+| 17 | sigprocmask | EMULATE | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
+| 18 | signalfd | EMULATE | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
 | 19 | epoll_create | ENOSYS | — | epoll — post-v1 |
 | 20 | epoll_ctl | ENOSYS | — | epoll — post-v1 |
 | 21 | epoll_wait | ENOSYS | — | epoll — post-v1 |

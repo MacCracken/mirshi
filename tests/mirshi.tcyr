@@ -154,11 +154,11 @@ fn main() {
     assert_eq(agnos_to_linux_nr(4), 0 - 1, "waitpid#4 has no Linux peer (EMULATE at the loop level, v1.5.0)");
     assert_eq(agnos_to_linux_nr(11), 0 - 1, "mount#11 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(13), 0 - 1, "reboot#13 -> ENOSYS");
-    assert_eq(agnos_to_linux_nr(14), 0 - 1, "pause#14 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(14), 0 - 1, "pause#14 -> no peer (EMULATE at the loop level, v1.6.0)");
     assert_eq(agnos_to_linux_nr(15), 0 - 1, "getuid#15 -> ENOSYS");
-    assert_eq(agnos_to_linux_nr(16), 0 - 1, "kill#16 -> ENOSYS (signals)");
-    assert_eq(agnos_to_linux_nr(17), 0 - 1, "sigprocmask#17 -> ENOSYS (signals)");
-    assert_eq(agnos_to_linux_nr(18), 0 - 1, "signalfd#18 -> ENOSYS (signals)");
+    assert_eq(agnos_to_linux_nr(16), 0 - 1, "kill#16 -> no peer (EMULATE at the loop level, v1.6.0)");
+    assert_eq(agnos_to_linux_nr(17), 0 - 1, "sigprocmask#17 -> no peer (EMULATE at the dispatcher, v1.6.0)");
+    assert_eq(agnos_to_linux_nr(18), 0 - 1, "signalfd#18 -> no peer (EMULATE at the dispatcher, v1.6.0)");
     assert_eq(agnos_to_linux_nr(19), 0 - 1, "epoll_create#19 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(20), 0 - 1, "epoll_ctl#20 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(21), 0 - 1, "epoll_wait#21 -> ENOSYS");
@@ -455,6 +455,9 @@ fn main() {
     assert_eq(_sig_lowest(_sig_bit(15)), 15, "single SIGTERM -> 15");
     assert_eq(_sig_lowest(_sig_bit(15) | _sig_bit(2)), 2, "SIGINT+SIGTERM -> lowest first (2)");
     assert_eq(_sig_lowest(_sig_bit(9) | _sig_bit(17)), 9, "SIGKILL+SIGCHLD -> lowest first (9)");
+    assert_eq(_sig_clear(_sig_bit(15) | _sig_bit(2), 15), _sig_bit(2), "clear SIGTERM -> only SIGINT left");
+    assert_eq(_sig_clear(_sig_bit(10), 10), 0, "clear the only pending bit -> 0");
+    assert_eq(_sig_clear(_sig_bit(2), 15), _sig_bit(2), "clear an absent bit -> unchanged");
 
     return assert_summary();
 }

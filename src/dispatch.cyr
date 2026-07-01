@@ -795,6 +795,121 @@ fn _net_config(pid, regs): i64 {
     return _net_emu(pid, regs, 0 - 1);                         # bad field
 }
 
+# Supervisor scratch for signal-mask pvm I/O (sigprocmask#17 / signalfd#18): an 8-byte word, lazy-
+# alloc-once (one call in flight, same discipline as _emu_ts). Never a per-call alloc.
+var _sig_buf = 0;
+fn _sig_buf_get(): i64 {
+    if (_sig_buf == 0) { _sig_buf = alloc(8); }
+    return _sig_buf;
+}
+
+# sigprocmask#17(how, set_ptr, oldset_ptr) -> 0 / -1. EMULATE (per-caller, no loop cooperation): if
+# oldset_ptr != 0, write the caller's CURRENT blocked mask there (POSIX: the mask BEFORE the change);
+# then if set_ptr != 0, apply `how` to C_SIG_BLOCKED with the 8-byte mask at set_ptr. Masks are agnos
+# `1<<sig`. _cur_rec is the caller's record (set by the loop at this enter stop).
+fn _do_sigprocmask(pid, regs): i64 {
+    var how = decode_arg(regs, 0);
+    var set_ptr = decode_arg(regs, 1);
+    var oldset_ptr = decode_arg(regs, 2);
+    var sb = _sig_buf_get();
+    var cur = load64(_cur_rec + C_SIG_BLOCKED);
+    # Read the new set FIRST (into a local), BEFORE writing oldset — so oldset_ptr == set_ptr aliasing
+    # (POSIX permits it) can't clobber the child's intended set with the just-written old mask.
+    var have_set = 0;
+    var newset = 0;
+    if (set_ptr != 0) {
+        if (pvm_read(pid, set_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+        newset = load64(sb);
+        have_set = 1;
+    }
+    if (oldset_ptr != 0) {                                 # oldset gets the mask BEFORE the change
+        store64(sb, cur);
+        if (pvm_write(pid, oldset_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    if (have_set == 1) {
+        var result = cur;
+        if (how == 0) { result = cur | newset; }              # SIG_BLOCK   — add bits
+        if (how == 1) { result = cur & (0 - newset - 1); }    # SIG_UNBLOCK — clear bits (cur & ~newset)
+        if (how == 2) { result = newset; }                    # SIG_SETMASK — replace wholesale
+        store64(_cur_rec + C_SIG_BLOCKED, result);
+    }
+    return _net_emu(pid, regs, 0);
+}
+
+# The caller's per-child signalfd slot table (lazy-alloc-once, mirrors _net_tbl). Each slot is
+# {watched_mask@0, flags@8}; flags == -1 marks a FREE slot. _cur_rec is the current child.
+fn _sigfd_tbl(): i64 {
+    var t = load64(_cur_rec + C_SIGFD_TBL);
+    if (t == 0) {
+        t = alloc(SIGNALFD_SLOTS * SIGFD_SLOT_SIZE);
+        var i = 0;
+        while (i < SIGNALFD_SLOTS) {
+            store64(t + i * SIGFD_SLOT_SIZE + 0, 0);        # watched_mask = 0
+            store64(t + i * SIGFD_SLOT_SIZE + 8, 0 - 1);    # flags = -1 -> FREE
+            i = i + 1;
+        }
+        store64(_cur_rec + C_SIGFD_TBL, t);
+    }
+    return t;
+}
+
+# signalfd#18(fd, mask_ptr, flags) -> fd / -1. EMULATE (per-caller). fd==-1 allocates a new slot ->
+# returns SIGFD_BASE+slot; an existing SIGFD_BASE+slot updates its watched mask. The mask (8-byte
+# 1<<sig) is read from mask_ptr. An OPAQUE emulated fd — a real Linux fd is meaningless in the child
+# (separate fd tables across the ptrace boundary). read#5 on the returned fd delivers pending signals.
+fn _do_signalfd(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var mask_ptr = decode_arg(regs, 1);
+    var flags = decode_arg(regs, 2);
+    var sb = _sig_buf_get();
+    if (pvm_read(pid, mask_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    var watched = load64(sb);
+    var tbl = _sigfd_tbl();
+    var slot = 0 - 1;
+    if (fd == (0 - 1)) {                                   # new signalfd -> first FREE slot
+        var i = 0;
+        while (i < SIGNALFD_SLOTS) {
+            if (load64(tbl + i * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { slot = i; i = SIGNALFD_SLOTS; }
+            else { i = i + 1; }
+        }
+        if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }         # table full
+    } else {                                              # update an existing signalfd
+        if (fd < SIGFD_BASE) { return _net_emu(pid, regs, 0 - 1); }
+        slot = fd - SIGFD_BASE;
+        if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+        if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }   # not open
+    }
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 0, watched);
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, flags);
+    return _net_emu(pid, regs, SIGFD_BASE + slot);
+}
+
+# read#5 on an emulated signalfd (fd >= SIGFD_BASE): deliver the lowest pending & watched & unblocked
+# signal as an 8-byte number into the child's buffer (return 8), consuming that pending bit. Nothing
+# deliverable -> agnos -1 (the MVP signalfd is NON-BLOCKING; the caller polls, yielding via pause#14).
+fn _sigfd_read(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    var slot = fd - SIGFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }            # belt-and-suspenders (net-band idiom)
+    if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _sigfd_tbl();
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }   # not open
+    if (len < 8) { return _net_emu(pid, regs, 0 - 1); }             # need room for the 8-byte number
+    var watched = load64(tbl + slot * SIGFD_SLOT_SIZE + 0);
+    var deliverable = _sig_deliverable(load64(_cur_rec + C_PENDING_SIG), load64(_cur_rec + C_SIG_BLOCKED)) & watched;
+    if (deliverable == 0) { return _net_emu(pid, regs, 0 - 1); }    # nothing pending (non-blocking)
+    var sig = _sig_lowest(deliverable);
+    # DELIVER FIRST, then consume: if the child buffer write fails, the pending bit MUST stay set
+    # (never lose a signal on a bad-buffer read — the "deliver-then-consume" discipline of _net_recv).
+    var sb = _sig_buf_get();
+    store64(sb, sig);                                              # the signal number, 8-byte i64
+    if (pvm_write(pid, buf, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }   # nothing consumed on failure
+    store64(_cur_rec + C_PENDING_SIG, _sig_clear(load64(_cur_rec + C_PENDING_SIG), sig));   # THEN consume
+    return _net_emu(pid, regs, 8);                                 # bytes delivered
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -849,6 +964,12 @@ fn translate_dispatch(pid, regs): i64 {
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EMULATE;
     }
+
+    # sigprocmask#17 -> supervisor-emulate the caller's blocked mask (read/apply/write-oldset).
+    if (nr == 17) { return _do_sigprocmask(pid, regs); }
+
+    # signalfd#18 -> an opaque emulated signalfd (per-child slot table); read#5 on it delivers signals.
+    if (nr == 18) { return _do_signalfd(pid, regs); }
 
     # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
     #     path(s) into the child red zone (NUL-terminated) before executing. ---
@@ -965,6 +1086,13 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 56) { return _net_listen(pid, regs); }       # sock_listen -> listen_id / -1
         if (nr == 57) { return _net_accept(pid, regs); }       # sock_accept -> conn_id / -1
         if (nr == 61) { return _net_config(pid, regs); }       # net_config -> packed ip / 0 / -1
+    }
+
+    # read#5 on an emulated signalfd (fd >= SIGFD_BASE) -> deliver a pending signal; a NORMAL read
+    # (any real fd, which the rlimit caps far below SIGFD_BASE) falls straight through to the EXECUTE
+    # tail below (renumber to Linux read#0). One decode_arg + one compare on the read#5 path only.
+    if (nr == 5) {
+        if (decode_arg(regs, 0) >= SIGFD_BASE) { return _sigfd_read(pid, regs); }
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg
