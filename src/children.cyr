@@ -19,7 +19,7 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
                                 # that flipping spawn#3 to EMULATE reopens (deliberately NOT
                                 # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 152;       # 19 x i64 fields
+    CHILD_REC_SIZE = 176;       # 22 x i64 fields (v1.7.0 grew it by 3: epoll / timerfd / pipe tables)
     # --- v1.6.0 signalfd#18 constants ---
     SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
                                 # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
@@ -53,6 +53,10 @@ enum MirshiChild {
     C_SIG_BLOCKED = 136;       # v1.6.0: the per-child BLOCKED signal mask (sigprocmask#17, `1<<sig`);
                                # a signal is deliverable iff (C_PENDING_SIG & ~C_SIG_BLOCKED) has it
     C_SIGFD_TBL = 144;         # v1.6.0: this child's signalfd slot-table ptr (0 = not yet alloc'd)
+    C_EPOLL_TBL = 152;         # v1.7.0: this child's epoll slot-table ptr (0 = not yet alloc'd)
+    C_TIMERFD_TBL = 160;       # v1.7.0: this child's timerfd slot-table ptr (0 = not yet alloc'd)
+    C_PIPE_TBL = 168;          # v1.7.0: RESERVED (unused in the MVP) — a watchable-pipe promotion would
+                               # store a supervisor-held {readfd,writefd} pair table here (ADR 0015)
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
@@ -60,6 +64,31 @@ enum MirshiChild {
     CS_EXITED = 3;             # exited; exit_code retained until reaped
     SPAWN_ELF_MAX = 8388608;   # 8 MB spawn#3 ELF read cap — matches lib/process_agnos.cyr's
                                # _AGNOS_ELF_MAX (the agnos-side spawn helper's own read buffer)
+    # --- v1.7.0 I/O-multiplexing (epoll #19-21 / timerfd #22-23 / pipe #25) ---
+    # epoll + timerfd are supervisor-EMULATED (a server epolls SOCKETS, which are supervisor-held host
+    # fds in the per-child net table — a real in-child epoll fd cannot see them), so each returns an
+    # opaque BASE+slot id the child later epoll_ctl's / read#5's / close#6's. Every base MUST clear bit
+    # 30 (AGNOS_SOCK_TAG) so the agnos userland does not route it to the net band before it reaches
+    # mirshi, AND stay distinct from SIGFD_BASE (bit 29). A strictly DESCENDING ladder lets
+    # _emu_classify tier by a single >= compare; all sit far above real child fds (rlimit caps < 256).
+    AGNOS_SOCK_TAG = 0x40000000; # bit 30 — the agnos userland's own socket-fd tag (routed to the net
+                                 # band before any raw syscall mirshi sees). _emu_classify checks it
+                                 # FIRST: 0x40000000 > SIGFD_BASE would otherwise mis-tier a socket id.
+    TIMERFD_BASE = 0x10000000;   # bit 28: emulated timerfd id = TIMERFD_BASE + slot
+    EPOLL_BASE = 0x08000000;     # bit 27: emulated epoll id = EPOLL_BASE + slot
+    PIPE_BASE = 0x04000000;      # bit 26: RESERVED for a watchable-pipe promotion (unused in the MVP)
+    MIN_EMU_BASE = 0x04000000;   # = PIPE_BASE — the low guard: fd >= this is a mirshi emulated id
+    EPOLL_SLOTS = 4;             # per-child epoll instances (a server rarely needs > 1-2)
+    EPOLL_SLOT_SIZE = 72;        # {i64 in_use (-1=FREE); 8 x i64 watched_id (-1=empty)} — the 8-watch list
+    TIMERFD_SLOTS = 8;           # per-child timerfd instances
+    TIMERFD_SLOT_SIZE = 32;      # {i64 flags (-1=FREE); i64 deadline_ms; i64 interval_ms; i64 armed}
+    # _emu_classify KIND codes — the read#5 / close#6 emulated-fd front-gate tiers:
+    KIND_REAL = 0;               # a real child fd (< MIN_EMU_BASE, bit 30 clear) — execute-in-child
+    KIND_SOCK = 1;               # AGNOS_SOCK_TAG (bit 30) — a net-band conn / listen id
+    KIND_SIGFD = 2;              # >= SIGFD_BASE — an emulated signalfd
+    KIND_TIMERFD = 3;            # >= TIMERFD_BASE — an emulated timerfd
+    KIND_EPOLL = 4;              # >= EPOLL_BASE — an emulated epoll instance
+    KIND_PIPE = 5;               # >= PIPE_BASE — RESERVED (watchable pipe, unused in the MVP)
 }
 
 # True (1) iff `size` is a plausible spawn#3 ELF size: positive and within the SPAWN_ELF_MAX cap
@@ -147,6 +176,32 @@ fn _sig_clear(mask, sig): i64 {
     return mask & (0 - (1 << sig) - 1);   # mask & ~(1<<sig)
 }
 
+# --- v1.7.0 pure I/O-mux helpers (hermetically unit-tested, beside _sig_deliverable) ---
+
+# Classify an fd / watched-id by mirshi's emulated-fd tag ladder -> a KIND_* code. Checks AGNOS_SOCK_TAG
+# (bit 30) FIRST — a socket id (0x40000000 + slot) exceeds SIGFD_BASE and would otherwise tier as a
+# signalfd — then the strictly-descending base ladder. The read#5 / close#6 front gate routes an
+# emulated id to its band with this; a real child fd (< MIN_EMU_BASE, bit 30 clear) -> KIND_REAL (rides
+# the execute-in-child path). Pure.
+fn _emu_classify(fd): i64 {
+    if (fd < 0) { return KIND_REAL; }
+    if ((fd & AGNOS_SOCK_TAG) != 0) { return KIND_SOCK; }
+    if (fd >= SIGFD_BASE) { return KIND_SIGFD; }
+    if (fd >= TIMERFD_BASE) { return KIND_TIMERFD; }
+    if (fd >= EPOLL_BASE) { return KIND_EPOLL; }
+    if (fd >= PIPE_BASE) { return KIND_PIPE; }
+    return KIND_REAL;
+}
+
+# The number of timerfd expirations to report at `now` for a timer whose next deadline is `deadline`
+# (all ms). `interval` 0 = one-shot -> 1; periodic -> 1 + floor((now - deadline) / interval), the ticks
+# elapsed since the deadline (matching Linux timerfd's u64 expiration count). Precondition: the caller
+# has already checked armed && now >= deadline. Pure.
+fn _timer_ticks(now, deadline, interval): i64 {
+    if (interval <= 0) { return 1; }
+    return 1 + (now - deadline) / interval;
+}
+
 # The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.
 var _children = 0;
 var _next_agnos_pid = 1;        # 0 reserved (getppid=0 stays distinct); root child = 1
@@ -229,6 +284,9 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_NET_TBL, 0);
             store64(b + C_SIG_BLOCKED, 0);
             store64(b + C_SIGFD_TBL, 0);
+            store64(b + C_EPOLL_TBL, 0);        # v1.7.0: lazy-alloc-once tables start unallocated
+            store64(b + C_TIMERFD_TBL, 0);
+            store64(b + C_PIPE_TBL, 0);         # reserved (unused in the MVP)
             return b;
         }
         i = i + 1;

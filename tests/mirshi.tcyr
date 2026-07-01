@@ -459,6 +459,45 @@ fn main() {
     assert_eq(_sig_clear(_sig_bit(10), 10), 0, "clear the only pending bit -> 0");
     assert_eq(_sig_clear(_sig_bit(2), 15), _sig_bit(2), "clear an absent bit -> unchanged");
 
+    # --- v1.7.0 I/O-mux tag ladder + pure classifier / tick-count (BITE 1 scaffolding) ------------
+    test_group("iomux-tags");
+    # every emulated base MUST clear bit 30 (AGNOS_SOCK_TAG) or the agnos userland swallows the id to
+    # the net band before mirshi's read#5/close#6 ever see it — the load-bearing invariant.
+    assert_eq(AGNOS_SOCK_TAG, 0x40000000, "AGNOS_SOCK_TAG is bit 30");
+    assert_eq(SIGFD_BASE & AGNOS_SOCK_TAG, 0, "SIGFD_BASE clears bit 30");
+    assert_eq(TIMERFD_BASE & AGNOS_SOCK_TAG, 0, "TIMERFD_BASE clears bit 30");
+    assert_eq(EPOLL_BASE & AGNOS_SOCK_TAG, 0, "EPOLL_BASE clears bit 30");
+    assert_eq(PIPE_BASE & AGNOS_SOCK_TAG, 0, "PIPE_BASE clears bit 30");
+    # the three sub-SIGFD bases must also clear bit 29 (0x60000000 = bit30|bit29) so they stay disjoint
+    # from the signalfd band.
+    assert_eq(TIMERFD_BASE & 0x60000000, 0, "TIMERFD_BASE clears bit 30 & 29");
+    assert_eq(EPOLL_BASE & 0x60000000, 0, "EPOLL_BASE clears bit 30 & 29");
+    assert_eq(PIPE_BASE & 0x60000000, 0, "PIPE_BASE clears bit 30 & 29");
+    # a STRICTLY DESCENDING ladder is what lets _emu_classify tier by a single >= compare.
+    assert_eq(SIGFD_BASE > TIMERFD_BASE, 1, "ladder: SIGFD > TIMERFD");
+    assert_eq(TIMERFD_BASE > EPOLL_BASE, 1, "ladder: TIMERFD > EPOLL");
+    assert_eq(EPOLL_BASE > PIPE_BASE, 1, "ladder: EPOLL > PIPE");
+    assert_eq(MIN_EMU_BASE, PIPE_BASE, "MIN_EMU_BASE is the low guard (= PIPE_BASE)");
+    # slot shapes: an epoll slot is {in_use; 8 x watched} = 9 x i64; a timerfd slot is 4 x i64.
+    assert_eq(EPOLL_SLOT_SIZE, 72, "epoll slot = in_use + 8 watches = 9 x i64");
+    assert_eq(TIMERFD_SLOT_SIZE, 32, "timerfd slot = flags/deadline/interval/armed = 4 x i64");
+    # _emu_classify — one sample per band, the bit-30 socket check taking priority over the >= ladder.
+    assert_eq(_emu_classify(5), KIND_REAL, "a small real child fd -> REAL");
+    assert_eq(_emu_classify(0 - 1), KIND_REAL, "negative -> REAL (guard)");
+    assert_eq(_emu_classify(MIN_EMU_BASE - 1), KIND_REAL, "just below the guard -> REAL");
+    assert_eq(_emu_classify(AGNOS_SOCK_TAG + 3), KIND_SOCK, "bit-30 id -> SOCK (checked before the ladder)");
+    assert_eq(_emu_classify(SIGFD_BASE + 1), KIND_SIGFD, "SIGFD_BASE+slot -> SIGFD");
+    assert_eq(_emu_classify(TIMERFD_BASE + 2), KIND_TIMERFD, "TIMERFD_BASE+slot -> TIMERFD");
+    assert_eq(_emu_classify(EPOLL_BASE), KIND_EPOLL, "EPOLL_BASE+0 -> EPOLL");
+    assert_eq(_emu_classify(PIPE_BASE + 7), KIND_PIPE, "PIPE_BASE+slot -> PIPE (reserved)");
+    # _timer_ticks — one-shot always 1; periodic = 1 + floor((now-deadline)/interval).
+    assert_eq(_timer_ticks(1000, 1000, 0), 1, "one-shot exactly at deadline -> 1");
+    assert_eq(_timer_ticks(5000, 1000, 0), 1, "one-shot fired late -> still 1");
+    assert_eq(_timer_ticks(1000, 1000, 100), 1, "periodic exactly at deadline -> 1");
+    assert_eq(_timer_ticks(1099, 1000, 100), 1, "periodic <1 interval past -> 1");
+    assert_eq(_timer_ticks(1100, 1000, 100), 2, "periodic exactly 1 interval past -> 2");
+    assert_eq(_timer_ticks(1350, 1000, 100), 4, "periodic 3.5 intervals past -> 1+3 = 4");
+
     return assert_summary();
 }
 
