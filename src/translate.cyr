@@ -280,3 +280,119 @@ fn net_recv_to_agnos(lr): i64 {
     if (lr == (0 - NET_EAGAIN)) { return 0; }        # -EAGAIN        -> agnos WOULD_BLOCK (0)
     return 0 - 1;                                     # any other -errno -> agnos error (-1)
 }
+
+# ----------------------------------------------------------------------------
+# Net egress policy (v1.1.0, --net-allow) — PURE ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
+# DEFAULT-DENY: a dst is reachable only if it matches a configured --net-allow CIDR.
+# SSRF hardening: a broad allow (0.0.0.0/0) must NOT implicitly expose the reserved
+# blocks (metadata / RFC1918 / loopback / link-local) — reaching one needs an allow
+# CIDR at least as specific as that block. All IPs are the agnos kernel-ip4 form
+# (oct1<<24|...|oct4), matching what arrives at the #47/#52 trap. Unit-tested.
+# ----------------------------------------------------------------------------
+enum MirshiEgress {
+    NET_ALLOW_MAX = 16;      # max --net-allow CIDR entries
+    ENTRY_SIZE = 16;         # per entry: {u64 net (masked, kernel-ip4); u64 prefix}
+}
+
+# /p -> a 32-bit prefix mask (kernel-ip4 form): top p bits set. p in 0..32.
+fn net_prefix_mask(p): i64 {
+    if (p <= 0) { return 0; }
+    if (p >= 32) { return 0xFFFFFFFF; }
+    return (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF;
+}
+
+# Is `ip` within CIDR (net/p)? Both kernel-ip4 form. (ip & mask) == (net & mask).
+fn net_in_cidr(ip, net, p): i64 {
+    var m = net_prefix_mask(p);
+    if ((ip & m) == (net & m)) { return 1; }
+    return 0;
+}
+
+# The minimum allow-CIDR prefix required to reach `ip` given the reserved deny-blocks:
+# the MAX prefix of any reserved block containing `ip`, or 0 if `ip` is public. So metadata
+# (169.254.169.254) needs a /32 allow, link-local a /16, loopback + 10/8 a /8, 172.16/12 a
+# /12, 192.168/16 a /16 — a broader (smaller-prefix) allow can't reach them (SSRF guard).
+fn net_reserved_min_prefix(ip): i64 {
+    var req = 0;
+    if (net_in_cidr(ip, 0xA9FEA9FE, 32) == 1) { if (32 > req) { req = 32; } }  # metadata 169.254.169.254/32
+    if (net_in_cidr(ip, 0xA9FE0000, 16) == 1) { if (16 > req) { req = 16; } }  # link-local 169.254/16
+    if (net_in_cidr(ip, 0x7F000000, 8) == 1)  { if (8 > req)  { req = 8; } }   # loopback 127/8
+    if (net_in_cidr(ip, 0x0A000000, 8) == 1)  { if (8 > req)  { req = 8; } }   # RFC1918 10/8
+    if (net_in_cidr(ip, 0xAC100000, 12) == 1) { if (12 > req) { req = 12; } }  # RFC1918 172.16/12
+    if (net_in_cidr(ip, 0xC0A80000, 16) == 1) { if (16 > req) { req = 16; } }  # RFC1918 192.168/16
+    return req;
+}
+
+# Egress decision (default-deny): is `dst_ip` allowed by the parsed allow-list? Allowed iff
+# SOME entry contains it AND entry.prefix >= the reserved-block minimum for it. `entries` is
+# a packed array of ENTRY_SIZE-byte {u64 net, u64 prefix}; `count` entries (0 -> deny all).
+fn net_egress_ok(dst_ip, entries, count): i64 {
+    var req = net_reserved_min_prefix(dst_ip);
+    var i = 0;
+    while (i < count) {
+        var net = load64(entries + i * ENTRY_SIZE + 0);
+        var pfx = load64(entries + i * ENTRY_SIZE + 8);
+        if (net_in_cidr(dst_ip, net, pfx) == 1) {
+            if (pfx >= req) { return 1; }            # matches + specific enough for its block
+        }
+        i = i + 1;
+    }
+    return 0;                                        # default-deny
+}
+
+# Parse a --net-allow value "a.b.c.d/p[,a.b.c.d/p...]" into `entries` (each masked net +
+# prefix). Returns the entry count, or -1 on ANY malformed input (fail-closed: the caller
+# must refuse to run rather than apply a half-parsed policy). Port ranges (`:ports`) are a
+# post-MVP refinement — not accepted here. Pure (reads a cstring, writes the entries buffer).
+fn net_parse_allow(s, entries, max_entries): i64 {
+    var i = 0;
+    var count = 0;
+    while (1 == 1) {
+        if (load8(s + i) == 0) { return count; }         # end of string
+        if (count >= max_entries) { return 0 - 1; }      # too many CIDRs
+        var ip = 0;
+        var oct_i = 0;
+        while (oct_i < 4) {
+            var have = 0;
+            var val = 0;
+            while (1 == 1) {
+                var c = load8(s + i);
+                if (c < 48) { break; }
+                if (c > 57) { break; }
+                val = val * 10 + (c - 48);
+                if (val > 255) { return 0 - 1; }         # octet out of range (checked BEFORE overflow)
+                have = 1;
+                i = i + 1;
+            }
+            if (have == 0) { return 0 - 1; }             # no digit
+            ip = (ip << 8) | val;                        # accumulate kernel-ip4 (oct1 first)
+            oct_i = oct_i + 1;
+            if (oct_i < 4) {
+                if (load8(s + i) != 46) { return 0 - 1; }  # expect '.'
+                i = i + 1;
+            }
+        }
+        if (load8(s + i) != 47) { return 0 - 1; }        # expect '/'
+        i = i + 1;
+        var pfx = 0;
+        var phave = 0;
+        while (1 == 1) {
+            var pc = load8(s + i);
+            if (pc < 48) { break; }
+            if (pc > 57) { break; }
+            pfx = pfx * 10 + (pc - 48);
+            if (pfx > 32) { return 0 - 1; }              # prefix out of range (checked BEFORE overflow)
+            phave = 1;
+            i = i + 1;
+        }
+        if (phave == 0) { return 0 - 1; }                # no prefix digit
+        store64(entries + count * ENTRY_SIZE + 0, ip & net_prefix_mask(pfx));  # masked network
+        store64(entries + count * ENTRY_SIZE + 8, pfx);
+        count = count + 1;
+        var sep = load8(s + i);
+        if (sep == 0) { return count; }                  # end
+        if (sep != 44) { return 0 - 1; }                 # expect ',' between CIDRs
+        i = i + 1;
+    }
+    return count;
+}

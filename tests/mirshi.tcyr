@@ -318,6 +318,57 @@ fn main() {
     assert_eq(net_recv_to_agnos(0 - 11), 0, "-EAGAIN -> agnos WOULD_BLOCK 0 [INVERTED]");
     assert_eq(net_recv_to_agnos(0 - 104), 0 - 1, "-ECONNRESET -> agnos error -1");
 
+    # --- Net egress policy (v1.1.0 --net-allow) pure logic (docs/adr/0012) --
+    test_group("net-prefix-mask");
+    assert_eq(net_prefix_mask(0), 0, "/0 -> 0");
+    assert_eq(net_prefix_mask(8), 0xFF000000, "/8");
+    assert_eq(net_prefix_mask(12), 0xFFF00000, "/12");
+    assert_eq(net_prefix_mask(24), 0xFFFFFF00, "/24");
+    assert_eq(net_prefix_mask(32), 0xFFFFFFFF, "/32");
+
+    test_group("net-in-cidr");
+    assert_eq(net_in_cidr(0x0A050507, 0x0A000000, 8), 1, "10.5.5.7 in 10/8");
+    assert_eq(net_in_cidr(0x0B050507, 0x0A000000, 8), 0, "11.5.5.7 not in 10/8");
+    assert_eq(net_in_cidr(0x7F000001, 0, 0), 1, "anything in 0/0");
+    assert_eq(net_in_cidr(0xC0A80105, 0xC0A80100, 24), 1, "192.168.1.5 in 192.168.1/24");
+    assert_eq(net_in_cidr(0xC0A80205, 0xC0A80100, 24), 0, "192.168.2.5 not in .1/24");
+
+    test_group("net-reserved-prefix");
+    assert_eq(net_reserved_min_prefix(0xA9FEA9FE), 32, "metadata -> /32");
+    assert_eq(net_reserved_min_prefix(0xA9FE0101), 16, "link-local -> /16");
+    assert_eq(net_reserved_min_prefix(0x7F000001), 8, "loopback -> /8");
+    assert_eq(net_reserved_min_prefix(0x0A050507), 8, "10/8 -> /8");
+    assert_eq(net_reserved_min_prefix(0xAC1F0001), 12, "172.31 (172.16/12) -> /12");
+    assert_eq(net_reserved_min_prefix(0xAC0F0001), 0, "172.15 not reserved -> 0");
+    assert_eq(net_reserved_min_prefix(0xC0A80101), 16, "192.168 -> /16");
+    assert_eq(net_reserved_min_prefix(0x08080808), 0, "8.8.8.8 public -> 0");
+
+    test_group("net-egress-parse+decide");
+    var ent = alloc(NET_ALLOW_MAX * ENTRY_SIZE);
+    assert_eq(net_parse_allow("", ent, NET_ALLOW_MAX), 0, "empty -> 0 entries");
+    assert_eq(net_egress_ok(0x08080808, ent, 0), 0, "default-deny: no allow -> deny");
+    var n1 = net_parse_allow("93.184.216.0/24", ent, NET_ALLOW_MAX);
+    assert_eq(n1, 1, "one CIDR parsed");
+    assert_eq(net_egress_ok(0x5DB8D822, ent, n1), 1, "93.184.216.34 allowed");
+    assert_eq(net_egress_ok(0x5DB8D922, ent, n1), 0, "93.184.217.34 denied (outside /24)");
+    # SSRF: broad 0/0 must NOT implicitly expose reserved blocks
+    var n2 = net_parse_allow("0.0.0.0/0", ent, NET_ALLOW_MAX);
+    assert_eq(net_egress_ok(0x08080808, ent, n2), 1, "0/0 allows public 8.8.8.8");
+    assert_eq(net_egress_ok(0x0A050507, ent, n2), 0, "0/0 does NOT expose RFC1918 [SSRF]");
+    assert_eq(net_egress_ok(0xA9FEA9FE, ent, n2), 0, "0/0 does NOT expose metadata [SSRF]");
+    # specific allow DOES reach a reserved block
+    var n3 = net_parse_allow("127.0.0.1/32,10.0.0.0/8", ent, NET_ALLOW_MAX);
+    assert_eq(n3, 2, "two CIDRs");
+    assert_eq(net_egress_ok(0x7F000001, ent, n3), 1, "127.0.0.1/32 allows loopback");
+    assert_eq(net_egress_ok(0x0A050507, ent, n3), 1, "10/8 allows RFC1918");
+    assert_eq(net_egress_ok(0x7F000002, ent, n3), 0, "127.0.0.2 denied (only .1/32 allowed)");
+    # malformed -> -1 (fail-closed)
+    assert_eq(net_parse_allow("1.2.3.256/24", ent, NET_ALLOW_MAX), 0 - 1, "octet>255 rejected");
+    assert_eq(net_parse_allow("1.2.3.4/33", ent, NET_ALLOW_MAX), 0 - 1, "prefix>32 rejected");
+    assert_eq(net_parse_allow("1.2.3/24", ent, NET_ALLOW_MAX), 0 - 1, "missing octet rejected");
+    assert_eq(net_parse_allow("1.2.3.4/24x", ent, NET_ALLOW_MAX), 0 - 1, "trailing junk rejected");
+    assert_eq(net_parse_allow("99999999999999999999.0.0.0/8", ent, NET_ALLOW_MAX), 0 - 1, "overflow octet rejected (in-loop bound)");
+
     return assert_summary();
 }
 
