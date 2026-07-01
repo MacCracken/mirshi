@@ -63,6 +63,8 @@ enum MirshiPtrace {
     EXECVE_FAILED = 127;
     BOUND_FAILED = 126;               # seccomp bound failed to install — child aborted, not run unbounded
     WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
+    __WALL = 0x40000000;              # wait4: reap children of ANY signal-delivery flavor (v1.5.0
+                                      # multi-tracee demux; robust for supervisor-forked grandchildren)
 }
 
 # wait-status decoders the stdlib lacks. lib/syscalls_linux_common.cyr provides
@@ -107,6 +109,21 @@ fn _wait(pid, status): i64 {
         if (r >= 0) { return r; }
         if (r == 0 - 4) { continue; }      # -EINTR: interrupted, retry
         return r;                          # other error (e.g. -ECHILD)
+    }
+    return r;
+}
+
+# wait4(-1, &status, __WALL, NULL) — reap the next event from ANY traced child (the v1.5.0
+# multi-tracee loop's demux point), zeroing status first + retrying on -EINTR like _wait.
+# Returns the woken host pid (> 0), or < 0 = -errno on a real failure.
+fn _wait_any(status): i64 {
+    var r = 0;
+    while (1 == 1) {
+        store64(status, 0);
+        r = sys_waitpid(0 - 1, status, __WALL);   # wait4(-1, status, __WALL, NULL)
+        if (r >= 0) { return r; }
+        if (r == 0 - 4) { continue; }             # -EINTR: interrupted, retry
+        return r;
     }
     return r;
 }
@@ -294,96 +311,114 @@ fn _trace_log(pid): i64 {
 # the raw return is mapped to the agnos convention. agnos exit#0 was rewritten to
 # a real exit_group, so the child terminates and waitpid carries its status out.
 # See docs/adr/0002.
-fn _trace_run(pid): i64 {
+fn _trace_run(root_pid): i64 {
     var regs = alloc(USER_REGS_SIZE);
     var status = alloc(8);
     var siginfo = alloc(SIGINFO_SIZE);   # group-stop discrimination buffer (PTRACE_GETSIGINFO)
     var raxbuf = alloc(8);               # 0.8.0: 1-word PTRACE_PEEKUSER target (exit reads only rax)
 
-    var a = _attach(pid, status);
+    var a = _attach(root_pid, status);
     if (a >= 0) { return a; }
 
-    # v1.5.0 BITE 2: the enter->exit carry (phase / captured nr / dispatcher verdict / the
-    # EMULATE return + M2 repack staging) lives in the child's RECORD, not loop locals + dispatch
-    # globals — so it survives other children's stops once the loop goes multi-tracee (BITE 4).
-    # Still single-child here (wait4(pid)) -> byte-identical. The dispatch globals
-    # (_xlat_emu_ret / _m2_out_*) stay transient per-stop scratch: saved into the record right
-    # after the enter dispatch, restored right before the exit stop consumes them.
-    var rec = _child_find_by_host(pid);
-    var pending_sig = 0;
+    # v1.5.0 BITE 4: MULTI-TRACEE demux. spawn#3 (BITE 7) forks more traced children, so the loop
+    # no longer waits on one pid — it _wait_any()s (wait4(-1, __WALL)) for the NEXT stop from ANY
+    # child, looks the woken host pid up in the record table, services exactly ONE stop keyed on
+    # THAT record, then resumes THAT child (resume-immediately — no cross-iteration pending_sig
+    # carry). Each child's enter/exit carry + net table live in its record (BITEs 1-3), so
+    # interleaved children never clobber one another. The loop returns only when the ROOT child
+    # (agnos_pid 1) exits; a non-root exit stashes its code in the record and keeps looping (BITE 8
+    # wakes any waitpid#4 parkers). PTRACE_O_EXITKILL (set in _attach) SIGKILLs a lingering grand-
+    # child on teardown. With only the root present (no spawns yet) this is behaviorally identical
+    # to the old single-child loop; the selftest path (_trace_log) stays single-child + untouched.
+    # _attach left the root stopped at its initial stop — kick it into its first syscall-enter.
+    pt(PTRACE_SYSCALL, root_pid, 0, 0);
+
     while (1 == 1) {
-        pt(PTRACE_SYSCALL, pid, 0, pending_sig);
-        pending_sig = 0;
-        var w = _wait(pid, status);
-        if (w < 0) { _emit(2, "mirshi: waitpid failed\n"); return WAIT_FAILED; }
-        var st = load64(status);
-        if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }    # incl. exit#0 -> exit_group
-        if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
-        if (WIFSTOPPED(st) == 1) {
-            var sig = WSTOPSIG(st);
-            if (sig == SYSCALL_STOP_SIG) {
-                if (load64(rec + C_AT_ENTRY) == 1) {
-                    # Syscall-ENTER: read regs, classify, rewrite for the kernel.
-                    _cur_rec = rec;   # v1.5.0 BITE 3: the net-table accessor _net_tbl() reads this
-                    pt(PTRACE_GETREGS, pid, 0, regs);
-                    store64(rec + C_AGNOS_NR, decode_nr(regs));
-                    store64(rec + C_STRAT, translate_dispatch(pid, regs));
-                    # Save this child's dispatch carry into its record; the globals are then
-                    # free for the next child's stop (BITE 4 makes this isolation load-bearing).
-                    store64(rec + C_XLAT_EMU_RET, _xlat_emu_ret);
-                    store64(rec + C_M2_OUT_PTR, _m2_out_ptr);
-                    store64(rec + C_M2_OUT_CAP, _m2_out_cap);
-                    store64(rec + C_M2_SCRATCH, _m2_scratch);
-                    store64(rec + C_AT_ENTRY, 0);
+        var wpid = _wait_any(status);
+        if (wpid < 0) { _emit(2, "mirshi: waitpid failed\n"); return WAIT_FAILED; }
+        var rec = _child_find_by_host(wpid);
+        if (rec == 0) {
+            # A stop from a pid we have no record for (should not happen — spawn inserts the
+            # record before the fork). Never deref null: resume it and move on.
+            pt(PTRACE_SYSCALL, wpid, 0, 0);
+        } else {
+            var st = load64(status);
+            if (WIFEXITED(st) == 1) {
+                store64(rec + C_EXIT_CODE, WEXITSTATUS(st));   # incl. exit#0 -> exit_group
+                store64(rec + C_STATE, CS_EXITED);
+                if (load64(rec + C_AGNOS_PID) == 1) { return WEXITSTATUS(st); }   # ROOT -> supervisor exit
+                # non-root: record kept (BITE 8 wakes waitpid#4 waiters); the child is gone, no resume.
+            }
+            if (WIFSIGNALED(st) == 1) {
+                store64(rec + C_EXIT_CODE, 0 - 1);   # killed by signal -> agnos -1 (BITE 8 refines)
+                store64(rec + C_STATE, CS_EXITED);
+                if (load64(rec + C_AGNOS_PID) == 1) { return 128 + WTERMSIG(st); }
+            }
+            if (WIFSTOPPED(st) == 1) {
+                var sig = WSTOPSIG(st);
+                if (sig == SYSCALL_STOP_SIG) {
+                    if (load64(rec + C_AT_ENTRY) == 1) {
+                        # Syscall-ENTER: read regs, classify, rewrite for the kernel.
+                        _cur_rec = rec;   # BITE 3: the net-table accessor _net_tbl() reads this
+                        pt(PTRACE_GETREGS, wpid, 0, regs);
+                        store64(rec + C_AGNOS_NR, decode_nr(regs));
+                        store64(rec + C_STRAT, translate_dispatch(wpid, regs));
+                        # Save this child's dispatch carry into its record; the globals are then
+                        # free for the next child's stop (the isolation this whole arc buys).
+                        store64(rec + C_XLAT_EMU_RET, _xlat_emu_ret);
+                        store64(rec + C_M2_OUT_PTR, _m2_out_ptr);
+                        store64(rec + C_M2_OUT_CAP, _m2_out_cap);
+                        store64(rec + C_M2_SCRATCH, _m2_scratch);
+                        store64(rec + C_AT_ENTRY, 0);
+                    } else {
+                        # Syscall-EXIT (0.8.0 hot-path opt; docs/benchmarks.md). The exit stop
+                        # needs exactly ONE register: rax (the raw kernel return). So read just
+                        # that word with PTRACE_PEEKUSER (8 bytes) instead of GETREGS (the full
+                        # 216-byte register set), map it to the agnos convention, and write it
+                        # back with PTRACE_POKEUSER (8 bytes) ONLY if it actually CHANGED. The
+                        # syscall-dense SUCCESS path then costs one 8-byte peek and NO write-back
+                        # at all — getpid/read/write/lseek/mmap/getrandom return values pass
+                        # through unchanged, and stat success stays 0 with its output already
+                        # repacked into child memory by fs_exit_return — vs the old GETREGS +
+                        # unconditional SETREGS, two 216-byte cross-process copies. Byte-identical:
+                        # at a syscall-exit the supervisor only ever wrote rax (rcx/r11 are kernel-
+                        # restored, every other GP reg is child-preserved), so touching exactly
+                        # rax, only when it differs, leaves the child resuming with precisely the
+                        # rax the unconditional path would have set. Only ERROR returns (-errno ->
+                        # -1, mmap/time -> 0), the getdents repack count, and the EMULATE/ENOSYS
+                        # injection (raw rax is -ENOSYS there) differ -> POKEUSER fires.
+                        # (PEEKUSER's raw ABI writes the word to the data pointer and returns
+                        # 0/-errno; POKEUSER takes the value in data. REG_RAX=80 is the offset
+                        # into struct user too — user_regs_struct is its leading member.)
+                        # Restore this child's carry into the dispatch globals before the exit
+                        # stop consumes them (agret reads _xlat_emu_ret; fs_exit_return reads _m2_*).
+                        _xlat_emu_ret = load64(rec + C_XLAT_EMU_RET);
+                        _m2_out_ptr = load64(rec + C_M2_OUT_PTR);
+                        _m2_out_cap = load64(rec + C_M2_OUT_CAP);
+                        _m2_scratch = load64(rec + C_M2_SCRATCH);
+                        pt(PTRACE_PEEKUSER, wpid, REG_RAX, raxbuf);
+                        var raw = load64(raxbuf);
+                        var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
+                        if (load64(rec + C_STRAT) == STRAT_EXECUTE) {
+                            # fs_exit_return maps the return AND, for stat/getdents, repacks the
+                            # Linux output struct into the child's saved buffer — a child-MEMORY
+                            # write, independent of the rax write-back conditionally done below.
+                            agret = fs_exit_return(wpid, load64(rec + C_AGNOS_NR), raw);
+                        }
+                        if (agret != raw) {
+                            pt(PTRACE_POKEUSER, wpid, REG_RAX, agret);
+                        }
+                        store64(rec + C_AT_ENTRY, 1);
+                    }
+                    pt(PTRACE_SYSCALL, wpid, 0, 0);   # resume the serviced child (syscall stop: no signal)
                 } else {
-                    # Syscall-EXIT (0.8.0 hot-path opt; docs/benchmarks.md). The exit stop
-                    # needs exactly ONE register: rax (the raw kernel return). So read just
-                    # that word with PTRACE_PEEKUSER (8 bytes) instead of GETREGS (the full
-                    # 216-byte register set), map it to the agnos convention, and write it
-                    # back with PTRACE_POKEUSER (8 bytes) ONLY if it actually CHANGED. The
-                    # syscall-dense SUCCESS path then costs one 8-byte peek and NO write-back
-                    # at all — getpid/read/write/lseek/mmap/getrandom return values pass
-                    # through unchanged, and stat success stays 0 with its output already
-                    # repacked into child memory by fs_exit_return — vs the old GETREGS +
-                    # unconditional SETREGS, two 216-byte cross-process copies. Byte-identical:
-                    # at a syscall-exit the supervisor only ever wrote rax (rcx/r11 are kernel-
-                    # restored, every other GP reg is child-preserved), so touching exactly
-                    # rax, only when it differs, leaves the child resuming with precisely the
-                    # rax the unconditional path would have set. Only ERROR returns (-errno ->
-                    # -1, mmap/time -> 0), the getdents repack count, and the EMULATE/ENOSYS
-                    # injection (raw rax is -ENOSYS there) differ -> POKEUSER fires.
-                    # (PEEKUSER's raw ABI writes the word to the data pointer and returns
-                    # 0/-errno; POKEUSER takes the value in data. REG_RAX=80 is the offset
-                    # into struct user too — user_regs_struct is its leading member.)
-                    # Restore this child's carry into the dispatch globals before the exit
-                    # stop consumes them (agret reads _xlat_emu_ret; fs_exit_return reads _m2_*).
-                    _xlat_emu_ret = load64(rec + C_XLAT_EMU_RET);
-                    _m2_out_ptr = load64(rec + C_M2_OUT_PTR);
-                    _m2_out_cap = load64(rec + C_M2_OUT_CAP);
-                    _m2_scratch = load64(rec + C_M2_SCRATCH);
-                    pt(PTRACE_PEEKUSER, pid, REG_RAX, raxbuf);
-                    var raw = load64(raxbuf);
-                    var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
-                    if (load64(rec + C_STRAT) == STRAT_EXECUTE) {
-                        # fs_exit_return maps the return AND, for stat/getdents, repacks the
-                        # Linux output struct into the child's saved buffer — a child-MEMORY
-                        # write, independent of the rax write-back conditionally done below.
-                        agret = fs_exit_return(pid, load64(rec + C_AGNOS_NR), raw);
-                    }
-                    if (agret != raw) {
-                        pt(PTRACE_POKEUSER, pid, REG_RAX, agret);
-                    }
-                    store64(rec + C_AT_ENTRY, 1);
+                    # Non-syscall signal stop: SUPPRESS a group-stop (resume with no signal, the
+                    # ptrace-correct restart), FORWARD a genuine signal-delivery stop. Resumed
+                    # immediately — no cross-iteration pending_sig carry. See docs/adr/0007.
+                    var psig = sig;
+                    if (_is_group_stop(wpid, sig, siginfo) == 1) { psig = 0; }
+                    pt(PTRACE_SYSCALL, wpid, 0, psig);
                 }
-            } else {
-                # Non-syscall signal stop; the enter/exit phase is unchanged (a signal
-                # stop is not a syscall boundary). For a group-stop (the child hit a
-                # stopping signal) the ptrace-correct restart carries NO signal, so
-                # SUPPRESS it (pending_sig stays 0 -> resume with data=0) rather than
-                # re-injecting a stop the supervisor never originated. A genuine
-                # signal-delivery stop is forwarded. See _is_group_stop / docs/adr/0007.
-                if (_is_group_stop(pid, sig, siginfo) == 1) { pending_sig = 0; }
-                else { pending_sig = sig; }
             }
         }
     }
