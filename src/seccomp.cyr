@@ -83,7 +83,9 @@ fn _bound_allowlist(buf): i64 {
     # The child's own exec/teardown (NOT rewritten by mirshi — they run before the
     # PTRACE_SYSCALL loop / on the execve-failure path):
     n = _allow(buf, n, 59);     # execve  (the initial image load)
-    n = _allow(buf, n, 60);     # exit    (execve-failure fallback in _child_exec)
+    n = _allow(buf, n, 322);    # execveat (v1.5.0 spawn#3 grandchild: memfd image via AT_EMPTY_PATH;
+                                #  the filter persists across it, so the re-exec'd image stays bounded)
+    n = _allow(buf, n, 60);     # exit    (execve-failure fallback in _child_exec / _child_exec_memfd)
     # NOTE: the emulate/ENOSYS skip sentinel (orig_rax = -1 -> nr 0xFFFFFFFF) is NOT in
     # this chain — it is allowed explicitly in apply_child_bound BEFORE the x32 guard,
     # which would otherwise KILL it (0xFFFFFFFF >= 0x40000000).
@@ -96,7 +98,7 @@ fn _bound_allowlist(buf): i64 {
 fn apply_child_bound(): i64 {
     sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    var allow = alloc(8 * 64);   # headroom: na=28 now; grows with the translation set
+    var allow = alloc(8 * 64);   # headroom: na=29 now; grows with the translation set
     if (allow == 0) { return 0 - 1; }                   # fail-closed: caller aborts the child
     var na = _bound_allowlist(allow);
 

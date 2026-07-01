@@ -41,6 +41,7 @@ enum MirshiPtrace {
     SYS_PTRACE = 101;
     SYS_PROCESS_VM_READV = 310;       # M2: read child paths / Linux structs out of child memory
     SYS_PROCESS_VM_WRITEV = 311;      # M2: stage NUL-terminated paths / agnos structs into child memory
+    SYS_MEMFD_CREATE = 319;           # v1.5.0 spawn#3: anonymous in-memory fd for the staged child ELF
     PTRACE_TRACEME = 0;
     PTRACE_CONT = 7;
     PTRACE_SYSCALL = 24;              # resume + EXECUTE one (rewritten) call, stop at exit
@@ -81,6 +82,13 @@ fn WSTOPSIG(status): i64 {
 # Thin ptrace(2) wrapper: ptrace(request, pid, addr, data).
 fn pt(req, pid, addr, data): i64 {
     return syscall(SYS_PTRACE, req, pid, addr, data);
+}
+
+# v1.5.0 spawn#3: create an anonymous in-memory file to hold the child ELF the supervisor stages,
+# then execveat's in the forked grandchild (AT_EMPTY_PATH). SUPERVISOR-side (pre-fork) — NOT in the
+# child seccomp bound. `name` is a debug-label cstr; flags 0. Returns the memfd, or < 0 = -errno.
+fn sys_memfd_create(name, flags): i64 {
+    return syscall(SYS_MEMFD_CREATE, name, flags);
 }
 
 # Write a NUL-terminated cstr to a fd without hand-counting its length.
@@ -139,23 +147,27 @@ include "src/dispatch.cyr"
 include "src/seccomp.cyr"
 include "src/limits.cyr"
 
-# The traced child. Runs the ABSOLUTE MINIMUM between fork and execve — mark
-# self as tracee, then replace the image. No alloc, no print: anything that
-# syscalls here would show up as a spurious pre-image trap (and we are not yet
-# set up to trace it). execve only returns on failure.
-fn _child_exec(path, bound, rootpath): i64 {
+# v1.5.0 spawn#3 config: intercept_run stashes the run-mode bound + rootpath here so a supervisor-
+# forked grandchild (_child_exec_memfd) can re-run the same gauntlet — it forks fresh from the mirshi
+# binary and inherits neither ROOTFD nor the seccomp filter, so both must be re-established.
+var _spawn_bound = 0;
+var _spawn_rootpath = 0;
+
+# The shared pre-exec gauntlet, run by BOTH the root child (_child_exec) and a spawn#3 grandchild
+# (_child_exec_memfd). Runs the ABSOLUTE MINIMUM between fork and exec — mark self as tracee, then
+# the 0.6.0 rlimits, the 0.7.1 rootfd anchor, and the M3 seccomp bound. No alloc/print: a stray
+# syscall here is a spurious pre-image trap. Each step FAIL-CLOSED (SYS_EXIT — never run with
+# confinement/bound silently off). Returns 0 on full success; never returns on a setup failure.
+fn _child_setup(bound, rootpath): i64 {
     pt(PTRACE_TRACEME, 0, 0, 0);
-    # 0.6.0 host-resource bounds: kernel-enforced rlimits (address space + fds) so a
-    # runaway/hostile child can't exhaust the host through the translated surface.
-    # ALWAYS on (independent of --no-seccomp) and FIRST — set before any seccomp
-    # filter so prlimit64 needs no allowlist entry and the child can't raise them.
+    # 0.6.0 host-resource bounds: kernel-enforced rlimits (address space + fds) so a runaway/hostile
+    # child can't exhaust the host. ALWAYS on and FIRST — before any seccomp filter, so prlimit64
+    # needs no allowlist entry and the child can't raise them.
     apply_child_rlimits();
-    # 0.7.1 rootfs confinement: open the configured root as the child's anchor fd, pinned
-    # at the fixed number ROOTFD that the dispatcher anchors every confined open#7 at.
-    # BEFORE the seccomp filter (dup3 is not allowlisted) and WITHOUT O_CLOEXEC (it must
-    # survive execve). O_PATH makes the fd inert as a data handle (read/getdents -> EBADF)
-    # yet valid as an openat2 anchor. FAIL-CLOSED: if the root won't open, abort rather
-    # than run the child with confinement silently disabled. See docs/adr/0009.
+    # 0.7.1 rootfs confinement: open the configured root as the child's anchor fd, pinned at the fixed
+    # ROOTFD the dispatcher anchors every confined open#7 at. BEFORE the seccomp filter (dup3 is not
+    # allowlisted), WITHOUT O_CLOEXEC (must survive exec). O_PATH keeps it inert as a data handle yet
+    # valid as an openat2 anchor. FAIL-CLOSED. See docs/adr/0009.
     if (rootpath != 0) {
         var rfd = syscall(HOST_OPEN, rootpath, O_PATH | O_DIRECTORY, 0);
         if (rfd < 0) {
@@ -164,9 +176,8 @@ fn _child_exec(path, bound, rootpath): i64 {
             return BOUND_FAILED;
         }
         if (rfd != ROOTFD) {
-            # dup3 returns the new fd on success — fail-closed if it does NOT land at
-            # ROOTFD, else the child would run with the anchor fd missing/wrong (the
-            # dispatcher's openat2 would resolve against the wrong fd = broken confinement).
+            # dup3 returns the new fd on success — fail-closed if it does NOT land at ROOTFD, else the
+            # child runs with the anchor fd wrong (openat2 would resolve against the wrong fd).
             if (syscall(HOST_DUP3, rfd, ROOTFD, 0) != ROOTFD) {
                 _emit(2, "mirshi: --root dup3 failed — refusing to run child unconfined\n");
                 syscall(SYS_EXIT, BOUND_FAILED);
@@ -175,11 +186,9 @@ fn _child_exec(path, bound, rootpath): i64 {
             syscall(HOST_CLOSE, rfd);
         }
     }
-    # M3 bounding seccomp: restrict the child to the agnos syscall surface before
-    # exec (the filter persists across execve). Installed here, after TRACEME and
-    # before execve, so the agnos image runs under it. FAIL-CLOSED (0.7.0 audit b1):
-    # if the bound cannot be installed, ABORT the child rather than exec it
-    # unconfined — a sandbox that silently runs unbounded is worse than not running.
+    # M3 bounding seccomp: restrict the child to the agnos surface before exec (the filter persists
+    # across execve/execveat). FAIL-CLOSED (0.7.0 audit b1) — a sandbox that silently runs unbounded
+    # is worse than not running. See docs/adr/0004.
     if (bound == 1) {
         if (apply_child_bound() != 0) {
             _emit(2, "mirshi: seccomp bound failed to install — refusing to run child unbounded\n");
@@ -187,12 +196,37 @@ fn _child_exec(path, bound, rootpath): i64 {
             return BOUND_FAILED;
         }
     }
-    var argv[24];                 # 3 slots: [path, NULL, spare] — bytes, not entries
+    return 0;
+}
+
+# The root child: run the gauntlet, then load the agnos ELF from `path` via execve (returns only on
+# failure).
+fn _child_exec(path, bound, rootpath): i64 {
+    _child_setup(bound, rootpath);          # never returns on a setup failure
+    var argv[24];                           # 3 slots: [path, NULL, spare] — bytes, not entries
     store64(&argv, path);
     store64(&argv + 8, 0);
     var envp[8];
     store64(&envp, 0);
     sys_execve(path, &argv, &envp);
+    syscall(SYS_EXIT, EXECVE_FAILED);
+    return EXECVE_FAILED;
+}
+
+# A spawn#3 grandchild (v1.5.0): run the SAME gauntlet, then load the in-memory ELF from `memfd` via
+# execveat(memfd, "", [NULL], [NULL], AT_EMPTY_PATH) — agnos spawn passes no argv/envp. The memfd
+# (opened by the supervisor pre-fork) is inherited across the fork. The grandchild forks fresh from
+# the mirshi binary (NOT cloned from the agnos parent), so _child_setup re-establishes ROOTFD + the
+# bound (fed _spawn_rootpath / _spawn_bound by the caller). execveat returns only on failure.
+fn _child_exec_memfd(memfd, bound, rootpath): i64 {
+    _child_setup(bound, rootpath);          # never returns on a setup failure
+    var empty[8];
+    store8(&empty, 0);                      # "" — AT_EMPTY_PATH operates on the fd itself
+    var argv[8];
+    store64(&argv, 0);                      # argv = [NULL]
+    var envp[8];
+    store64(&envp, 0);                      # envp = [NULL]
+    sys_execveat(memfd, &empty, &argv, &envp, AT_EMPTY_PATH);
     syscall(SYS_EXIT, EXECVE_FAILED);
     return EXECVE_FAILED;
 }
@@ -443,17 +477,21 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
         _net_count = net_count;
         _net_listen_any = net_listen_any;
     }
+    # The bounding allowlist is the RUN translation's output set; it does not fit the trace mode
+    # (SYSEMU leaves the raw agnos numbers unrewritten), so only bound in run mode. Computed before
+    # the fork so the child branch AND the spawn#3 config below share one value.
+    var b = bound;
+    if (selftest == 1) { b = 0; }
+    # v1.5.0 spawn#3: stash the run-mode bound + rootpath so a supervisor-forked grandchild
+    # (_child_exec_memfd) re-runs the same gauntlet (it inherits neither ROOTFD nor the filter).
+    _spawn_bound = b;
+    _spawn_rootpath = rp;
     var pid = sys_fork();
     if (pid < 0) {
         _emit(2, "mirshi: fork failed\n");
         return 1;
     }
     if (pid == 0) {
-        # The bounding allowlist is the RUN translation's output set; it does not
-        # fit the trace mode (SYSEMU leaves the raw agnos numbers unrewritten), so
-        # only bound in run mode.
-        var b = bound;
-        if (selftest == 1) { b = 0; }
         _child_exec(path, b, rp);   # never returns on success
         return EXECVE_FAILED;
     }
