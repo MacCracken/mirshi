@@ -8,6 +8,9 @@
 > tests** (`tests/mirshi.tcyr`: `xlat-nr`, `fs-nr`, `xlat-coverage` assert
 > `agnos_to_linux_nr` for every number 0–61 + boundaries). Changing a row is a
 > deliberate contract change — update the code, this doc, **and** the freeze test together.
+> The v1.0 **core is frozen**; the **net band** (#47–50 client / #56–57 server) is a documented
+> **post-v1 extension** (v1.1.0 / v1.2.0, EMULATE under `--net` — footnote ²), the remaining
+> net numbers (#51–55, #61) still ENOSYS pending v1.3.0–v1.4.0.
 
 ## Dispositions
 
@@ -69,21 +72,21 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 42–44 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
-| 47 | sock_connect | ENOSYS | — | sovereign net band #47–57 (+ #61) — **first post-v1 expansion** |
-| 48 | sock_send | ENOSYS | — | net band — post-v1 |
-| 49 | sock_recv | ENOSYS | — | net band — post-v1 (inverted-EOF) |
-| 50 | sock_close | ENOSYS | — | net band — post-v1 |
-| 51 | udp_bind | ENOSYS | — | net band — post-v1 |
-| 52 | udp_send | ENOSYS | — | net band — post-v1 |
-| 53 | udp_recv | ENOSYS | — | net band — post-v1 |
-| 54 | udp_unbind | ENOSYS | — | net band — post-v1 |
-| 55 | icmp_echo | ENOSYS | — | net band — post-v1 |
-| 56 | sock_listen | ENOSYS | — | net band — post-v1 |
-| 57 | sock_accept | ENOSYS | — | net band — post-v1 |
+| 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress |
+| 48 | sock_send | EMULATE ² | — | net band client (v1.1.0): pvm-staged `send` (`MSG_NOSIGNAL`) |
+| 49 | sock_recv | EMULATE ² | — | net band client (v1.1.0): **inverted EOF** (0=WOULD_BLOCK, −1=EOF) |
+| 50 | sock_close | EMULATE ² | — | net band (v1.1.0): free the slot; a LISTEN slot reaps children (v1.2.0) |
+| 51 | udp_bind | ENOSYS | — | net band — pending v1.3.0 (UDP) |
+| 52 | udp_send | ENOSYS | — | net band — pending v1.3.0 (UDP) |
+| 53 | udp_recv | ENOSYS | — | net band — pending v1.3.0 (UDP) |
+| 54 | udp_unbind | ENOSYS | — | net band — pending v1.3.0 (UDP) |
+| 55 | icmp_echo | ENOSYS | — | net band — pending v1.4.0 (ICMP) |
+| 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
+| 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
 | 59 | flock | ENOSYS | — | |
 | 60 | winsize | ENOSYS | — | graphics — post-v1 |
-| 61 | net_config | ENOSYS | — | net band — post-v1 |
+| 61 | net_config | ENOSYS | — | net band — pending v1.3.0 (netns config read) |
 
 Any number > 61 (and the undefined gaps) → **ENOSYS**.
 
@@ -94,6 +97,13 @@ filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLV
 lexically sanitized (`sanitize_rootrel`). The fd-based ops (`read`/`write`/`lseek`/`dup`/
 `close`/`getdents`) ride a fd from a confined `open`, so they are transitively confined.
 Without `--root`, the peers in the table above apply (transparent pass-through).
+
+² **Net band (post-v1 extension, `--net`).** #47–50 (TCP client, v1.1.0) and #56/#57 (TCP server,
+v1.2.0) are **supervisor-EMULATE** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
+the supervisor owns the sockets via an 8-slot `conn_id/listener_id → host fd` table; the child never
+holds a socket fd. Enabled by `--net` / `--net-allow` (egress default-deny) / `--net-listen-any` (ingress
+loopback-default). **Without `--net` they return ENOSYS** (agnos `-1`). UDP #51–54, ICMP #55, and
+`net_config#61` remain ENOSYS pending v1.3.0–v1.4.0 (see the [roadmap net band arc](../development/roadmap.md)).
 
 ## The runnable surface (v1)
 

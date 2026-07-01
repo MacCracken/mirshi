@@ -5,14 +5,17 @@
 
 ## Version
 
-**1.1.0** — 2026-06-30. **Net band — TCP client** (the first post-v1 expansion,
-[ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). agnos net tools can open TCP
-connections through mirshi: `sock_connect#47`/`send#48`/`recv#49`/`close#50` are **supervisor-emulated**
-— the supervisor owns the sockets via an 8-slot `conn_id(0..7)→host fd` table, the child never holds a
-socket fd, and the child seccomp allowlist is unchanged. Egress is **default-deny** (`--net` opt-in +
-`--net-allow` CIDR policy, SSRF-hardened, brute-force-verified over all 2³²). Proven end-to-end by an
-agnos HTTP-GET round-trip (`scripts/it/net_io.sh`). TCP server / UDP / ICMP / `net_config#61` follow in
-v1.2.0–v1.4.0. **1.0.0** — the clean cut: AGNOS userland in Docker, no QEMU — a representative agnos CLI
+**1.2.0** — 2026-06-30. **Net band — TCP server** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
+agnos server tools can accept inbound TCP through mirshi: `sock_listen#56` (merges bind+listen) /
+`sock_accept#57`, supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table (conn / listen);
+`sock_close#50` on a listener **reaps its accepted children**. Ingress is **loopback-only by default**
+(`--net-listen-any` binds all interfaces) — the sandboxed child's server isn't network-reachable unless
+asked. Proven by an agnos server accepting a real client (`scripts/it/net_server.sh`, both bind modes).
+UDP / ICMP / `net_config#61` follow in v1.3.0–v1.4.0. **1.1.0** — Net band TCP client (the first post-v1
+expansion): `sock_connect#47`/`send#48`/`recv#49`/`close#50` supervisor-emulated (the conn_id slot table;
+child never holds a socket fd; seccomp allowlist unchanged); egress **default-deny** (`--net`/`--net-allow`,
+SSRF-hardened, brute-force-verified over all 2³²); proven by an agnos HTTP-GET round-trip. **1.0.0** — the
+clean cut: AGNOS userland in Docker, no QEMU — a representative agnos CLI
 userland (`hello`/`echo`/`catfile`/`ls`/`cp`) runs under mirshi in a plain `FROM scratch` container,
 fan-out-ready, seccomp-bounded (`docker/smoke.sh`); the v1 definition met, capping the 0.6→0.9 quality
 arc. 0.9.0 = freeze + docs cleanup: froze the v1 contracts — the per-number **syscall-coverage
@@ -76,9 +79,10 @@ paths in the child red zone + repack output structs at the exit stop
   `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
   default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
   The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
-- Net band TCP client (1.1.0, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
-  `sock_connect#47`/`send#48`/`recv#49`/`close#50` supervisor-emulated (an 8-slot `conn_id→host fd`
-  table); egress default-deny via `--net`/`--net-allow`. `net_config#61` + server/UDP/ICMP are v1.2–1.4.
+- Net band (1.1.0 client + 1.2.0 server, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
+  `sock_connect#47`/`send#48`/`recv#49`/`close#50` + `sock_listen#56`/`accept#57` supervisor-emulated over a
+  unified 8-slot `{fd, kind, parent}` table (conn / listen; `close#50` reaps a listener's children). Egress
+  default-deny via `--net`/`--net-allow`; ingress loopback-default via `--net-listen-any`. UDP/ICMP/`net_config#61` are v1.3–1.4.
 
 ## Tests
 
@@ -125,6 +129,9 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/net_io.sh` — 1.1.0 net-band send/recv gate (CI step, after net_client): an agnos
   HTTP-GET round-trip (`connect`/`send`/`recv`-loop-to-EOF/`close`) proving `send#48`/`recv#49` +
   the inverted-EOF end-to-end against a local server. Needs python3.
+- `scripts/it/net_server.sh` — 1.2.0 net-band TCP-server gate (CI step, after net_io): an agnos
+  server (`sock_listen#56`/`accept#57`/recv/send/`close#50`-reap) accepts a real python client and
+  replies, in both bind modes (loopback default + `--net-listen-any`). Needs python3.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -218,11 +225,19 @@ connections through mirshi — `sock_connect#47`/`send#48`/`recv#49`/`close#50` 
 8-slot `conn_id→host fd` table; the child never holds a socket fd; the seccomp allowlist unchanged). Egress
 is **default-deny** (`--net`/`--net-allow`, SSRF-hardened, brute-force-verified over all 2³²). Proven by an
 agnos HTTP-GET round-trip (`scripts/it/net_io.sh`) — the inverted `recv#49` EOF validated live; the
-socket/send/recv handlers adversarially reviewed (no fd/slot leak, OOB, SIGPIPE-kill, or overflow). Next in
-the arc: **v1.2.0** TCP server (`listen#56`/`accept#57`), then **v1.3.0** UDP + `net_config#61`, then **v1.4.0** ICMP.
+socket/send/recv handlers adversarially reviewed (no fd/slot leak, OOB, SIGPIPE-kill, or overflow).
+
+**1.2.0 — net band, TCP server** — ✅ shipped 2026-06-30: agnos server tools accept inbound TCP through
+mirshi — `sock_listen#56` (bind+listen) / `sock_accept#57`, supervisor-emulated over a unified 8-slot
+`{fd, kind, parent}` table (conn / listen); `sock_close#50` on a listener **reaps its accepted children**.
+Ingress is **loopback-only by default** (`--net-listen-any` binds all interfaces) — the safe posture, so a
+sandboxed child's server isn't network-reachable unless asked. Proven by an agnos server accepting a real
+client (`scripts/it/net_server.sh`, both bind modes); the server + reap handlers adversarially reviewed (no
+fd/slot leak, double/cross-close, or OOB; the reap invariant pinned in a comment). Next: **v1.3.0** UDP +
+`net_config#61`, then **v1.4.0** ICMP.
 
 **Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 —
-TCP client shipped (1.1.0), server/UDP/ICMP ongoing (v1.2–1.4); **multi-process** agnos
+TCP client + server shipped (1.1.0/1.2.0), UDP/ICMP ongoing (v1.3–1.4); **multi-process** agnos
 (`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
 **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
 compat layer), v2+. Each is its own validation surface; the translation core built here runs from both

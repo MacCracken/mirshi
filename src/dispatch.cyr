@@ -374,6 +374,11 @@ fn _net_close_conn(pid, regs): i64 {
     if (load64(b + 8) == SLOT_FREE) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
     # A LISTEN slot reaps its accepted children first (agnos #50 semantics): close + free every
     # SLOT_CONN whose parent is this listener, so a server that closes its listener doesn't leak.
+    # INVARIANT (load-bearing): `parent` is a bare slot INDEX (not generation-stamped), so this is
+    # correct ONLY because a SLOT_LISTEN is NEVER freed without first reaping its children here —
+    # a listener index can therefore only be reused after all children carrying it are gone, so no
+    # stranded child can cross-close an unrelated (reused-index) listener. Any future path that
+    # frees a SLOT_LISTEN MUST reap first, or switch `parent` to a generation-stamped id.
     if (load64(b + 8) == SLOT_LISTEN) {
         var tbl = _net_tbl();
         var i = 0;

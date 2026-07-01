@@ -157,7 +157,7 @@ with every v1.0 criterion across the 0.6–0.9 arc:
 - [x] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
 - [x] CHANGELOG complete from 0.1.0; ADRs for the load-bearing decisions (0.9.0)
 
-## Post-v1 — the net band arc (v1.1.0 → v1.4.0) — v1.1.0 shipped 2026-06-30
+## Post-v1 — the net band arc (v1.1.0 → v1.4.0) — v1.2.0 shipped 2026-06-30
 
 The **first post-v1 expansion**: the sovereign net band (#47–57, #61) over Linux sockets, so agnos net tools
 (`http`/`ws_server`/dns, `agora`/`descent`) run under mirshi at fan-out scale. Architecture + security are fixed
@@ -167,12 +167,13 @@ pattern), the child never holds a socket fd, and the seccomp allowlist is **unch
 supervisor-side). Chosen over execute-in-child to avoid a rip-rewind loop change ([ADR 0002](../adr/0002-execute-in-child-translation.md)'s
 rejected pattern) and to keep the fd + the egress choke point supervisor-side. **Egress is a shipping gate**:
 `--net` opt-in + `--net-allow <CIDR>[:ports]` **default-deny** (stricter than `--root` — metadata/RFC1918/loopback
-blocked, fail-closed to agnos `-1`). Client-first.
+blocked, fail-closed to agnos `-1`). Client-first; the **ingress** side (v1.2.0 server) binds **loopback-only by
+default** (`--net-listen-any` to expose all interfaces), so a sandboxed child's server isn't network-reachable unless asked.
 
 | Ver | Slice | Acceptance gate | Key risk |
 |---|---|---|---|
 | **v1.1.0** ✅ | **TCP client** (`#47`/`48`/`49`/`50`) + `--net`/`--net-allow` egress | agnos HTTP-GET round-trip — connect/send/recv-loop-to-EOF/close (`scripts/it/net_io.sh` + `net_client.sh`) — **shipped 2026-06-30** | done ✓ |
-| **v1.2.0** | **TCP server** (`sock_listen#56`/`accept#57`) | agnos `ws_server.cyr` accepts a connection | 2nd slot namespace; `close#50` reaps children |
+| **v1.2.0** ✅ | **TCP server** (`sock_listen#56`/`accept#57`) + `--net-listen-any` (loopback-default ingress) | agnos server accepts a real client (`scripts/it/net_server.sh`, both bind modes) — **shipped 2026-06-30** | done ✓ |
 | **v1.3.0** | **UDP** (`#51`–`54`) + `net_config#61` (DNS/gateway) | agnos DNS-class fixture resolves via a resolver | `addr_out` repack; packed ports; the netns-config read |
 | **v1.4.0** | **ICMP** (`icmp_echo#55`) | agnos ping-class tool RTTs a host | unprivileged `SOCK_DGRAM` ICMP (`ping_group_range`) — env-sensitive |
 

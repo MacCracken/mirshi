@@ -4,6 +4,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-06-30
+
+**Net band — TCP server.** agnos server tools can now accept inbound TCP connections through
+mirshi: `sock_listen#56` / `sock_accept#57`, supervisor-emulated over the same conn_id slot
+table as the client. Safe-by-default ingress posture ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)).
+
+### Added
+- **Net band TCP server** (`src/dispatch.cyr`): `sock_listen#56` merges bind+listen (a supervisor
+  non-blocking listening socket, `SO_REUSEADDR`); `sock_accept#57` `accept4`s the next connection
+  into a fresh `SLOT_CONN` whose `parent` is the listener (so `sock_close#50` on a listener **reaps
+  its accepted children** — the agnos 1.45.6 semantic). The slot table became a unified 8-slot
+  `{fd, kind, parent}` space (conn / listen), so `close#50(id)` is unambiguous; send/recv now
+  require a live `SLOT_CONN` (can't operate on a listener).
+- **`--net-listen-any`** (`src/main.cyr`): `sock_listen` binds **all interfaces** (the faithful
+  agnos behavior, network-exposed); the default binds **loopback only** — the safe ingress default
+  (a sandboxed child's server is reachable only from localhost / the same container).
+- **New gate** `scripts/it/net_server.sh`: an agnos server (listen/accept/recv/send/close-reap)
+  accepts a real python client and replies, verified in **both** bind modes. CI-wired.
+
+### Security
+- **Ingress default-loopback** ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)):
+  a sandboxed child's listening socket is bound to loopback unless `--net-listen-any` is passed,
+  so the new inbound surface is not network-exposed by default (mirrors the egress default-deny
+  posture). The server + reap-children handlers were adversarially reviewed (no fd/slot leak,
+  double-close, cross-close, or OOB; the reap invariant is pinned in a code comment).
+
 ## [1.1.0] — 2026-06-30
 
 **Net band — TCP client (the first post-v1 expansion).** agnos net tools can now open TCP
