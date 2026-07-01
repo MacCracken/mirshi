@@ -437,6 +437,25 @@ fn main() {
     assert_eq(_spawn_size_ok(SPAWN_ELF_MAX), 1, "size == cap -> ok");
     assert_eq(_spawn_size_ok(SPAWN_ELF_MAX + 1), 0, "size > cap -> reject");
 
+    # --- v1.6.0 signal-mask helpers (src/children.cyr) — agnos 1<<sig convention ------------
+    test_group("signal-mask");
+    assert_eq(_sig_valid(0), 0, "sig 0 invalid");
+    assert_eq(_sig_valid(1), 1, "sig 1 (SIGHUP) valid");
+    assert_eq(_sig_valid(15), 1, "sig 15 (SIGTERM) valid");
+    assert_eq(_sig_valid(63), 1, "sig 63 valid (top of the 64-bit mask)");
+    assert_eq(_sig_valid(64), 0, "sig 64 invalid (would overflow the mask)");
+    assert_eq(_sig_valid(0 - 1), 0, "negative sig invalid");
+    assert_eq(_sig_bit(1), 2, "_sig_bit(1) = 1<<1 = 2 (bit N = signal N, NOT libc 1<<(sig-1))");
+    assert_eq(_sig_bit(15), 32768, "_sig_bit(15) = 1<<15 (SIGTERM)");
+    assert_eq(_sig_deliverable(_sig_bit(15), 0), _sig_bit(15), "SIGTERM pending, none blocked -> deliverable");
+    assert_eq(_sig_deliverable(_sig_bit(15), _sig_bit(15)), 0, "SIGTERM pending but blocked -> not deliverable");
+    assert_eq(_sig_deliverable(_sig_bit(15) | _sig_bit(2), _sig_bit(15)), _sig_bit(2), "block masks only its own bit");
+    assert_eq(_sig_deliverable(0, 0), 0, "nothing pending -> nothing deliverable");
+    assert_eq(_sig_lowest(0), 0, "empty mask -> 0 (no signal)");
+    assert_eq(_sig_lowest(_sig_bit(15)), 15, "single SIGTERM -> 15");
+    assert_eq(_sig_lowest(_sig_bit(15) | _sig_bit(2)), 2, "SIGINT+SIGTERM -> lowest first (2)");
+    assert_eq(_sig_lowest(_sig_bit(9) | _sig_bit(17)), 9, "SIGKILL+SIGCHLD -> lowest first (9)");
+
     return assert_summary();
 }
 

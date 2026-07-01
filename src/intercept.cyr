@@ -66,6 +66,8 @@ enum MirshiPtrace {
     WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
     __WALL = 0x40000000;              # wait4: reap children of ANY signal-delivery flavor (v1.5.0
                                       # multi-tracee demux; robust for supervisor-forked grandchildren)
+    PAUSE_YIELD_NS = 1000000;         # v1.6.0 pause#14 bounded-yield quantum (1 ms — the "one hlt"
+                                      # idle; short-circuited to 0 when a deliverable signal is pending)
 }
 
 # wait-status decoders the stdlib lacks. lib/syscalls_linux_common.cyr provides
@@ -383,6 +385,43 @@ fn _break_deadlock(): i64 {
     return 0;
 }
 
+# kill#16(pid, sig) -> 0 / -1. A SUPERVISOR-CONTROL op: validate sig (1..63) + pid!=0 + self/direct-
+# child scope, then OR (1<<sig) into the TARGET's pending mask. The caller returns 0 on success — the
+# target picks the bit up on its next pause#14 / signalfd#18 read (v1.6.0 is edge-triggered + non-
+# blocking, so nothing to wake yet). `rec` is the CALLER's record.
+fn _do_kill(pid, regs, rec): i64 {
+    var tgt_pid = decode_arg(regs, 0);
+    var sig = decode_arg(regs, 1);
+    if (tgt_pid == 0) { return _net_emu(pid, regs, 0 - 1); }          # pid 0 protected (no broadcast)
+    if (_sig_valid(sig) != 1) { return _net_emu(pid, regs, 0 - 1); }  # bad signal number
+    var t = _child_find_by_agnos(tgt_pid);
+    if (t == 0) { return _net_emu(pid, regs, 0 - 1); }               # unknown pid
+    # Scope = self OR a DIRECT child of the caller (agnos "self/child only").
+    var caller = load64(rec + C_AGNOS_PID);
+    var ok = 0;
+    if (t == rec) { ok = 1; }                                        # self
+    if (load64(t + C_PARENT) == caller) { ok = 1; }                  # direct child
+    if (ok == 0) { return _net_emu(pid, regs, 0 - 1); }             # not self/child -> denied
+    store64(t + C_PENDING_SIG, load64(t + C_PENDING_SIG) | _sig_bit(sig));   # set the pending bit
+    return _net_emu(pid, regs, 0);
+}
+
+# pause#14() -> 0. A BOUNDED YIELD — never blocks forever (that would wedge _agnos_sock_recv_block's
+# TLS/HTTP poll loop, which yields via pause#14 between non-blocking sock_recv polls). If a deliverable
+# signal is already pending, return 0 immediately; else idle a short quantum in the supervisor (the
+# child is stopped at its trap — same nanosleep idiom as sleep_ms#41) then return 0. Matches agnos's
+# "one hlt" edge-triggered contract; no CS_BLOCKED park, so no deadlock-guard interaction.
+fn _do_pause(pid, regs, rec): i64 {
+    if (_sig_deliverable(load64(rec + C_PENDING_SIG), load64(rec + C_SIG_BLOCKED)) != 0) {
+        return _net_emu(pid, regs, 0);              # a deliverable signal is pending -> wake now
+    }
+    var req = _emu_ts_buf();
+    store64(req, 0);                                # tv_sec = 0
+    store64(req + 8, PAUSE_YIELD_NS);               # tv_nsec = the yield quantum
+    syscall(SYS_NANOSLEEP, req, 0);
+    return _net_emu(pid, regs, 0);
+}
+
 # Consume the post-execve SIGTRAP stop (delivered BEFORE options are set, so no
 # 0x80 bit) and set ptrace options ONCE. Returns -1 when attached OK (proceed),
 # else a >= 0 mirshi exit code to propagate immediately (the child died or
@@ -572,6 +611,8 @@ fn _trace_run(root_pid): i64 {
                         var handled = 0;
                         if (enr == 3) { verdict = _do_spawn(wpid, regs, rec); handled = 1; }
                         if (enr == 4) { verdict = _do_waitpid(wpid, regs, rec); handled = 1; }
+                        if (enr == 14) { verdict = _do_pause(wpid, regs, rec); handled = 1; }
+                        if (enr == 16) { verdict = _do_kill(wpid, regs, rec); handled = 1; }
                         if (handled == 0) { verdict = translate_dispatch(wpid, regs); }
                         store64(rec + C_STRAT, verdict);
                         # Save this child's dispatch carry into its record; the globals are then

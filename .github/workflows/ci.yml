@@ -204,6 +204,13 @@ jobs:
         # handles nesting). Needs the same-uid ptrace requirement.
         run: bash scripts/it/spawn_storm.sh
 
+      - name: Signals — kill#16 + pause#14 (v1.6.0)
+        # v1.6.0 signal band (BITE 1): agnos kill#16 sets a 1<<sig pending bit on the target (self /
+        # direct-child scope, pid 0 protected, sig validated), supervisor-emulated over the record
+        # table; pause#14 is a bounded yield (returns 0, never wedges the recv poll loop). Delivery
+        # (signalfd#18) lands in a later bite. Needs the same-uid ptrace requirement.
+        run: bash scripts/it/signals.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

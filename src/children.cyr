@@ -19,7 +19,7 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
                                 # that flipping spawn#3 to EMULATE reopens (deliberately NOT
                                 # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 136;       # 17 x i64 fields
+    CHILD_REC_SIZE = 144;       # 18 x i64 fields
     # --- record field offsets (all i64) ---
     C_AGNOS_PID = 0;            # the opaque guest-facing pid mirshi coined (root = 1)
     C_HOST_PID = 8;            # the real Linux pid (the wait4 / ptrace target)
@@ -33,13 +33,16 @@ enum MirshiChild {
     C_AT_ENTRY = 64;           # enter/exit ptrace toggle (was a _trace_run local)
     C_AGNOS_NR = 72;           # agnos syscall nr captured at enter (was a _trace_run local)
     C_STRAT = 80;              # dispatcher verdict at enter (was a _trace_run local)
-    C_PENDING_SIG = 88;        # RESERVED (unused in v1.5.0): the resume-immediately loop delivers a
-                               # signal inline, no cross-iteration carry; reserved for v1.6.0 signals
+    C_PENDING_SIG = 88;        # v1.6.0: the per-child PENDING signal mask (agnos `1<<sig` — bit N =
+                               # signal N, NOT libc's 1<<(sig-1)). kill#16 sets bits; pause#14 /
+                               # signalfd#18 read them. Deliverable = pending & ~C_SIG_BLOCKED.
     C_XLAT_EMU_RET = 96;       # enter->exit EMULATE/ENOSYS return carry (was _xlat_emu_ret)
     C_M2_OUT_PTR = 104;        # fs exit-stop repack carry (was _m2_out_ptr)
     C_M2_OUT_CAP = 112;        #   "     (was _m2_out_cap)
     C_M2_SCRATCH = 120;        #   "     (was _m2_scratch)
     C_NET_TBL = 128;           # this child's net slot-table ptr (0 = not yet alloc'd)
+    C_SIG_BLOCKED = 136;       # v1.6.0: the per-child BLOCKED signal mask (sigprocmask#17, `1<<sig`);
+                               # a signal is deliverable iff (C_PENDING_SIG & ~C_SIG_BLOCKED) has it
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
@@ -91,6 +94,39 @@ fn _any_running(): i64 {
     var i = 0;
     while (i < MAX_CHILDREN) {
         if (load64(tbl + i * CHILD_REC_SIZE + C_STATE) == CS_RUNNING) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- v1.6.0 signal-mask helpers (PURE, unit-tested). agnos masks are `1<<sig` (bit N = signal N),
+#     NOT libc's 1<<(sig-1). Real signals are 1..63; kill#16 never sets bit 0. ---
+
+# True (1) iff `sig` is a valid signal number (1..63) — guards the undefined `1<<sig` for sig<=0 /
+# sig>=64 before kill#16 sets a bit.
+fn _sig_valid(sig): i64 {
+    if (sig < 1) { return 0; }
+    if (sig > 63) { return 0; }
+    return 1;
+}
+
+# The single-bit mask for `sig` (agnos `1<<sig`). Caller must `_sig_valid(sig)` first (no re-guard).
+fn _sig_bit(sig): i64 {
+    return 1 << sig;
+}
+
+# The deliverable set: signals pending AND not blocked. Cyrius has no unary `~`, so ~blocked is the
+# two's-complement identity ~x == 0 - x - 1.
+fn _sig_deliverable(pending, blocked): i64 {
+    return pending & (0 - blocked - 1);
+}
+
+# The lowest set signal number in `mask` (1..63), or 0 if none — the delivery order (pause#14 /
+# signalfd#18 hand out the lowest-numbered pending signal first).
+fn _sig_lowest(mask): i64 {
+    var i = 1;
+    while (i <= 63) {
+        if (((mask >> i) & 1) != 0) { return i; }
         i = i + 1;
     }
     return 0;
@@ -176,6 +212,7 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_M2_OUT_CAP, 0);
             store64(b + C_M2_SCRATCH, 0);
             store64(b + C_NET_TBL, 0);
+            store64(b + C_SIG_BLOCKED, 0);
             return b;
         }
         i = i + 1;
