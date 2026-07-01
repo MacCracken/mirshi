@@ -191,6 +191,12 @@ jobs:
         # the same-uid ptrace requirement.
         run: bash scripts/it/waitpid.sh
 
+      - name: Multi-process — getpid#2 pid model (v1.5.0)
+        # v1.5.0 multi-process (BITE 9): getpid#2 is EMULATE, returning the caller's coined agnos pid
+        # (root=1, a spawn#3 child=2) instead of the host getpid#39 — so each process sees ITS agnos
+        # pid, matching what spawn returns to the parent. Needs the same-uid ptrace requirement.
+        run: bash scripts/it/getpid.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

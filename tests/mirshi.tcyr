@@ -71,7 +71,7 @@ fn main() {
     test_group("xlat-nr");
     assert_eq(agnos_to_linux_nr(1), 1, "write 1->1");
     assert_eq(agnos_to_linux_nr(5), 0, "read 5->0 (DIFFERS)");
-    assert_eq(agnos_to_linux_nr(2), 39, "getpid 2->39 (DIFFERS)");
+    assert_eq(agnos_to_linux_nr(2), 0 - 1, "getpid 2 -> no peer (v1.5.0: EMULATE at the dispatcher)");
     assert_eq(agnos_to_linux_nr(27), 9, "mmap 27->9");
     assert_eq(agnos_to_linux_nr(28), 11, "munmap 28->11");
     assert_eq(agnos_to_linux_nr(12), 162, "sync 12->162");
@@ -105,7 +105,7 @@ fn main() {
     assert_eq(linux_ret_to_agnos(27, 0 - 12), 0, "mmap fail -> 0 (not -1)");
     assert_eq(linux_ret_to_agnos(27, 0x7fff00000000), 0x7fff00000000, "mmap addr passes");
     assert_eq(linux_ret_to_agnos(46, 0 - 1), 0, "time fail -> 0 (not -1)");
-    assert_eq(linux_ret_to_agnos(2, 1234), 1234, "getpid passes");
+    assert_eq(linux_ret_to_agnos(46, 1700000000), 1700000000, "time seconds pass (getpid is now EMULATE)");
 
     # ms_from_timespec (uptime_ms emulation arithmetic).
     test_group("xlat-ms");

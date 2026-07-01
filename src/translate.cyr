@@ -27,7 +27,8 @@ enum MirshiStrat {
 fn agnos_to_linux_nr(agnos_nr): i64 {
     if (agnos_nr == 1) { return 1; }      # write       -> write(1)
     if (agnos_nr == 5) { return 0; }      # read        -> read(0)     [number DIFFERS]
-    if (agnos_nr == 2) { return 39; }     # getpid      -> getpid(39)  [number DIFFERS]
+    # getpid#2: NO Linux EXECUTE peer — v1.5.0 handles it EMULATE at the dispatcher (returns the
+    # caller's coined agnos pid, not host getpid#39); falls through to -1 (no peer) below.
     if (agnos_nr == 27) { return 9; }     # mmap        -> mmap(9)     [+ 6-arg synth]
     if (agnos_nr == 28) { return 11; }    # munmap      -> munmap(11)
     if (agnos_nr == 12) { return 162; }   # sync        -> sync(162)

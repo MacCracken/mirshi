@@ -32,7 +32,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 |--:|------|:-----:|-----------:|-------|
 | 0 | exit | EXIT | `exit_group` (231) | code in a1; terminates, no exit stop |
 | 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
-| 2 | getpid | EXECUTE | `getpid` (39) | number differs |
+| 2 | getpid | EMULATE | — | multi-process (v1.5.0): returns the caller's **coined agnos pid** (root=1), not host `getpid`(39) — else children would see clashing host pids; loop-supplied `_cur_rec` |
 | 3 | spawn | EMULATE | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
 | 4 | waitpid | EMULATE | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |

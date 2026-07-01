@@ -6,10 +6,10 @@
 # This gate storms the two dispatch classes NOT already RSS-gated by
 # supervisor_hardening.sh (which gates the EMULATE path via an uptime#40 storm):
 #
-#   (1) EXECUTE pass-through — a getpid#2 storm. The dominant hot path: the enter-stop
-#       renumber + the 0.8.0 single-register exit stop (PTRACE_PEEKUSER read, no write-
-#       back on success). Touches NO staging buffer, so mirshi's RSS must be FLAT —
-#       zero heap alloc, ever, per call.
+#   (1) EXECUTE pass-through — a time_unix#46 storm (bufferless; getpid#2 became EMULATE in
+#       v1.5.0). The dominant hot path: the enter-stop renumber + the 0.8.0 single-register
+#       exit stop (PTRACE_PEEKUSER read, no write-back on success). Touches NO staging buffer,
+#       so mirshi's RSS must be FLAT — zero heap alloc, ever, per call.
 #   (2) fs path-staging — a stat#33 storm on "/". The alloc-heaviest path: stage_at ->
 #       _m2_init (the _m2_pathbuf / _m2_linbuf / _m2_agnbuf buffers) + the exit-stop
 #       144->48 repack (pvm_read/write into those buffers). They are LAZY-ONCE
@@ -65,7 +65,7 @@ EOF
     fi
 }
 
-storm_flat getpidstorm 'syscall(2);'                       # EXECUTE pass-through (getpid#2)
+storm_flat timestorm   'syscall(46);'                      # EXECUTE pass-through (time_unix#46, bufferless)
 storm_flat statstorm   'syscall(33, p, strlen(p), &sb);'   # fs path-staging + exit repack (stat#33)
 
 if [ "$fail" -ne 0 ]; then echo "alloc-clean: FAILED" >&2; exit 1; fi

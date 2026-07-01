@@ -810,6 +810,14 @@ fn translate_dispatch(pid, regs): i64 {
         return STRAT_EXECUTE;
     }
 
+    # getpid#2 -> the CALLER's coined agnos pid (EMULATE; was EXECUTE -> host getpid#39). Once >1
+    # process exists a child expects ITS agnos pid, and two children each seeing a distinct host pid
+    # would clash with the pids spawn#3 coins. _cur_rec is the calling child's record (set by the loop
+    # at this enter stop); the coiner is monotonic (root = 1). No fault surface. See src/children.cyr.
+    if (nr == 2) {
+        return _net_emu(pid, regs, load64(_cur_rec + C_AGNOS_PID));
+    }
+
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert
     # to ms, skip the kernel syscall, stash the result. No fault surface.
