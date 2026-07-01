@@ -261,9 +261,11 @@ enum MirshiNetSys {
     NET_IO_CAP = 4096;           # one-page bound on a single send/recv payload (caller loops)
     NET_SLOTS = 8;               # agnos conn_id / listener_id space is 0..7 (the kernel's 8 slots)
     NET_SLOT_SIZE = 24;          # per-slot entry {i64 fd; i64 kind; i64 parent}
-    SLOT_FREE = 0;               # slot kind: free / a live conn / a listener
+    SLOT_FREE = 0;               # slot kind: free / a live conn / a TCP listener / a UDP socket
     SLOT_CONN = 1;
     SLOT_LISTEN = 2;
+    SLOT_UDP = 3;                # a bound UDP socket (udp_bind#51); its `parent` field holds the bound port
+    SOCK_DGRAM = 2;
     CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
     SYS_BIND = 49;
     SYS_LISTEN = 50;
@@ -277,8 +279,10 @@ enum MirshiNetSys {
 
 # The supervisor-side conn_id/listener_id(0..7) slot table (lazy-alloc-once, like _how_buf).
 # Each 24-byte slot is {i64 fd; i64 kind; i64 parent}: fd = host fd or -1; kind = SLOT_FREE /
-# SLOT_CONN / SLOT_LISTEN; parent = for an accepted conn, the listen slot it came from (so
-# closing a listener reaps its children), else -1. The child only ever sees the slot INDEX
+# SLOT_CONN / SLOT_LISTEN / SLOT_UDP; `parent` is the slot's extra datum — for an accepted conn
+# it is the listen slot it came from (so closing a listener reaps its children); for a SLOT_UDP
+# it is the bound port (so udp_send#52 can find the socket by its source port); else -1. The
+# child only ever sees the slot INDEX
 # (the opaque agnos conn_id / listen_id), never a host fd. ONE unified 0..7 space (mirroring
 # the agnos kernel's, so sock_close#50(id) is unambiguous whether id is a conn or a listen).
 var _net_slots = 0;
@@ -516,6 +520,116 @@ fn _net_accept(pid, regs): i64 {
     return _net_emu(pid, regs, slot);                    # conn_id = the new slot
 }
 
+# udp_bind#51(port) -> listener_id 0..7 / -1. A bound non-blocking DGRAM socket (SLOT_UDP), the
+# bound port stashed in `parent` so udp_send#52 can find it by source port. Loopback bind by
+# default (ingress posture, like sock_listen); --net-listen-any binds all interfaces.
+fn _net_udp_bind(pid, regs): i64 {
+    var port = decode_arg(regs, 0);
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    store32(sb + 40, 1);
+    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, sb + 40, 4);
+    var bind_ip = LOOPBACK_IP;
+    if (_net_listen_any == 1) { bind_ip = INADDR_ANY_IP; }
+    build_sockaddr_in(sb, bind_ip, port);
+    if (syscall(SYS_BIND, fd, sb, SOCKADDR_IN_SIZE) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);
+    store64(b + 8, SLOT_UDP);
+    store64(b + 16, port);                               # `parent` = the bound source port
+    return _net_emu(pid, regs, slot);
+}
+
+# The bound UDP socket fd whose source port == `sport`, or -1. udp_send#52 sends FROM this socket
+# so the reply returns to the matching udp_recv#53 listener.
+fn _net_udp_fd_by_port(sport): i64 {
+    var tbl = _net_tbl();
+    var i = 0;
+    while (i < NET_SLOTS) {
+        var b = tbl + i * NET_SLOT_SIZE;
+        if (load64(b + 8) == SLOT_UDP) {
+            if (load64(b + 16) == sport) { return load64(b + 0); }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# udp_send#52(dst_ip, (sport<<16)|dport, buf, len[=r10]) -> bytes / 0 / -1. Egress-checked per
+# datagram (UDP is connectionless — the dst can change every call). Sends FROM the socket bound to
+# `sport` (udp_bind#51 must have created it) to dst_ip:dport. dst_ip is the agnos kernel-ip4 form.
+fn _net_udp_send(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) { return _net_emu(pid, regs, 0 - 1); }
+    var packed = decode_arg(regs, 1);
+    var sport = (packed >> 16) & 0xffff;
+    var dport = packed & 0xffff;
+    var fd = _net_udp_fd_by_port(sport);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # no socket bound to sport
+    var child_buf = decode_arg(regs, 2);
+    var len = decode_arg(regs, 3);                        # a4 = r10
+    if (len <= 0) { return _net_emu(pid, regs, 0); }
+    if (len > NET_IO_CAP) { len = NET_IO_CAP; }
+    var io = _net_io_buf();
+    if (pvm_read(pid, child_buf, io, len) != len) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, dport);                # the destination sockaddr
+    var sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, sb, SOCKADDR_IN_SIZE);
+    if (sent < 0) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, sent);
+}
+
+# udp_recv#53(listener_id, buf, maxlen, addr_out[=r10]) -> bytes / 0=none / -1. Non-blocking recv
+# on the bound UDP socket. NO EOF (UDP): -EAGAIN -> agnos 0 (none). If `addr_out` (a 16-byte child
+# buffer, 0 to skip) is given, writes the sender {peer_ip@0 kernel-ip4, peer_port@8 host-order}.
+fn _net_udp_recv(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var lb = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(lb + 8) != SLOT_UDP) { return _net_emu(pid, regs, 0 - 1); }   # not a udp socket
+    var fd = load64(lb + 0);
+    var child_buf = decode_arg(regs, 1);
+    var maxlen = decode_arg(regs, 2);
+    var addr_out = decode_arg(regs, 3);                  # a4 = r10 (0 = skip)
+    if (maxlen <= 0) { return _net_emu(pid, regs, 0); }
+    if (maxlen > NET_IO_CAP) { maxlen = NET_IO_CAP; }
+    var io = _net_io_buf();
+    var sb = _net_scratch_buf();
+    store32(sb + 48, SOCKADDR_IN_SIZE);                  # addrlen (in/out) for the src sockaddr
+    var lr = syscall(SYS_RECVFROM, fd, io, maxlen, MSG_DONTWAIT, sb, sb + 48);
+    if (lr < 0) {
+        if (lr == (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0); }   # no datagram waiting
+        return _net_emu(pid, regs, 0 - 1);
+    }
+    if (lr > 0) {
+        if (pvm_write(pid, child_buf, io, lr) != lr) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    if (addr_out != 0) {
+        store64(sb + 24, net_ip4_to_inaddr(load32(sb + 4)));   # sin_addr(network) -> kernel-ip4 @0
+        store64(sb + 32, net_htons(load16(sb + 2)));           # sin_port(network) -> host @8
+        pvm_write(pid, addr_out, sb + 24, 16);
+    }
+    return _net_emu(pid, regs, lr);
+}
+
+# udp_unbind#54(listener_id) -> 0 / -1. Close the bound UDP socket + free the slot (SLOT_UDP only).
+fn _net_udp_unbind(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(b + 8) != SLOT_UDP) { return _net_emu(pid, regs, 0 - 1); }
+    syscall(HOST_CLOSE, load64(b + 0));
+    store64(b + 0, 0 - 1);
+    store64(b + 8, SLOT_FREE);
+    store64(b + 16, 0 - 1);
+    return _net_emu(pid, regs, 0);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -670,6 +784,10 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 48) { return _net_send(pid, regs); }         # sock_send -> bytes / -1
         if (nr == 49) { return _net_recv(pid, regs); }         # sock_recv -> bytes / 0 WB / -1 EOF
         if (nr == 50) { return _net_close_conn(pid, regs); }   # sock_close (reaps LISTEN children)
+        if (nr == 51) { return _net_udp_bind(pid, regs); }     # udp_bind -> listener_id / -1
+        if (nr == 52) { return _net_udp_send(pid, regs); }     # udp_send -> bytes / 0 / -1
+        if (nr == 53) { return _net_udp_recv(pid, regs); }     # udp_recv -> bytes / 0 none / -1
+        if (nr == 54) { return _net_udp_unbind(pid, regs); }   # udp_unbind -> 0 / -1
         if (nr == 56) { return _net_listen(pid, regs); }       # sock_listen -> listen_id / -1
         if (nr == 57) { return _net_accept(pid, regs); }       # sock_accept -> conn_id / -1
     }

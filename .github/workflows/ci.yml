@@ -154,6 +154,13 @@ jobs:
         # conn) — a python client gets the reply. Needs python3 + the same-uid ptrace requirement.
         run: bash scripts/it/net_server.sh
 
+      - name: Net band — UDP (v1.3.0)
+        # v1.3.0 net band (docs/adr/0012): an agnos UDP client under mirshi does udp_bind#51
+        # (loopback), udp_send#52 a datagram (per-datagram egress check) to a local UDP echo
+        # server, udp_recv#53 the reply with the sender addr_out {ip,port}, udp_unbind#54.
+        # Needs python3 + the same-uid ptrace requirement.
+        run: bash scripts/it/net_udp.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
