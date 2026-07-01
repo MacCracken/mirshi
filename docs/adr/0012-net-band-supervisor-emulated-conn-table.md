@@ -1,6 +1,6 @@
 # 0012 — Net band: supervisor-emulated conn_id table + recv-EOF inversion + default-deny egress
 
-**Status**: Proposed
+**Status**: Accepted (TCP client shipped v1.1.0)
 **Date**: 2026-06-30
 
 ## Context
@@ -77,9 +77,9 @@ client-first.**
   doesn't permit. Shipped **last** (environment-sensitive).
 - **`net_config#61`** — an EMULATE getter that reads the **real (container-netns) interface**
   config (host IP / netmask / gateway / DNS) supervisor-side, returns packed IPv4 / `0` unset.
-- **Scope order** — client first: v1.1.0 = TCP client + `net_config` + the egress gate; v1.2.0
-  = TCP server (`listen`/`accept` — a distinct ingress threat model + a 2nd slot namespace);
-  v1.3.0 = UDP; v1.4.0 = ICMP.
+- **Scope order** — client first: v1.1.0 = TCP client + the egress gate; v1.2.0 = TCP server
+  (`listen`/`accept` — a distinct ingress threat model + a 2nd slot namespace); v1.3.0 = UDP +
+  `net_config` (its DNS consumer); v1.4.0 = ICMP.
 
 ## Consequences
 

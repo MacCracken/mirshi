@@ -4,6 +4,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-30
+
+**Net band — TCP client (the first post-v1 expansion).** agnos net tools can now open TCP
+connections through mirshi: a sandboxed agnos child reaches the network via a
+**supervisor-emulated** socket layer, egress-confined by a default-deny policy. Architecture +
+security fixed in [ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md). Scope:
+TCP client (`sock_connect#47`/`send#48`/`recv#49`/`close#50`); TCP server, UDP, ICMP, and
+`net_config#61` follow in v1.2.0–v1.4.0.
+
+### Added
+- **Net band TCP client** (`src/dispatch.cyr`) — **supervisor-EMULATE**: the supervisor owns the
+  sockets via an 8-slot `conn_id(0..7) → host fd` table; the child only ever sees the opaque
+  conn_id, never a real socket fd; the child seccomp allowlist is **unchanged** (socket syscalls
+  run supervisor-side; the emulated `-1` skip-sentinel is already allowed). `connect#47` does
+  `socket`+non-blocking-`connect`+bounded `ppoll`/`SO_ERROR`; `send#48` pvm-stages the child buffer
+  → `sendto` (**`MSG_NOSIGNAL`** so a closed peer can't SIGPIPE the supervisor); `recv#49`
+  `recvfrom MSG_DONTWAIT` → the **inverted-EOF** mapper → pvm-writes the child buffer; `close#50`
+  frees the slot. Chosen over execute-in-child to avoid a rip-rewind loop change (ADR 0002's
+  rejected pattern) and keep the fd + egress choke point supervisor-side.
+- **`--net` / `--net-allow <cidrs>`** (`src/main.cyr`) — opt-in to the net band + the egress policy;
+  the policy is **validated fail-closed before fork** (malformed → refuse to run). Pinned by `cli.sh`.
+- **Pure, unit-pinned net translation** (`src/translate.cyr`, +~50 assertions): `net_htons`,
+  `net_ip4_to_inaddr` (the kernel-ip4 → `sin_addr` byte-swap the agnos side expects), `build_sockaddr_in`,
+  the **inverted `recv#49` EOF** mapper `net_recv_to_agnos` (`0`=Linux-EOF→agnos `-1`, `-EAGAIN`→agnos
+  `0`=WOULD_BLOCK — a naïve reuse of the fs mapper spins agnos poll-loops forever), and the **egress
+  policy** (`net_parse_allow`/`net_in_cidr`/`net_reserved_min_prefix`/`net_egress_ok`).
+- **New gates**: `scripts/it/net_client.sh` (connect/close + egress enforcement, incl. connect-failure)
+  and `scripts/it/net_io.sh` (an agnos HTTP-GET round-trip proving send/recv + the inverted-EOF
+  end-to-end). Both CI-wired.
+
+### Security
+- **Default-deny egress** ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)):
+  `--net-allow` is required to reach any destination; **SSRF-hardened** — a broad `0.0.0.0/0` does
+  **not** implicitly expose metadata/RFC1918/loopback (only a sufficiently-specific allow does),
+  enforced in the supervisor on the decoded `dst_ip` before the socket, fail-closed to agnos `-1`.
+  **Brute-force-verified**: an exhaustive all-2³² sweep of the `0.0.0.0/0` policy — every public IP
+  allowed, every reserved IP denied, zero misclassifications. The socket/send/recv handlers were
+  adversarially reviewed (no fd/slot leak, OOB, double-close, SIGPIPE-kill, or overflow).
+
+### Changed
+- **Toolchain pin → `6.3.15`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.0.0] — 2026-06-30
 
 **The clean cut: AGNOS userland in Docker, no QEMU (direction 1, headless CLI).** A

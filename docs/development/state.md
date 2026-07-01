@@ -5,14 +5,17 @@
 
 ## Version
 
-**1.0.0** — 2026-06-30. **The clean cut: AGNOS userland in Docker, no QEMU** (direction 1, headless
-CLI). A representative agnos CLI userland (`hello`/`echo`/`catfile`/`ls`/`cp` — console + fs
-read/list/write) runs as native Linux processes under mirshi in a plain `FROM scratch` container,
-shared host kernel, fan-out-ready, seccomp-bounded — proven end-to-end by `docker/smoke.sh`. The v1
-definition is met. The 0.6→0.9 quality arc (hardened · audited · confined · optimized · frozen) is
-the foundation; no translation-logic change in the cut. Registry publishing is a documented post-v1
-ops step (see [`../guides/docker-fanout.md`](../guides/docker-fanout.md)), not gated by the v1
-definition. 0.9.0 = freeze + docs cleanup: froze the v1 contracts — the per-number **syscall-coverage
+**1.1.0** — 2026-06-30. **Net band — TCP client** (the first post-v1 expansion,
+[ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). agnos net tools can open TCP
+connections through mirshi: `sock_connect#47`/`send#48`/`recv#49`/`close#50` are **supervisor-emulated**
+— the supervisor owns the sockets via an 8-slot `conn_id(0..7)→host fd` table, the child never holds a
+socket fd, and the child seccomp allowlist is unchanged. Egress is **default-deny** (`--net` opt-in +
+`--net-allow` CIDR policy, SSRF-hardened, brute-force-verified over all 2³²). Proven end-to-end by an
+agnos HTTP-GET round-trip (`scripts/it/net_io.sh`). TCP server / UDP / ICMP / `net_config#61` follow in
+v1.2.0–v1.4.0. **1.0.0** — the clean cut: AGNOS userland in Docker, no QEMU — a representative agnos CLI
+userland (`hello`/`echo`/`catfile`/`ls`/`cp`) runs under mirshi in a plain `FROM scratch` container,
+fan-out-ready, seccomp-bounded (`docker/smoke.sh`); the v1 definition met, capping the 0.6→0.9 quality
+arc. 0.9.0 = freeze + docs cleanup: froze the v1 contracts — the per-number **syscall-coverage
 matrix** ([`../reference/syscall-coverage.md`](../reference/syscall-coverage.md), test-pinned for
 agnos# 0–61) + the **CLI contract** ([`../reference/cli.md`](../reference/cli.md)) + the
 **boundary-discipline ADR** ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md)).
@@ -30,7 +33,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.14` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.15` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -73,12 +76,15 @@ paths in the child red zone + repack output structs at the exit stop
   `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
   default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
   The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
+- Net band TCP client (1.1.0, [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)):
+  `sock_connect#47`/`send#48`/`recv#49`/`close#50` supervisor-emulated (an 8-slot `conn_id→host fd`
+  table); egress default-deny via `--net`/`--net-allow`. `net_config#61` + server/UDP/ICMP are v1.2–1.4.
 
 ## Tests
 
 - `tests/mirshi.tcyr` — primary suite (smoke + the pure M0 decode/format layer + the M1/M2
   translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
-  0–61's disposition); **166 assertions**, hermetic)
+  0–61's disposition) + the pure net helpers/egress policy (1.1.0); **218 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -112,7 +118,13 @@ paths in the child red zone + repack output structs at the exit stop
   path-mutation ops denied; self-validating (proves the escape leaks without `--root`).
 - `scripts/it/cli.sh` — 0.9.0 CLI-freeze gate (CI step, after confine): pins the frozen CLI
   contract ([`../reference/cli.md`](../reference/cli.md)) — usage on misuse (no args / `--root`
-  without a dir → exit 2) + the `EXECVE_FAILED` (127) exit code.
+  without a dir → exit 2) + the `EXECVE_FAILED` (127) exit code + the fail-closed `--net-allow`.
+- `scripts/it/net_client.sh` — 1.1.0 net-band TCP-client gate (CI step, after cli): mirshi's
+  emulated `sock_connect#47`/`close#50` establish + tear down a real TCP connection to a local
+  server, and `--net-allow` egress is enforced (un-allowed dst → agnos -1). Needs python3.
+- `scripts/it/net_io.sh` — 1.1.0 net-band send/recv gate (CI step, after net_client): an agnos
+  HTTP-GET round-trip (`connect`/`send`/`recv`-loop-to-EOF/`close`) proving `send#48`/`recv#49` +
+  the inverted-EOF end-to-end against a local server. Needs python3.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -200,8 +212,17 @@ container, fan-out-ready + seccomp-bounded — proven end-to-end by `docker/smok
 confined · optimized · frozen) is the foundation. Registry publishing is a documented post-v1 ops step
 ([`../guides/docker-fanout.md`](../guides/docker-fanout.md)), not gated by the v1 definition.
 
+**1.1.0 — net band, TCP client** — ✅ shipped 2026-06-30: the **first post-v1 expansion**
+([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)). A sandboxed agnos child can open TCP
+connections through mirshi — `sock_connect#47`/`send#48`/`recv#49`/`close#50` **supervisor-emulated** (an
+8-slot `conn_id→host fd` table; the child never holds a socket fd; the seccomp allowlist unchanged). Egress
+is **default-deny** (`--net`/`--net-allow`, SSRF-hardened, brute-force-verified over all 2³²). Proven by an
+agnos HTTP-GET round-trip (`scripts/it/net_io.sh`) — the inverted `recv#49` EOF validated live; the
+socket/send/recv handlers adversarially reviewed (no fd/slot leak, OOB, SIGPIPE-kill, or overflow). Next in
+the arc: **v1.2.0** TCP server (`listen#56`/`accept#57`), then **v1.3.0** UDP + `net_config#61`, then **v1.4.0** ICMP.
+
 **Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 —
-the first post-v1 expansion (unblocks the net tools / agora / descent at scale); **multi-process** agnos
+TCP client shipped (1.1.0), server/UDP/ICMP ongoing (v1.2–1.4); **multi-process** agnos
 (`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
 **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
 compat layer), v2+. Each is its own validation surface; the translation core built here runs from both
