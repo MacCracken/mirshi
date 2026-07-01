@@ -1,0 +1,133 @@
+# src/children.cyr — the per-child process record table (v1.5.0 multi-process).
+#
+# mirshi supervises a small process tree: agnos spawn#3 forks a new traced child, and this
+# table is the supervisor's per-child bookkeeping — one fixed record per live child, lazy-
+# alloc-once (ADR 0008 discipline, like the net slot table). PURE: only alloc / load / store
+# + module globals, no syscalls / ptrace — so it is unit-testable hermetically in
+# tests/mirshi.tcyr (which includes only the pure modules).
+#
+# The pid mapping is a TWO-WAY {agnos_pid <-> host_pid} lookup. mirshi COINS the opaque
+# guest-facing agnos pid (monotonic, root = 1, never reused) and maps it to the real host
+# (Linux) pid used for wait4 / ptrace. The agnos pid CONTRACT is agnos-owned (an opaque token
+# >= 0, 0 reserved, waitpid/kill self/child-scoped); the pid VALUE is mirshi-owned in
+# direction 1 (no agnos kernel runs — mirshi is the process creator, same as it coins the net
+# band's conn_id/listener_id). Coining opaque pids (never passing a host pid through) keeps
+# this DIRECTION-AGNOSTIC: direction 2 (the v2+ Linux->AGNOS "swallow") flips the guest/host
+# roles and reuses this same table + coiner.
+
+enum MirshiChild {
+    MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
+                                # that flipping spawn#3 to EMULATE reopens (deliberately NOT
+                                # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
+    CHILD_REC_SIZE = 136;       # 17 x i64 fields
+    # --- record field offsets (all i64) ---
+    C_AGNOS_PID = 0;            # the opaque guest-facing pid mirshi coined (root = 1)
+    C_HOST_PID = 8;            # the real Linux pid (the wait4 / ptrace target)
+    C_PARENT = 16;             # parent's agnos_pid (bookkeeping; 0 = no parent / root)
+    C_STATE = 24;             # CS_FREE / CS_RUNNING / CS_BLOCKED / CS_EXITED
+    C_EXIT_CODE = 32;          # agnos exit code, retained until waitpid#4 claims it
+    C_WAIT_TARGET = 40;        # the agnos_pid this child is parked in waitpid#4 on
+    C_REAPED = 48;             # 1 once waitpid#4 has claimed the exit code
+    C_NEEDS_ATTACH = 56;       # 1 = a freshly-forked grandchild awaiting its first-stop attach
+    C_AT_ENTRY = 64;           # enter/exit ptrace toggle (was a _trace_run local)
+    C_AGNOS_NR = 72;           # agnos syscall nr captured at enter (was a _trace_run local)
+    C_STRAT = 80;              # dispatcher verdict at enter (was a _trace_run local)
+    C_PENDING_SIG = 88;        # signal to inject on the next PTRACE_SYSCALL resume
+    C_XLAT_EMU_RET = 96;       # enter->exit EMULATE/ENOSYS return carry (was _xlat_emu_ret)
+    C_M2_OUT_PTR = 104;        # fs exit-stop repack carry (was _m2_out_ptr)
+    C_M2_OUT_CAP = 112;        #   "     (was _m2_out_cap)
+    C_M2_SCRATCH = 120;        #   "     (was _m2_scratch)
+    C_NET_TBL = 128;           # this child's net slot-table ptr (0 = not yet alloc'd)
+    # --- state values ---
+    CS_FREE = 0;               # slot unused
+    CS_RUNNING = 1;            # live, being traced
+    CS_BLOCKED = 2;            # parked in waitpid#4 (left stopped at its enter-stop)
+    CS_EXITED = 3;             # exited; exit_code retained until reaped
+}
+
+# The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.
+var _children = 0;
+var _next_agnos_pid = 1;        # 0 reserved (getppid=0 stays distinct); root child = 1
+
+fn _child_tbl(): i64 {
+    if (_children == 0) {
+        _children = alloc(MAX_CHILDREN * CHILD_REC_SIZE);
+        var i = 0;
+        while (i < MAX_CHILDREN) {
+            store64(_children + i * CHILD_REC_SIZE + C_STATE, CS_FREE);
+            i = i + 1;
+        }
+    }
+    return _children;
+}
+
+# Reset the table + coiner. TEST-ONLY (the supervisor lazy-allocs once per process; the old
+# table is abandoned to the bump allocator, which never frees — fine for a hermetic test).
+fn _child_reset(): i64 {
+    _children = 0;
+    _next_agnos_pid = 1;
+    return 0;
+}
+
+# Find the live record for a host (Linux) pid, or 0 if none. A FREE slot's host_pid is stale,
+# so only non-FREE records match.
+fn _child_find_by_host(hpid): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        var b = tbl + i * CHILD_REC_SIZE;
+        if (load64(b + C_STATE) != CS_FREE) {
+            if (load64(b + C_HOST_PID) == hpid) { return b; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Find the record for an agnos pid, or 0 if none.
+fn _child_find_by_agnos(apid): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        var b = tbl + i * CHILD_REC_SIZE;
+        if (load64(b + C_STATE) != CS_FREE) {
+            if (load64(b + C_AGNOS_PID) == apid) { return b; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Allocate a record for a freshly-created host pid: coin the next agnos pid, fill the mapping
+# + parent + RUNNING state, and zero the carry / wait fields. Returns the record ptr, or 0 if
+# the table is full (the process-storm bound — spawn#3 injects agnos -1 on full).
+fn _child_alloc(hpid, parent_apid): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        var b = tbl + i * CHILD_REC_SIZE;
+        if (load64(b + C_STATE) == CS_FREE) {
+            store64(b + C_AGNOS_PID, _next_agnos_pid);
+            _next_agnos_pid = _next_agnos_pid + 1;
+            store64(b + C_HOST_PID, hpid);
+            store64(b + C_PARENT, parent_apid);
+            store64(b + C_STATE, CS_RUNNING);
+            store64(b + C_EXIT_CODE, 0);
+            store64(b + C_WAIT_TARGET, 0);
+            store64(b + C_REAPED, 0);
+            store64(b + C_NEEDS_ATTACH, 0);
+            store64(b + C_AT_ENTRY, 1);        # a child's first ptrace stop is a syscall-ENTER
+            store64(b + C_AGNOS_NR, 0);
+            store64(b + C_STRAT, 0);
+            store64(b + C_PENDING_SIG, 0);
+            store64(b + C_XLAT_EMU_RET, 0);
+            store64(b + C_M2_OUT_PTR, 0);
+            store64(b + C_M2_OUT_CAP, 0);
+            store64(b + C_M2_SCRATCH, 0);
+            store64(b + C_NET_TBL, 0);
+            return b;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

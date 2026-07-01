@@ -117,6 +117,7 @@ fn _wait(pid, status): i64 {
 # _emit/_emit_int defined above, and so _trace_loop below sees translate_dispatch.
 include "src/translate.cyr"
 include "src/scratch.cyr"
+include "src/children.cyr"
 include "src/dispatch.cyr"
 include "src/seccomp.cyr"
 include "src/limits.cyr"
@@ -405,5 +406,9 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
         return EXECVE_FAILED;
     }
     if (selftest == 1) { return _trace_log(pid); }
+    # v1.5.0 multi-process: register the ROOT child (agnos_pid 1, the coined guest pid;
+    # parent 0). Inserted here so the root is present before tracing; the trace loop starts
+    # reading records by host pid from BITE 4 on (single-child today — this is unread infra).
+    _child_alloc(pid, 0);
     return _trace_run(pid);
 }

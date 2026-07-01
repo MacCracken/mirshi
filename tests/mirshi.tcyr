@@ -8,6 +8,7 @@
 
 include "src/decode.cyr"
 include "src/translate.cyr"
+include "src/children.cyr"
 
 fn main() {
     alloc_init();
@@ -385,6 +386,41 @@ fn main() {
     assert_eq(net_ip4_to_inaddr(net_parse_hex32(dq)), 0xC0A80101, "…bswapped -> 192.168.1.1 kernel-ip4");
     memcpy(dq, "00000000", 8); store8(dq + 8, 0);
     assert_eq(net_parse_hex32(dq), 0, "route hex 00000000 -> 0");
+
+    # --- v1.5.0 multi-process: the per-child record table (src/children.cyr) -------------
+    test_group("child-table");
+    _child_reset();
+    assert_eq(_child_find_by_host(1234), 0, "empty table: host miss -> 0");
+    assert_eq(_child_find_by_agnos(1), 0, "empty table: agnos miss -> 0");
+    # the root: coined agnos_pid 1, host_pid 1000, parent 0, RUNNING
+    var r0 = _child_alloc(1000, 0);
+    assert(r0 != 0, "alloc root -> non-null record");
+    assert_eq(load64(r0 + C_AGNOS_PID), 1, "root coined agnos_pid = 1");
+    assert_eq(load64(r0 + C_HOST_PID), 1000, "root host_pid = 1000");
+    assert_eq(load64(r0 + C_STATE), CS_RUNNING, "root state = RUNNING");
+    assert_eq(load64(r0 + C_AT_ENTRY), 1, "root at_entry = 1 (first stop is a syscall-enter)");
+    # a spawned child: next agnos_pid 2 (monotonic), parent 1
+    var r1 = _child_alloc(1001, 1);
+    assert_eq(load64(r1 + C_AGNOS_PID), 2, "child coined agnos_pid = 2 (monotonic)");
+    assert_eq(load64(r1 + C_PARENT), 1, "child parent_agnos_pid = 1");
+    # two-way lookup resolves to the right records
+    assert_eq(_child_find_by_host(1000), r0, "find root by host pid");
+    assert_eq(_child_find_by_agnos(2), r1, "find child by agnos pid");
+    assert_eq(_child_find_by_host(9999), 0, "unknown host pid -> 0");
+    # the MAX_CHILDREN storm bound
+    _child_reset();
+    var k = 0;
+    var all_ok = 1;
+    while (k < MAX_CHILDREN) {
+        if (_child_alloc(2000 + k, 0) == 0) { all_ok = 0; }
+        k = k + 1;
+    }
+    assert_eq(all_ok, 1, "all MAX_CHILDREN allocs succeed");
+    assert_eq(_child_alloc(9000, 0), 0, "alloc past MAX_CHILDREN -> 0 (storm bound)");
+    # agnos pids are never reused (monotonic coiner)
+    _child_reset();
+    _child_alloc(1, 0);
+    assert_eq(load64(_child_alloc(2, 0) + C_AGNOS_PID), 2, "agnos pids monotonic across allocs");
 
     return assert_summary();
 }
