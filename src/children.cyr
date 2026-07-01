@@ -56,6 +56,21 @@ fn _spawn_size_ok(size): i64 {
     return 1;
 }
 
+# Number of records in use (not FREE) — the live-process count spawn#3 checks BEFORE forking a new
+# grandchild, so the supervisor never forks past the table (re-closes the ADR 0006 process-storm
+# vector that flipping spawn to EMULATE reopens; not RLIMIT_NPROC, which is per-uid + container-
+# hostile). Counts EXITED-but-unreaped records too (they still hold a slot until waitpid#4 reaps).
+fn _child_count(): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    var c = 0;
+    while (i < MAX_CHILDREN) {
+        if (load64(tbl + i * CHILD_REC_SIZE + C_STATE) != CS_FREE) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
 # The record table + the monotonic agnos-pid coiner. Lazy-alloc-once.
 var _children = 0;
 var _next_agnos_pid = 1;        # 0 reserved (getppid=0 stays distinct); root child = 1

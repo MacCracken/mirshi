@@ -256,6 +256,47 @@ fn _spawn_read_elf(pid, addr, size, buf): i64 {
     return got;
 }
 
+# spawn#3(elf_addr, elf_size) -> agnos pid / -1. A SUPERVISOR-CONTROL op — NOT a per-syscall
+# translation, so handled at the loop level (here, after the includes) rather than in
+# translate_dispatch, because it forks + runs _child_exec_memfd (which depend on limits.cyr/
+# seccomp.cyr, included AFTER dispatch.cyr). Reads the caller's in-memory ELF, stages it into a
+# memfd, forks a new TRACED grandchild that execveat's it, registers the grandchild (needs_attach —
+# the demux loop sets its ptrace options on its first stop), and injects the coined agnos pid as
+# spawn's return. Fail-closed to agnos -1 on any error. `rec` is the CALLER's (parent's) record.
+fn _do_spawn(pid, regs, rec): i64 {
+    # Storm bound: refuse BEFORE forking if the table is full (so we never fork an untrackable child).
+    if (_child_count() >= MAX_CHILDREN) { return _net_emu(pid, regs, 0 - 1); }
+    var elf_addr = decode_arg(regs, 0);
+    var elf_size = decode_arg(regs, 1);
+    var buf = _spawn_elf_buffer();
+    if (_spawn_read_elf(pid, elf_addr, elf_size, buf) < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var memfd = sys_memfd_create("mirshi-spawn", 0);
+    if (memfd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    # Stage the ELF image into the memfd (loop on short writes).
+    var written = 0;
+    while (written < elf_size) {
+        var w = file_write(memfd, buf + written, elf_size - written);
+        if (w <= 0) { syscall(HOST_CLOSE, memfd); return _net_emu(pid, regs, 0 - 1); }
+        written = written + w;
+    }
+    var cpid = sys_fork();
+    if (cpid < 0) { syscall(HOST_CLOSE, memfd); return _net_emu(pid, regs, 0 - 1); }
+    if (cpid == 0) {
+        # Grandchild: run the gauntlet + execveat the memfd image (inherits its own memfd copy).
+        # Bound/rootpath come from the fork-copied _spawn_* config. Never returns on success.
+        _child_exec_memfd(memfd, _spawn_bound, _spawn_rootpath);
+        syscall(SYS_EXIT, EXECVE_FAILED);
+        return EXECVE_FAILED;
+    }
+    # Supervisor: drop our memfd copy (the grandchild inherited its own), register the grandchild
+    # with the CALLER as parent + needs_attach (the demux loop attaches it on its first stop).
+    syscall(HOST_CLOSE, memfd);
+    var crec = _child_alloc(cpid, load64(rec + C_AGNOS_PID));
+    store64(crec + C_NEEDS_ATTACH, 1);
+    # EMULATE: inject the coined agnos pid as spawn's return, skipping the foreign syscall.
+    return _net_emu(pid, regs, load64(crec + C_AGNOS_PID));
+}
+
 # Consume the post-execve SIGTRAP stop (delivered BEFORE options are set, so no
 # 0x80 bit) and set ptrace options ONCE. Returns -1 when attached OK (proceed),
 # else a >= 0 mirshi exit code to propagate immediately (the child died or
@@ -414,14 +455,31 @@ fn _trace_run(root_pid): i64 {
                 if (load64(rec + C_AGNOS_PID) == 1) { return 128 + WTERMSIG(st); }
             }
             if (WIFSTOPPED(st) == 1) {
+                if (load64(rec + C_NEEDS_ATTACH) == 1) {
+                    # A spawn#3 grandchild's FIRST stop (post-execveat SIGTRAP, delivered before its
+                    # options are set — no 0x80 bit). Attach it (tag syscall-stops + EXITKILL, as
+                    # _attach does for the root), clear the flag, resume into its first syscall-enter;
+                    # from its next stop on it is serviced like any other child.
+                    pt(PTRACE_SETOPTIONS, wpid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL);
+                    store64(rec + C_NEEDS_ATTACH, 0);
+                    pt(PTRACE_SYSCALL, wpid, 0, 0);
+                    continue;
+                }
                 var sig = WSTOPSIG(st);
                 if (sig == SYSCALL_STOP_SIG) {
                     if (load64(rec + C_AT_ENTRY) == 1) {
                         # Syscall-ENTER: read regs, classify, rewrite for the kernel.
                         _cur_rec = rec;   # BITE 3: the net-table accessor _net_tbl() reads this
                         pt(PTRACE_GETREGS, wpid, 0, regs);
-                        store64(rec + C_AGNOS_NR, decode_nr(regs));
-                        store64(rec + C_STRAT, translate_dispatch(wpid, regs));
+                        var enr = decode_nr(regs);
+                        store64(rec + C_AGNOS_NR, enr);
+                        # spawn#3 is a SUPERVISOR-CONTROL op (fork a new tracee), handled here at the
+                        # loop level not in translate_dispatch (BITE 7); all else -> normal translation.
+                        if (enr == 3) {
+                            store64(rec + C_STRAT, _do_spawn(wpid, regs, rec));
+                        } else {
+                            store64(rec + C_STRAT, translate_dispatch(wpid, regs));
+                        }
                         # Save this child's dispatch carry into its record; the globals are then
                         # free for the next child's stop (the isolation this whole arc buys).
                         store64(rec + C_XLAT_EMU_RET, _xlat_emu_ret);

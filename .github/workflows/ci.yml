@@ -176,6 +176,13 @@ jobs:
         # forbidden. Needs python3 + the same-uid ptrace requirement.
         run: bash scripts/it/net_icmp.sh
 
+      - name: Multi-process — spawn#3 (v1.5.0)
+        # v1.5.0 multi-process (BITE 7): an agnos parent under mirshi reads a child ELF and
+        # sys_spawn#3's it — the supervisor forks a new TRACED grandchild (memfd + execveat of the
+        # in-memory ELF), and BOTH run under one wait4(-1) demux loop. Proves the supervisor as a
+        # small process tree. Needs the same-uid ptrace requirement.
+        run: bash scripts/it/spawn.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

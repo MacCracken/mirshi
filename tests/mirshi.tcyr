@@ -150,7 +150,7 @@ fn main() {
     #     update this freeze + docs/reference/syscall-coverage.md.
     test_group("xlat-coverage");
     assert_eq(agnos_to_linux_nr(0), 0 - 1, "exit#0 -> no peer (EXIT: exit_group, special)");
-    assert_eq(agnos_to_linux_nr(3), 0 - 1, "spawn#3 -> ENOSYS (multi-proc)");
+    assert_eq(agnos_to_linux_nr(3), 0 - 1, "spawn#3 has no Linux peer (EMULATE at the loop level, v1.5.0)");
     assert_eq(agnos_to_linux_nr(4), 0 - 1, "waitpid#4 -> ENOSYS (multi-proc)");
     assert_eq(agnos_to_linux_nr(11), 0 - 1, "mount#11 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(13), 0 - 1, "reboot#13 -> ENOSYS");
@@ -421,6 +421,13 @@ fn main() {
     _child_reset();
     _child_alloc(1, 0);
     assert_eq(load64(_child_alloc(2, 0) + C_AGNOS_PID), 2, "agnos pids monotonic across allocs");
+    # _child_count reflects live (non-FREE) records — the spawn#3 pre-fork storm-bound gate
+    _child_reset();
+    assert_eq(_child_count(), 0, "empty table: count 0");
+    _child_alloc(100, 0);
+    assert_eq(_child_count(), 1, "one alloc: count 1");
+    _child_alloc(101, 1);
+    assert_eq(_child_count(), 2, "two allocs: count 2");
 
     # --- v1.5.0 spawn#3 ELF-size bounds (src/children.cyr _spawn_size_ok) -----------------
     test_group("spawn-elf-size");

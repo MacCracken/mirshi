@@ -33,7 +33,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 0 | exit | EXIT | `exit_group` (231) | code in a1; terminates, no exit stop |
 | 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
 | 2 | getpid | EXECUTE | `getpid` (39) | number differs |
-| 3 | spawn | ENOSYS | — | multi-process — post-v1 |
+| 3 | spawn | EMULATE | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
 | 4 | waitpid | ENOSYS | — | multi-process — post-v1 |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
 | 6 | close | EXECUTE | `close` (3) | |
