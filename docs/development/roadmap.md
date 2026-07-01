@@ -157,7 +157,7 @@ with every v1.0 criterion across the 0.6–0.9 arc:
 - [x] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
 - [x] CHANGELOG complete from 0.1.0; ADRs for the load-bearing decisions (0.9.0)
 
-## Post-v1 — the net band arc (v1.1.0 → v1.4.0) — v1.3.0 shipped 2026-06-30
+## Post-v1 — the net band arc (v1.1.0 → v1.4.0) — ✅ COMPLETE, v1.4.0 shipped 2026-06-30
 
 The **first post-v1 expansion**: the sovereign net band (#47–57, #61) over Linux sockets, so agnos net tools
 (`http`/`ws_server`/dns, `agora`/`descent`) run under mirshi at fan-out scale. Architecture + security are fixed
@@ -175,7 +175,7 @@ default** (`--net-listen-any` to expose all interfaces), so a sandboxed child's 
 | **v1.1.0** ✅ | **TCP client** (`#47`/`48`/`49`/`50`) + `--net`/`--net-allow` egress | agnos HTTP-GET round-trip — connect/send/recv-loop-to-EOF/close (`scripts/it/net_io.sh` + `net_client.sh`) — **shipped 2026-06-30** | done ✓ |
 | **v1.2.0** ✅ | **TCP server** (`sock_listen#56`/`accept#57`) + `--net-listen-any` (loopback-default ingress) | agnos server accepts a real client (`scripts/it/net_server.sh`, both bind modes) — **shipped 2026-06-30** | done ✓ |
 | **v1.3.0** ✅ | **UDP** (`#51`–`54`) + `net_config#61` (real netns gateway/DNS/host-IP) | agnos UDP round-trip + net_config matches the netns config (`scripts/it/net_udp.sh` + `net_config.sh`) — **shipped 2026-06-30** | done ✓ |
-| **v1.4.0** | **ICMP** (`icmp_echo#55`) | agnos ping-class tool RTTs a host | unprivileged `SOCK_DGRAM` ICMP (`ping_group_range`) — env-sensitive |
+| **v1.4.0** ✅ | **ICMP** (`icmp_echo#55`) | agnos ping-class tool RTTs a host — unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP`, bounded ~3s `ppoll`, egress-checked (`scripts/it/net_icmp.sh`; live: `icmp_echo(1.1.1.1)`=6ms vs host `ping`=6.48ms) — **shipped 2026-06-30** | done ✓ (`ping_group_range`-gated, SKIPs where forbidden) |
 
 Load-bearing correctness (both pure + unit-pinned): the **inverted `recv#49` EOF** mapper (`n>0→n`, Linux
 `0`→`-1` EOF, `EAGAIN`→`0` WOULD_BLOCK — a naïve reuse of the fs mapper spins agnos poll-loops forever) and the

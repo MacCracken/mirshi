@@ -5,13 +5,17 @@
 
 ## Version
 
-**1.3.0** — 2026-06-30. **Net band — UDP + net_config** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
-agnos UDP tools (dig/DNS-class) send + receive datagrams through mirshi: `udp_bind#51`/`send#52`/`recv#53`/
-`unbind#54` supervisor-emulated (a `SLOT_UDP` in the unified slot table; per-datagram egress on send; the
-sender `addr_out` repack on recv). `net_config#61` reads the **real container-netns config** (gateway from
-`/proc/net/route`, DNS from `/etc/resolv.conf`, host-IP via a getsockname trick; netmask 0-unset). Proven by
-an agnos UDP round-trip + net_config matching the netns config (`scripts/it/net_udp.sh` + `net_config.sh`).
-Only ICMP (#55) remains, in **v1.4.0**. **1.2.0** — Net band TCP server: `sock_listen#56`/`accept#57`
+**1.4.0** — 2026-06-30. **Net band — ICMP (the arc's finale)** ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)).
+agnos `icmp_echo#55` (yo/ping) round-trips through mirshi via an **unprivileged** `SOCK_DGRAM`+`IPPROTO_ICMP`
+ping socket (**never** `SOCK_RAW`/`CAP_NET_RAW`): a **pure** supervisor op (no child buffer) — egress-check →
+send one echo request → bounded ~3s `ppoll(POLLIN)` → return the monotonic-clock RTT ms (≥0; sub-ms reads 0);
+fail-closed to −1 on any error (`ping_group_range` denial, send fail, timeout). Proven live
+(`scripts/it/net_icmp.sh`; `icmp_echo(1.1.1.1)`=6 ms vs host `ping`=6.48 ms). **The sovereign net band
+(#47–57, #61) is now complete** — no net-band number remains ENOSYS. Pin stays `6.3.16` (no drift).
+**1.3.0** — Net band UDP + net_config: `udp_bind#51`/`send#52`/`recv#53`/`unbind#54` supervisor-emulated (a
+`SLOT_UDP` in the unified slot table; per-datagram egress on send; the sender `addr_out` repack on recv);
+`net_config#61` reads the **real container-netns config** (gateway from `/proc/net/route`, DNS from
+`/etc/resolv.conf`, host-IP via a getsockname trick; netmask 0-unset). **1.2.0** — Net band TCP server: `sock_listen#56`/`accept#57`
 supervisor-emulated; `close#50` on a listener reaps its children; ingress loopback-default (`--net-listen-any`
 to expose). **1.1.0** — Net band TCP client (the first post-v1
 expansion): `sock_connect#47`/`send#48`/`recv#49`/`close#50` supervisor-emulated (the conn_id slot table;
@@ -81,14 +85,14 @@ paths in the child red zone + repack output structs at the exit stop
   `rename#31`, `link#32`, `stat#33`, `getdents#29`. Path policy = transparent pass-through by
   default; under `--root` the path surface is kernel-confined (0.7.1, [ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)).
   The full per-number contract is frozen in [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
-- Net band (1.1.0 client + 1.2.0 server + 1.3.0 UDP/net_config + ICMP [v1.4.0, in-flight/unreleased],
+- Net band (1.1.0 client + 1.2.0 server + 1.3.0 UDP/net_config + 1.4.0 ICMP,
   [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)): `sock_*#47–50/56/57` + `udp_*#51–54`
   supervisor-emulated over a unified 8-slot `{fd, kind, parent}` table (TCP conn / TCP listen / UDP;
   `close#50` reaps a listener's children). `net_config#61` reads the real netns gateway/DNS/host-IP.
   `icmp_echo#55` opens a transient unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket, round-trips one echo
   under a bounded ~3s `ppoll`, and returns the RTT ms (no slot). Egress default-deny (`--net`/`--net-allow`,
   per-datagram on UDP, per-destination on ICMP); ingress loopback-default (`--net-listen-any`). **The net band
-  is now complete in-code** — no net-band number remains ENOSYS (the v1.4.0 cut is pending).
+  is complete** — no net-band number (#47–57, #61) remains ENOSYS.
 
 ## Tests
 
@@ -258,10 +262,19 @@ unified table; **per-datagram egress** on send; the sender `addr_out` {ip,port} 
 `net_config#61` reads the **real container-netns config** (gateway from `/proc/net/route`, DNS from
 `/etc/resolv.conf`, host-IP via a getsockname trick; netmask 0-unset; bad field -1). Proven by an agnos UDP
 round-trip + net_config matching the environment's files (`scripts/it/net_udp.sh` + `net_config.sh`); the UDP
-+ net_config handlers adversarially reviewed (no leak/OOB/over-read/crash). Only **v1.4.0** ICMP remains.
++ net_config handlers adversarially reviewed (no leak/OOB/over-read/crash).
 
-**Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 —
-TCP client + server + UDP + net_config shipped (1.1–1.3), only ICMP remains (v1.4.0); **multi-process** agnos
+**1.4.0 — net band, ICMP (the arc's finale)** — ✅ shipped 2026-06-30: agnos `icmp_echo#55` (yo/ping) RTTs a
+host through mirshi via an **unprivileged** `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket (**never** `SOCK_RAW`/
+`CAP_NET_RAW` — a privilege a sandbox deputy must not hold). A **pure** supervisor op (no child buffer):
+egress-check → one echo request → bounded ~3s `ppoll(POLLIN)` → the monotonic-clock RTT ms (≥0; sub-ms=0);
+fail-closed to −1 on any error (`ping_group_range` denial / send fail / timeout). Proven live
+(`scripts/it/net_icmp.sh`; `icmp_echo(1.1.1.1)`=6 ms vs host `ping`=6.48 ms; SKIPs where the kernel forbids
+unprivileged ICMP); the handler adversarially reviewed (**CLEAN** — no fd leak on any exit, fail-closed). **The
+sovereign net band (#47–57, #61) is now COMPLETE.**
+
+**Post-v1** (see [`roadmap.md`](roadmap.md) "Out of scope"): the **sovereign net band** #47–57/#61 is
+**complete** — TCP client + server + UDP + net_config + ICMP shipped (1.1–1.4); **multi-process** agnos
 (`spawn#3`/`execwait#37`/`waitpid#4` — the agnsh target); **graphics** (`fbinfo`/`blit`/`winsize`); and
 **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos kernel — the permanent
 compat layer), v2+. Each is its own validation surface; the translation core built here runs from both

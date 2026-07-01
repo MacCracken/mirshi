@@ -4,6 +4,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-06-30
+
 **Net band — ICMP (the arc's finale).** agnos `icmp_echo#55` (yo/ping) now round-trips through
 mirshi via an **unprivileged** ping socket, completing the sovereign net band (#47–57, #61).
 Supervisor-emulated ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-table.md)).
@@ -24,6 +26,13 @@ Supervisor-emulated ([ADR 0012](docs/adr/0012-net-band-supervisor-emulated-conn-
 - `icmp_echo#55` is **egress-checked** (`--net-allow`, default-deny) before the socket, and uses
   **only** the unprivileged datagram-ICMP path — a privilege a sandbox-class deputy must not hold
   or grant. The handler was adversarially reviewed (no fd leak on any exit path, fail-closed).
+
+### Changed
+- **Frozen syscall-coverage contract**: `icmp_echo#55` moves ENOSYS → **EMULATE ²**
+  (`docs/reference/syscall-coverage.md`) — the **net band is now complete**, no net-band number
+  (#47–57, #61) remains ENOSYS.
+- **Toolchain pin** stays `6.3.16` (`cyrius.cyml`) — the wrapper is unchanged at this release
+  boundary, so no drift to reconcile.
 
 ## [1.3.0] — 2026-06-30
 
