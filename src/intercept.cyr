@@ -324,6 +324,7 @@ fn _trace_run(pid): i64 {
             if (sig == SYSCALL_STOP_SIG) {
                 if (load64(rec + C_AT_ENTRY) == 1) {
                     # Syscall-ENTER: read regs, classify, rewrite for the kernel.
+                    _cur_rec = rec;   # v1.5.0 BITE 3: the net-table accessor _net_tbl() reads this
                     pt(PTRACE_GETREGS, pid, 0, regs);
                     store64(rec + C_AGNOS_NR, decode_nr(regs));
                     store64(rec + C_STRAT, translate_dispatch(pid, regs));

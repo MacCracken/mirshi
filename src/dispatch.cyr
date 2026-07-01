@@ -284,28 +284,39 @@ enum MirshiNetSys {
     POLLIN = 1;                  # ppoll event: the echo reply is readable
 }
 
-# The supervisor-side conn_id/listener_id(0..7) slot table (lazy-alloc-once, like _how_buf).
-# Each 24-byte slot is {i64 fd; i64 kind; i64 parent}: fd = host fd or -1; kind = SLOT_FREE /
-# SLOT_CONN / SLOT_LISTEN / SLOT_UDP; `parent` is the slot's extra datum — for an accepted conn
-# it is the listen slot it came from (so closing a listener reaps its children); for a SLOT_UDP
-# it is the bound port (so udp_send#52 can find the socket by its source port); else -1. The
-# child only ever sees the slot INDEX
-# (the opaque agnos conn_id / listen_id), never a host fd. ONE unified 0..7 space (mirroring
-# the agnos kernel's, so sock_close#50(id) is unambiguous whether id is a conn or a listen).
-var _net_slots = 0;
+# The conn_id/listener_id(0..7) slot table. Each 24-byte slot is {i64 fd; i64 kind; i64 parent}:
+# fd = host fd or -1; kind = SLOT_FREE / SLOT_CONN / SLOT_LISTEN / SLOT_UDP; `parent` is the slot's
+# extra datum — for an accepted conn it is the listen slot it came from (so closing a listener reaps
+# its children); for a SLOT_UDP it is the bound port (so udp_send#52 can find the socket by its
+# source port); else -1. The child only ever sees the slot INDEX (the opaque agnos conn_id /
+# listen_id), never a host fd. ONE unified 0..7 space (mirroring the agnos kernel's, so
+# sock_close#50(id) is unambiguous whether id is a conn or a listen).
+#
+# v1.5.0 BITE 3: the table is PER-CHILD — it lives in the child's record (C_NET_TBL), lazily
+# alloc'd on first net use. `_cur_rec` is the record of the child whose syscall is currently being
+# dispatched (set by the trace loop at each enter stop, before translate_dispatch). Every net-table
+# access funnels through _net_tbl(), so pointing it at _cur_rec's table gives per-child isolation
+# with no handler-signature churn. MANDATORY for multi-process: two children sharing one 0..7 index
+# space would cross-close each other's sockets (the child hands back a bare conn_id with no pid tag).
+# The bare-index reap invariant stays valid WITHIN each child's own table. _cur_rec is set on every
+# enter stop and read only during enter-stop dispatch (net handlers are EMULATE — all work at enter),
+# so it is never stale when _net_tbl() runs. Single-child today, so byte-identical.
+var _cur_rec = 0;
 fn _net_tbl(): i64 {
-    if (_net_slots == 0) {
-        _net_slots = alloc(NET_SLOTS * NET_SLOT_SIZE);
+    var slots = load64(_cur_rec + C_NET_TBL);
+    if (slots == 0) {
+        slots = alloc(NET_SLOTS * NET_SLOT_SIZE);
         var i = 0;
         while (i < NET_SLOTS) {
-            var b = _net_slots + i * NET_SLOT_SIZE;
+            var b = slots + i * NET_SLOT_SIZE;
             store64(b + 0, 0 - 1);         # fd = -1
             store64(b + 8, SLOT_FREE);     # kind
             store64(b + 16, 0 - 1);        # parent = -1
             i = i + 1;
         }
+        store64(_cur_rec + C_NET_TBL, slots);
     }
-    return _net_slots;
+    return slots;
 }
 
 # First free slot index, or -1 if the 8-slot table is full.
