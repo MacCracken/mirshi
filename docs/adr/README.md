@@ -30,3 +30,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0009 — Rootfs confinement via openat2 RESOLVE_IN_ROOT in the child](0009-rootfs-confinement-openat2-in-child.md) — *Accepted*
 - [0010 — ptrace exit-stop single-register I/O (the ptrace optimization ceiling)](0010-ptrace-exit-stop-single-register-io.md) — *Accepted*
 - [0011 — The mirshi / QEMU / iron boundary discipline](0011-mirshi-qemu-iron-boundary-discipline.md) — *Accepted*
+- [0012 — Net band: supervisor-emulated conn_id table + recv-EOF inversion + default-deny egress](0012-net-band-supervisor-emulated-conn-table.md) — *Proposed*

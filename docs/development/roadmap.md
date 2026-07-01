@@ -157,11 +157,36 @@ with every v1.0 criterion across the 0.6–0.9 arc:
 - [x] Hardening: fault-injection harness green, host-resource bounds enforced (0.6.0)
 - [x] CHANGELOG complete from 0.1.0; ADRs for the load-bearing decisions (0.9.0)
 
+## Post-v1 — the net band arc (v1.1.0 → v1.4.0) — scoped 2026-06-30
+
+The **first post-v1 expansion**: the sovereign net band (#47–57, #61) over Linux sockets, so agnos net tools
+(`http`/`ws_server`/dns, `agora`/`descent`) run under mirshi at fan-out scale. Architecture + security are fixed
+in [ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md): **supervisor-EMULATE** — the supervisor
+owns the sockets via an 8-slot `conn_id(0..7) → host fd` table, buffers stage through `process_vm` (the M2
+pattern), the child never holds a socket fd, and the seccomp allowlist is **unchanged** (socket syscalls run
+supervisor-side). Chosen over execute-in-child to avoid a rip-rewind loop change ([ADR 0002](../adr/0002-execute-in-child-translation.md)'s
+rejected pattern) and to keep the fd + the egress choke point supervisor-side. **Egress is a shipping gate**:
+`--net` opt-in + `--net-allow <CIDR>[:ports]` **default-deny** (stricter than `--root` — metadata/RFC1918/loopback
+blocked, fail-closed to agnos `-1`). Client-first.
+
+| Ver | Slice | Acceptance gate | Key risk |
+|---|---|---|---|
+| **v1.1.0** | `net_config#61` + **TCP client** (`#47`/`48`/`49`/`50`) + `--net`/`--net-allow` | agnos `http.cyr` GET over `net.cyr` fetches a URL in-container | the recv-EOF inversion; the `connect` 2-step |
+| **v1.2.0** | **TCP server** (`sock_listen#56`/`accept#57`) | agnos `ws_server.cyr` accepts a connection | 2nd slot namespace; `close#50` reaps children |
+| **v1.3.0** | **UDP** (`#51`–`54`) | agnos DNS-class fixture resolves via a resolver | `addr_out` repack; packed `(sport<<16)\|dport` |
+| **v1.4.0** | **ICMP** (`icmp_echo#55`) | agnos ping-class tool RTTs a host | unprivileged `SOCK_DGRAM` ICMP (`ping_group_range`) — env-sensitive |
+
+Load-bearing correctness (both pure + unit-pinned): the **inverted `recv#49` EOF** mapper (`n>0→n`, Linux
+`0`→`-1` EOF, `EAGAIN`→`0` WOULD_BLOCK — a naïve reuse of the fs mapper spins agnos poll-loops forever) and the
+`dst_ip`→`sockaddr_in` **byte order**. `net_config#61` reads the **real container-netns** interface (minor
+infoleak, accepted). Discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md)): mirshi
+validates net-**app** compat on the **host** kernel; the agnos **sovereign** net stack stays QEMU's job.
+
 ## Out of scope for v1 (post-v1 / v2+)
 
-- **Sovereign net band #47-#57 over Linux sockets** — the `conn_id` ABI, inverted `recv` EOF, UDP/ICMP.
-  **First post-v1 expansion** (high-value: unblocks running the net tools / `agora` / `descent` in mirshi
-  containers — the "meatier tests at scale" goal). Its own arc (socket-semantics emulation is real work).
+- **Sovereign net band #47-#57/#61 over Linux sockets** — **now scoped** as the v1.1.0→v1.4.0 arc above
+  ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)); the first post-v1 expansion (unblocks
+  the net tools / `agora` / `descent` at fan-out scale).
 - **Multi-process agnos** (`spawn#3`/`execwait#37`/`spawn_path#43`/`waitpid#4`) — run **agnsh with child
   exec** (the crown-jewel target). Needs per-child supervisor spawning + run-to-completion semantics.
   Likely v1.x once single-process is solid.
