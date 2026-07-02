@@ -29,6 +29,8 @@ enum MirshiXlatNr {
     SLEEP_MS_CAP = 3600000;     # mirror agnos's 1 h sleep cap
     SYS_SYSINFO = 99;           # v1.8.0 sysinfo#35: read the host's real uptime / total+free RAM
     SYS_SCHED_GETAFFINITY = 204;# v1.8.0 sysinfo#35: the mirshi process's usable CPU mask -> cpu count
+    SYS_IOCTL = 16;             # v1.9.0 winsize#60: TIOCGWINSZ on the controlling terminal
+    TIOCGWINSZ = 0x5413;        # ioctl: get the terminal window size (struct winsize: ws_row@0, ws_col@2)
 }
 
 # 0.7.1 rootfs confinement (docs/audit/2026-06-30-audit.md class-c fix). When a
@@ -1376,6 +1378,30 @@ fn _do_sysinfo(pid, regs): i64 {
     return _net_emu(pid, regs, 0);
 }
 
+# winsize#60() -> (cols<<16)|rows. EMULATE (a pure supervisor return, no args / no child buffer — like
+# uptime_ms#40). The real agnos kernel reads the live framebuffer char grid (`fb_winsize`); a headless mirshi
+# has no FB, so mirshi reads the CONTROLLING TERMINAL's size via TIOCGWINSZ on its own stdio (the child
+# inherits it) and packs it agnos-style. No tty (redirected stdio / a plain container) -> a virtual 80×24
+# default. Always returns a usable size (never -1) — an agnos TUI sizes to the real console or a sane default.
+fn _do_winsize(pid, regs): i64 {
+    var ws = _info_scratch();
+    var cols = 80;                                       # virtual default (headless / no tty)
+    var rows = 24;
+    var got = 0;
+    var fd = 0;
+    while (fd < 3) {                                     # the controlling terminal on stdin/stdout/stderr
+        if (got == 0) {
+            if (syscall(SYS_IOCTL, fd, TIOCGWINSZ, ws) == 0) {
+                var r = load16(ws + 0) & 0xFFFF;         # struct winsize: ws_row @0 (u16)
+                var c = load16(ws + 2) & 0xFFFF;         #                 ws_col @2 (u16)
+                if (c > 0) { if (r > 0) { cols = c; rows = r; got = 1; } }
+            }
+        }
+        fd = fd + 1;
+    }
+    return _net_emu(pid, regs, ((cols & 0xFFFF) << 16) | (rows & 0xFFFF));
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -1406,6 +1432,9 @@ fn translate_dispatch(pid, regs): i64 {
     # uname#34 / sysinfo#35 -> the agnos-native info structs (EMULATE, synthesized from live host values).
     if (nr == 34) { return _do_uname(pid, regs); }
     if (nr == 35) { return _do_sysinfo(pid, regs); }
+
+    # winsize#60 -> (cols<<16)|rows from the controlling terminal (EMULATE; 80×24 default if no tty).
+    if (nr == 60) { return _do_winsize(pid, regs); }
 
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert

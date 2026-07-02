@@ -253,6 +253,13 @@ jobs:
         # agnos-process count; cpus = affinity popcount). Both hard-reject -1 if len < the struct size.
         run: bash scripts/it/info.sh
 
+      - name: Winsize — winsize#60 (v1.9.0)
+        # v1.9.0 tty sizing (BITE 1): agnos winsize#60 is EMULATE — mirshi returns the controlling terminal's
+        # size packed (cols<<16)|rows via TIOCGWINSZ on its own stdio (a headless container has no framebuffer,
+        # so a virtual 80×24 default). Proves the no-tty default + a pty sized to 120×40 reports 120×40 (the
+        # pty sub-test SKIPs without python3). Same-uid ptrace requirement.
+        run: bash scripts/it/winsize.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

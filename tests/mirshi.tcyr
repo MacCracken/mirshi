@@ -188,7 +188,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(56), 0 - 1, "sock_listen#56 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(57), 0 - 1, "sock_accept#57 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(59), 73, "flock#59 -> flock(73) (v1.8.0: execute-in-child, op codes identical)");
-    assert_eq(agnos_to_linux_nr(60), 0 - 1, "winsize#60 -> ENOSYS (graphics)");
+    assert_eq(agnos_to_linux_nr(60), 0 - 1, "winsize#60 -> no peer (v1.9.0: EMULATE, (cols<<16)|rows)");
     assert_eq(agnos_to_linux_nr(61), 0 - 1, "net_config#61 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(62), 0 - 1, "out-of-range#62 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
