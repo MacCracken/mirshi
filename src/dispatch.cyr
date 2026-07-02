@@ -989,8 +989,16 @@ fn _do_timerfd_settime(pid, regs): i64 {
     if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }  # not open
     var tb = _timer_buf_get();
     if (pvm_read(pid, val_ptr, tb, 24) != 24) { return _net_emu(pid, regs, 0 - 1); }
-    store64(tbl + slot * TIMERFD_SLOT_SIZE + 16, load64(tb + 0) * 1000);   # interval_ms = interval_sec*1000
+    var interval_sec = load64(tb + 0);
     var initial_sec = load64(tb + 16);
+    # Bound untrusted child seconds BEFORE the *1000 + deadline arithmetic: reject negatives (EINVAL
+    # parity; a huge u64 loads as a negative i64) and clamp huge values to TIMERFD_SEC_CAP, so the
+    # products can't overflow i64 into a wrong timer (sleep_ms#41's SLEEP_MS_CAP discipline).
+    if (interval_sec < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (initial_sec < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (interval_sec > TIMERFD_SEC_CAP) { interval_sec = TIMERFD_SEC_CAP; }
+    if (initial_sec > TIMERFD_SEC_CAP) { initial_sec = TIMERFD_SEC_CAP; }
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 16, interval_sec * 1000);     # interval_ms
     if (initial_sec == 0) {
         store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);              # disarm
     } else {
@@ -1041,6 +1049,91 @@ fn _timerfd_close(pid, regs): i64 {
     var tbl = _timerfd_tbl();
     store64(tbl + slot * TIMERFD_SLOT_SIZE + 0, 0 - 1);              # flags = -1 -> FREE
     store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);                # disarm
+    return _net_emu(pid, regs, 0);
+}
+
+# --- v1.7.0 epoll band (#19/#20; epoll_wait#21 lands in BITE 5). SUPERVISOR-EMULATED: a server's epoll
+#     watches SOCKETS (supervisor-held host fds), signalfds (a pending mask), and timerfds (a deadline) —
+#     none are real child fds, so a real in-child epoll fd could not see them. Each epoll instance is a
+#     per-child slot holding up to 8 watched RAW agnos ids; epoll_wait#21 resolves them fresh at wait
+#     time (the stale-slot-reuse guard). Per-child C_EPOLL_TBL, lazy-alloc-once. ---
+
+# The caller's per-child epoll slot table (lazy-alloc-once). Each 72 B slot is {in_use@0 (-1 = FREE);
+# 8 x watched_id@8..64 (-1 = empty)} — the 8 entries are the frozen "8-watch list".
+fn _epoll_tbl(): i64 {
+    var t = load64(_cur_rec + C_EPOLL_TBL);
+    if (t == 0) {
+        t = alloc(EPOLL_SLOTS * EPOLL_SLOT_SIZE);
+        var i = 0;
+        while (i < EPOLL_SLOTS) {
+            store64(t + i * EPOLL_SLOT_SIZE + 0, 0 - 1);       # in_use = -1 -> FREE
+            i = i + 1;
+        }
+        store64(_cur_rec + C_EPOLL_TBL, t);
+    }
+    return t;
+}
+
+# epoll_create#19 (no args) -> EPOLL_BASE+slot / -1. First FREE slot; mark in use; empty all 8 watches.
+fn _do_epoll_create(pid, regs): i64 {
+    var tbl = _epoll_tbl();
+    var i = 0;
+    var slot = 0 - 1;
+    while (i < EPOLL_SLOTS) {
+        if (load64(tbl + i * EPOLL_SLOT_SIZE + 0) == (0 - 1)) { slot = i; i = EPOLL_SLOTS; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }               # instance table full
+    var b = tbl + slot * EPOLL_SLOT_SIZE;
+    store64(b + 0, 1);                                                 # in use
+    var j = 0;
+    while (j < 8) { store64(b + 8 + j * 8, 0 - 1); j = j + 1; }        # empty all 8 watch entries
+    return _net_emu(pid, regs, EPOLL_BASE + slot);
+}
+
+# epoll_ctl#20(epfd, op, fd) -> 0 / -1. op 1 = ADD the watched id to the first empty entry (dedup; all 8
+# used -> -1); op 2 = CLEAR (wipe all 8 entries; the fd arg is IGNORED — the frozen "2=clear" has no
+# per-fd DEL). Stores the RAW agnos id verbatim (socket / signalfd / timerfd); epoll_wait#21 resolves it
+# fresh at wait time. Unknown op / bad epfd / closed epoll -> -1.
+fn _do_epoll_ctl(pid, regs): i64 {
+    var epfd = decode_arg(regs, 0);
+    var op = decode_arg(regs, 1);
+    var fd = decode_arg(regs, 2);
+    if (epfd < EPOLL_BASE) { return _net_emu(pid, regs, 0 - 1); }
+    var slot = epfd - EPOLL_BASE;
+    if (slot >= EPOLL_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var b = _epoll_tbl() + slot * EPOLL_SLOT_SIZE;
+    if (load64(b + 0) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }   # not an open epoll instance
+    if (op == 2) {                                                     # CLEAR -> wipe all watches
+        var c = 0;
+        while (c < 8) { store64(b + 8 + c * 8, 0 - 1); c = c + 1; }
+        return _net_emu(pid, regs, 0);
+    }
+    if (op == 1) {                                                    # ADD (dedup, first-empty, 8-cap)
+        if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }            # a negative id is invalid (and -1
+                                                                      # is the empty-entry sentinel)
+        var empty = 0 - 1;
+        var k = 0;
+        while (k < 8) {
+            var w = load64(b + 8 + k * 8);
+            if (w == fd) { return _net_emu(pid, regs, 0); }           # already watched -> dedup (0)
+            if (w == (0 - 1)) { if (empty < 0) { empty = k; } }       # remember the first empty entry
+            k = k + 1;
+        }
+        if (empty < 0) { return _net_emu(pid, regs, 0 - 1); }         # all 8 used -> -1
+        store64(b + 8 + empty * 8, fd);
+        return _net_emu(pid, regs, 0);
+    }
+    return _net_emu(pid, regs, 0 - 1);                                # unknown op
+}
+
+# close#6 on an emulated epoll -> free the slot (returns 0). A real close(3) would EBADF.
+fn _epoll_close(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var slot = fd - EPOLL_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (slot >= EPOLL_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    store64(_epoll_tbl() + slot * EPOLL_SLOT_SIZE + 0, 0 - 1);        # in_use = -1 -> FREE
     return _net_emu(pid, regs, 0);
 }
 
@@ -1109,6 +1202,11 @@ fn translate_dispatch(pid, regs): i64 {
     # id delivers the expiration count. No real Linux timerfd fd (invisible to the emulated epoll).
     if (nr == 22) { return _do_timerfd_create(pid, regs); }
     if (nr == 23) { return _do_timerfd_settime(pid, regs); }
+
+    # epoll#19/#20 -> a supervisor-emulated instance holding up to 8 watched RAW agnos ids; epoll_wait#21
+    # (BITE 5) resolves them fresh. epoll_create#19 (no args) / epoll_ctl#20(epfd, op, fd).
+    if (nr == 19) { return _do_epoll_create(pid, regs); }
+    if (nr == 20) { return _do_epoll_ctl(pid, regs); }
 
     # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
     #     path(s) into the child red zone (NUL-terminated) before executing. ---
@@ -1267,11 +1365,13 @@ fn translate_dispatch(pid, regs): i64 {
         }
     }
 
-    # close#6 on an emulated timerfd -> free the slot (a real close would EBADF). signalfd close stays a
-    # real close (the v1.6.0 slot-leak limit); epoll close lands in BITE 4. Real child fds (incl. pipe
-    # ends, < MIN_EMU_BASE) fall through to the EXECUTE tail (renumber to Linux close#3).
+    # close#6 on an emulated timerfd / epoll -> free the slot (a real close would EBADF). signalfd close
+    # stays a real close (the v1.6.0 slot-leak limit). Real child fds (incl. pipe ends, < MIN_EMU_BASE)
+    # fall through to the EXECUTE tail (renumber to Linux close#3).
     if (nr == 6) {
-        if (_emu_classify(decode_arg(regs, 0)) == KIND_TIMERFD) { return _timerfd_close(pid, regs); }
+        var ck = _emu_classify(decode_arg(regs, 0));
+        if (ck == KIND_TIMERFD) { return _timerfd_close(pid, regs); }
+        if (ck == KIND_EPOLL) { return _epoll_close(pid, regs); }
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg

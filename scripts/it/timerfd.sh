@@ -56,6 +56,14 @@ fn main(): i64 {
             if (pit > 10000) { return 11; }                    # ~10s ceiling (two ~1s fires)
         }
     }
+    # (3.5) out-of-contract seconds are rejected BEFORE the *1000/deadline math (no i64 overflow ->
+    # wrong timer). A negative sec -> -1, leaving the slot untouched (the periodic timer above survives).
+    store64(val + 0, 0);
+    store64(val + 16, 0 - 1);                                  # initial_sec = -1 -> reject
+    if (sys_timerfd_settime(tfd, 0, val) != (0 - 1)) { return 16; }
+    store64(val + 0, 0 - 1);                                   # interval_sec = -1 -> reject
+    store64(val + 16, 1);
+    if (sys_timerfd_settime(tfd, 0, val) != (0 - 1)) { return 17; }
     # (4) close frees the slot; a create/close loop recycles it (no leak)
     if (sys_close(tfd) != 0) { return 12; }
     var k = 0;

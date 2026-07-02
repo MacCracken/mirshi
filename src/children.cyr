@@ -82,6 +82,10 @@ enum MirshiChild {
     EPOLL_SLOT_SIZE = 72;        # {i64 in_use (-1=FREE); 8 x i64 watched_id (-1=empty)} — the 8-watch list
     TIMERFD_SLOTS = 8;           # per-child timerfd instances
     TIMERFD_SLOT_SIZE = 32;      # {i64 flags (-1=FREE); i64 deadline_ms; i64 interval_ms; i64 armed}
+    TIMERFD_SEC_CAP = 1000000000;# timerfd_settime seconds ceiling (~31.7 yr) — bounds untrusted child
+                                 # input so sec*1000 + the deadline arithmetic stays well within i64
+                                 # (a hostile initial/interval_sec would else overflow -> a wrong timer;
+                                 # same discipline as sleep_ms#41's SLEEP_MS_CAP). Negatives are rejected.
     # _emu_classify KIND codes — the read#5 / close#6 emulated-fd front-gate tiers:
     KIND_REAL = 0;               # a real child fd (< MIN_EMU_BASE, bit 30 clear) — execute-in-child
     KIND_SOCK = 1;               # AGNOS_SOCK_TAG (bit 30) — a net-band conn / listen id

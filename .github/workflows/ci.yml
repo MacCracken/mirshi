@@ -226,6 +226,13 @@ jobs:
         # one-shot fires ~1s + a periodic re-arms + close frees the slot. Needs the same-uid ptrace req.
         run: bash scripts/it/timerfd.sh
 
+      - name: Epoll — epoll_create#19 / epoll_ctl#20 (v1.7.0)
+        # v1.7.0 I/O-mux (BITE 4): agnos epoll#19/#20 are supervisor-emulated — a per-child instance slot
+        # holds up to 8 watched RAW agnos ids (sockets/signalfds/timerfds resolved fresh at wait time).
+        # epoll_create hands out an EPOLL_BASE+slot id; epoll_ctl op1=ADD (dedup, 8-cap) / op2=CLEAR;
+        # close#6 frees the instance. Proves create/ctl/close semantics (epoll_wait#21 is BITE 5). Same-uid.
+        run: bash scripts/it/epoll.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
