@@ -240,6 +240,12 @@ jobs:
         # (single-threaded supervisor). The roadmap gate (epoll set + timerfd) + best-effort socket. Same-uid.
         run: bash scripts/it/epoll_wait.sh
 
+      - name: Flock — getuid#15 + flock#59 (v1.8.0)
+        # v1.8.0 info-getters + advisory-locks (BITE 1): getuid#15 is EMULATE -> 0 (agnos is always root —
+        # never the host uid); flock#59 is execute-in-child (renumbered to Linux flock(73); op codes
+        # identical). Proves getuid/geteuid=0 + a real two-OFD LOCK_EX contention/release. Same-uid ptrace.
+        run: bash scripts/it/flock.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

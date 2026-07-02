@@ -1299,6 +1299,10 @@ fn translate_dispatch(pid, regs): i64 {
         return _net_emu(pid, regs, load64(_cur_rec + C_AGNOS_PID));
     }
 
+    # getuid#15 (also geteuid) -> 0 (EMULATE). The agnos environment is always root (spec: "getuid() -> 0,
+    # always root"); return 0, NOT the host's real uid (which an execute-in-child getuid#102 would leak).
+    if (nr == 15) { return _net_emu(pid, regs, 0); }
+
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert
     # to ms, skip the kernel syscall, stash the result. No fault surface.

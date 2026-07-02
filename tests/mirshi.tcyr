@@ -155,7 +155,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(11), 0 - 1, "mount#11 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(13), 0 - 1, "reboot#13 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(14), 0 - 1, "pause#14 -> no peer (EMULATE at the loop level, v1.6.0)");
-    assert_eq(agnos_to_linux_nr(15), 0 - 1, "getuid#15 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(15), 0 - 1, "getuid#15 -> no peer (v1.8.0: EMULATE -> 0 at the dispatcher)");
     assert_eq(agnos_to_linux_nr(16), 0 - 1, "kill#16 -> no peer (EMULATE at the loop level, v1.6.0)");
     assert_eq(agnos_to_linux_nr(17), 0 - 1, "sigprocmask#17 -> no peer (EMULATE at the dispatcher, v1.6.0)");
     assert_eq(agnos_to_linux_nr(18), 0 - 1, "signalfd#18 -> no peer (EMULATE at the dispatcher, v1.6.0)");
@@ -187,7 +187,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(55), 0 - 1, "icmp_echo#55 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(56), 0 - 1, "sock_listen#56 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(57), 0 - 1, "sock_accept#57 -> ENOSYS (net band)");
-    assert_eq(agnos_to_linux_nr(59), 0 - 1, "flock#59 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(59), 73, "flock#59 -> flock(73) (v1.8.0: execute-in-child, op codes identical)");
     assert_eq(agnos_to_linux_nr(60), 0 - 1, "winsize#60 -> ENOSYS (graphics)");
     assert_eq(agnos_to_linux_nr(61), 0 - 1, "net_config#61 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(62), 0 - 1, "out-of-range#62 -> ENOSYS");
