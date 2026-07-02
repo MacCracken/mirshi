@@ -20,11 +20,12 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.6.0)
+## Shipped (v0.1.0 → v1.7.0)
 
 The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
-multi-process, and signals are **done**. Full per-release detail: [`../../CHANGELOG.md`](../../CHANGELOG.md).
-Frozen per-number contract: [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
+multi-process, signals, and I/O multiplexing are **done**. Full per-release detail:
+[`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen per-number contract:
+[`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
 
 | Band | Versions | What |
 |---|---|---|
@@ -34,6 +35,7 @@ Frozen per-number contract: [`../reference/syscall-coverage.md`](../reference/sy
 | **Net band (post-v1)** | v1.1–v1.4 | TCP client → TCP server → UDP + `net_config` → ICMP: the sovereign net band (#47–57, #61), supervisor-EMULATE, egress default-deny ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)) — **complete** |
 | **Multi-process (post-v1)** | v1.5.0 | `spawn#3`/`waitpid#4`/`getpid#2` — the **agnsh crown jewel**: a parent spawns in-memory-ELF children + waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor; opaque-monotonic pids, `MAX_CHILDREN` storm bound, deadlock guard ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)) |
 | **Signals (post-v1)** | v1.6.0 | `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — the shell's notification half: supervisor-emulated pending/blocked masks over the record table, `kill` self/child-scoped, a **bounded-yield** `pause`, and an opaque `signalfd` whose `read#5` delivers the raw signal number ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) |
+| **I/O multiplexing (post-v1)** | v1.7.0 | `epoll#19–21`/`timerfd#22–23`/`pipe#25` — the **event loop**: epoll + timerfd **supervisor-emulated** (a heterogeneous **bounded-yield** `epoll_wait` — `ppoll` sockets + mask-test signalfds + clock-test timerfds), `pipe` **execute-in-child**; the tag ladder + `_emu_classify` read#5/close#6 front gate; socket-watching best-effort ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) |
 
 ## Planned — post-v1 minors
 
@@ -41,12 +43,6 @@ Each remaining agnos-ABI surface is an additive **minor** (backward-compatible n
 same cadence the net band used). **Ordering is provisional + demand-driven** — a slice gets pulled
 forward when a real agnos consumer needs it. All rows below are **ENOSYS today**
 ([the matrix](../reference/syscall-coverage.md)).
-
-### v1.7.0 — I/O multiplexing
-`epoll_create#19` / `epoll_ctl#20` / `epoll_wait#21`, `timerfd_create#22` / `timerfd_settime#23`,
-`pipe#25`. The readiness / timer / pipe primitives agnos servers reach for once they outgrow the net
-band's blocking loops. Mostly execute-in-child (real Linux epoll/timerfd/pipe fds) with the agnos
-struct/flag repack. *Gate*: an agnos event loop waits on an epoll set + a timerfd; a pipe round-trips.
 
 ### v1.8.0 — Info getters + advisory locks (the ENOSYS long-tail)
 `getuid#15` (stub → 0) / `uname#34` (4×16-byte fields) / `sysinfo#35` (5×u64) / `flock#59`

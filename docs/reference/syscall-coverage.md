@@ -49,13 +49,13 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
 | 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
 | 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
-| 19 | epoll_create | ENOSYS | — | epoll — post-v1 |
-| 20 | epoll_ctl | ENOSYS | — | epoll — post-v1 |
-| 21 | epoll_wait | ENOSYS | — | epoll — post-v1 |
-| 22 | timerfd_create | ENOSYS | — | post-v1 |
-| 23 | timerfd_settime | ENOSYS | — | post-v1 |
+| 19 | epoll_create | EMULATE ⁵ | — | I/O-mux (v1.7.0): a per-child epoll instance (`EPOLL_BASE+slot`), an 8-watch list of raw agnos ids |
+| 20 | epoll_ctl | EMULATE ⁵ | — | I/O-mux (v1.7.0): op 1=ADD (dedup, 8-cap), op 2=CLEAR (whole list; fd ignored) |
+| 21 | epoll_wait | EMULATE ⁵ | — | I/O-mux (v1.7.0): heterogeneous **bounded-yield** readiness — `ppoll` sockets + mask-test signalfds + clock-test timerfds; packed 12 B events; never parks |
+| 22 | timerfd_create | EMULATE ⁵ | — | I/O-mux (v1.7.0): a supervisor-side deadline (`TIMERFD_BASE+slot`); no real Linux timerfd |
+| 23 | timerfd_settime | EMULATE ⁵ | — | I/O-mux (v1.7.0): arm a `CLOCK_MONOTONIC` deadline (seconds; capped); `read#5` delivers the expiration count |
 | 24 | umount | ENOSYS | — | stub |
-| 25 | pipe | ENOSYS | — | post-v1 |
+| 25 | pipe | EXECUTE ⁵ | `pipe2` (293) | I/O-mux (v1.7.0): run **in the child** (`O_CLOEXEC`); exit-stop 2×i32→2×u64 repack; the sole child-bound delta. Not via `agnos_to_linux_nr` (intercepted before it) |
 | 26 | write_boot_checkpoint | ENOSYS | — | agnos-kernel-only |
 | 27 | mmap | EXECUTE | `mmap` (9) | a1=length → 6-arg synth: anon/private, `PROT_READ\|WRITE`, fd=-1, 2 MB round-up; fail→`0` |
 | 28 | munmap | EXECUTE | `munmap` (11) | length 2 MB round-up (matches mmap granularity) |
@@ -138,6 +138,29 @@ the 1 ms quantum (the `sleep_ms#41` class); the MVP signalfd is **non-blocking-o
 pending returns −1, not a park); `sys_close` on a signalfd does **not** free its mirshi slot (bounded 8/proc,
 freed on exit). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
 
+⁵ **I/O-multiplexing band (v1.7.0).** `epoll#19–21` + `timerfd#22–23` are **supervisor-EMULATE**; `pipe#25`
+is **EXECUTE-in-child** ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)). A server's
+epoll watches SOCKETS (supervisor-held host fds) + signalfds (a mask) + timerfds (a deadline) — none real
+child fds — so epoll/timerfd MUST be supervisor-side. **timerfd** is a stored `CLOCK_MONOTONIC` deadline
+(`TIMERFD_BASE+slot`, no real Linux timerfd); `read#5` delivers the u64 expiration count (deliver-then-consume,
+seconds capped at `TIMERFD_SEC_CAP` + negative-reject). **epoll** is a per-child instance (`EPOLL_BASE+slot`,
+4 instances × an 8-watch list of raw ids); `epoll_wait#21` is a **heterogeneous bounded-yield** pass (the
+`pause#14` model, **never** a park — a readiness event has no `wait4` wake source): `ppoll` the socket host fds
++ mask-test signalfds + clock-test timerfds, merge, write packed 12 B `{u32 EPOLLIN; u64 raw-id}` events (0 =
+nothing ready, valid non-blocking). The tag ladder (SIGFD bit29 > TIMERFD bit28 > EPOLL bit27 > PIPE bit26, all
+bit-30-clear) lets `read#5`/`close#6` tier by a `>= MIN_EMU_BASE` front gate. **pipe#25** runs real Linux
+`pipe2`(`O_CLOEXEC`) in the child — every agnos pipe use is intra-process (no fork; `spawn#3` passes no fds) —
+with a 2×i32→2×u64 exit-stop repack + an enter-stop output-buffer write-probe (fail-clean, no fd leak); the
+sole child-seccomp delta (`pipe2=293`). **Known limits**: **socket-watching is best-effort** — a program
+watches the bit-30-tagged socket fd and epoll resolves `id & 7` → conn slot; exact for sequential server flows,
+but the guest/mirshi socket-slot maps can diverge under connect-failure churn (a coordinated agnos-kernel +
+mirshi-shim fix lands later; guarded by a wait-time `SLOT_FREE` re-validation). A **real child fd** (stdin, a
+pipe end) is **not epoll-watchable** (not supervisor-observable). A **blocking** pipe read with no writer wedges
+the single-threaded supervisor (the write-before-read / self-pipe pattern avoids it; a watchable/non-blocking
+pipe is the reserved `PIPE_BASE` follow-up). `epoll_wait`'s ≤1 ms `ppoll` head-of-line-blocks other children
+(the `pause#14` class). The ABI-ambiguity defaults (epoll mask=EPOLLIN, op 2=whole-clear, timerfd flags
+relative) are baked pending a real consumer. See [ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md).
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -146,11 +169,11 @@ freed on exit). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks
   `unlink#30`, `rename#31`, `link#32`, `stat#33`, `getdents#29`.
 
 Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47–57, #61, v1.1.0–v1.4.0
-— footnote ²), **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³), and
-the **signal band** (`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18`, v1.6.0 — footnote ⁴) shipped as
-post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see the
-[roadmap](../development/roadmap.md)): epoll/timerfd/pipe (#19–25), info getters (#15/#34/#35),
-`flock#59`, and `winsize#60`.
+— footnote ²), **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³),
+the **signal band** (`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18`, v1.6.0 — footnote ⁴), and the
+**I/O-multiplexing band** (`epoll#19–21`/`timerfd#22–23`/`pipe#25`, v1.7.0 — footnote ⁵) shipped as post-v1
+extensions. Still ENOSYS, as **planned post-v1 minors** (see the [roadmap](../development/roadmap.md)):
+info getters (#15/#34/#35), `flock#59`, and `winsize#60`.
 
 ## Known gaps (carried forward, documented not fixed)
 
@@ -173,3 +196,12 @@ post-v1 extensions. Still ENOSYS, as **planned post-v1 minors** (see the
   (harmless) close but does **not** free the mirshi slot (bounded 8/proc, freed on exit; a `close#6`
   intercept is a future enhancement). `SIGKILL`/`SIGSTOP` unmaskability is not special-cased (agnos
   delivers via signalfd, not default actions). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
+- **I/O-mux band (`epoll#19–21`/`timerfd#22–23`/`pipe#25`, ⁵)**: **socket-watching is best-effort** — epoll
+  resolves a watched socket by `id & 7` → conn slot, exact for sequential server flows but divergent under
+  connect-failure churn (a coordinated agnos+shim fix lands later; wait-time `SLOT_FREE`-revalidated). A
+  **real child fd** (stdin, a pipe end) is **not epoll-watchable** (not supervisor-observable). A **blocking**
+  pipe read with no writer wedges the single-threaded supervisor (write-before-read / self-pipe avoids it;
+  the watchable/non-blocking pipe is the reserved `PIPE_BASE` follow-up). `epoll_wait`'s ≤1 ms `ppoll`
+  head-of-line-blocks other children (the `pause#14` class); timerfd/signalfd reads are non-blocking. The
+  ABI-ambiguity defaults (epoll mask=EPOLLIN, op 2=whole-clear, timerfd flags relative) await a real consumer.
+  See [ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md).

@@ -5,6 +5,26 @@
 
 ## Version
 
+**1.7.0** — 2026-07-01. **I/O multiplexing — the event loop** ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)).
+agnos `epoll#19–21` / `timerfd#22–23` / `pipe#25` now run: a server multiplexes a timerfd + a signalfd + a
+socket on one epoll set. **epoll + timerfd are supervisor-emulated** (a server epolls sockets + signalfds,
+which aren't real child fds — a real in-child epoll couldn't see them); **pipe is execute-in-child** (real
+Linux `pipe2(O_CLOEXEC)`, every agnos pipe use being intra-process — no fork, `spawn#3` passes no fds — with a
+2×i32→2×u64 exit repack + an enter-stop output-probe, the sole child-seccomp delta `pipe2=293`). **timerfd** is
+a supervisor-side `CLOCK_MONOTONIC` deadline (per-child 8-slot table, no real Linux timerfd; seconds capped at
+`TIMERFD_SEC_CAP` + negative-reject); `read#5` delivers the u64 expiration count (deliver-then-consume).
+**epoll** is a per-child instance (4 × an 8-watch list of raw ids); `epoll_wait#21` is a **heterogeneous
+bounded-yield** pass (the `pause#14` model, **never** a park) — `ppoll` the supervisor-held socket host fds +
+mask-test signalfds + clock-test timerfds, merge, write packed 12 B `{u32 EPOLLIN; u64 raw-id}` events (0 =
+nothing ready, valid). A bit-30-clear descending tag ladder (SIGFD>TIMERFD>EPOLL>PIPE) + the pure unit-pinned
+`_emu_classify` drives a `read#5`/`close#6` `>= MIN_EMU_BASE` front gate. **Socket-watching is best-effort**
+(strip `id & 7` → conn slot; exact for sequential server flows, divergent under connect-failure churn — a
+coordinated agnos-kernel + mirshi-shim fix lands later, wait-time `SLOT_FREE`-revalidated). Proven by
+`scripts/it/pipe.sh` / `timerfd.sh` / `epoll.sh` / `epoll_wait.sh` (the heterogeneous wake — the roadmap gate —
++ best-effort socket); each band adversarially reviewed (pipe fd-leak + timerfd overflow MINORs found + fixed;
+epoll clean). **Known limits**: real child fds (stdin/pipe) not epoll-watchable; a blocking pipe read with no
+writer wedges the single-threaded supervisor; `epoll_wait`'s ≤1 ms `ppoll` head-of-line-blocks (the `pause#14`
+class); the ABI-ambiguity defaults await a real consumer (ADR 0015). Pin → `6.3.25`.
 **1.6.0** — 2026-07-01. **Signals — the shell's other half** ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)).
 agnos `pause#14` / `kill#16` / `sigprocmask#17` / `signalfd#18` now run — the notification half of job control
 pairing with v1.5.0's `spawn`/`waitpid`. The agnos signal model is **signalfd-centric, no async `sa_handler`**,
@@ -69,7 +89,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.23` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.25` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -136,6 +156,16 @@ paths in the child red zone + repack output structs at the exit stop
   bit-30-clear to dodge `AGNOS_SOCK_TAG`), and `read#5` delivers the lowest watched-deliverable signal as an
   8-byte number (deliver-then-consume). Known limits: `pause` head-of-line blocking, non-blocking-only
   signalfd, signalfd-close slot leak (ADR 0014).
+- I/O multiplexing (1.7.0, [ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)):
+  `epoll#19–21`/`timerfd#22–23` supervisor-emulated, `pipe#25` execute-in-child. Per-child `C_EPOLL_TBL`
+  (4 instances × an 8-watch list of raw ids) + `C_TIMERFD_TBL` (8-slot `CLOCK_MONOTONIC` deadlines) +
+  reserved `C_PIPE_TBL`. `epoll_wait#21` is a heterogeneous **bounded-yield** pass (`ppoll` socket host fds +
+  read-only mask/clock probes for signalfds/timerfds, merged into packed 12 B events; never parks). A
+  bit-30-clear descending tag ladder (`TIMERFD_BASE`/`EPOLL_BASE`/`PIPE_BASE` below `SIGFD_BASE`, guard
+  `MIN_EMU_BASE`) + the pure `_emu_classify`/`_timer_ticks` (in `src/children.cyr`) drive a `read#5`/`close#6`
+  front gate. `pipe#25` → Linux `pipe2(O_CLOEXEC)` in the child (2×i32→2×u64 exit repack, enter-stop probe;
+  seccomp `pipe2=293`). Known limits: best-effort socket-watching (slot divergence — agnos+shim fix later),
+  real child fds not epoll-watchable, blocking-pipe wedge, `epoll_wait` ≤1 ms HOL (ADR 0015).
 
 ## Tests
 
@@ -143,7 +173,8 @@ paths in the child red zone + repack output structs at the exit stop
   translation contract + the **frozen syscall-coverage** pin (`xlat-coverage`: every agnos#
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
-  (`signal-mask`: `_sig_valid`/`_bit`/`_deliverable`/`_lowest`/`_clear`, 1.6.0); **267 assertions**, hermetic)
+  (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
+  **295 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -209,6 +240,16 @@ paths in the child red zone + repack output structs at the exit stop
   pid0/badsig/unknown/cross-tree −1) + `pause#14` bounded yield; `sigprocmask#17` BLOCK/UNBLOCK/SETMASK
   oldset round-trip; the full `signalfd#18`+`read#5` `kill → observe` delivery chain (raw signal number,
   watch-filtered) incl. the signal-loss regression (a failed delivery must not consume the pending bit).
+- `scripts/it/pipe.sh` — 1.7.0 pipe#25 gate (after signals): an agnos intra-process pipe round-trip (write
+  8 → read 8, bytes match) + a create/close loop that recycles fds (no leak) + a bad-`fds_ptr` fail-clean.
+- `scripts/it/timerfd.sh` — 1.7.0 timerfd#22/#23 gate (after pipe): a disarmed read → −1; a one-shot fires
+  ~1s (count ≥ 1) then disarms; a periodic re-arms (two fires); negative-seconds rejected; close no leak.
+- `scripts/it/epoll.sh` — 1.7.0 epoll#19/#20 gate (after timerfd): create + `epoll_ctl` ADD (dedup, 8-cap) +
+  CLEAR + bad-op/epfd −1 + the instance cap (`EPOLL_SLOTS=4`) + close-recycle (epoll_wait not exercised here).
+- `scripts/it/epoll_wait.sh` — 1.7.0 epoll_wait#21 keystone (after epoll): the heterogeneous wake — one epoll
+  set watching a timerfd + a signalfd wakes on whichever fires (EPOLLIN + the raw id; bounded-yield 0 when
+  idle — the roadmap gate); plus best-effort socket-watching (a server epoll-wakes on an inbound connection,
+  `--net` + python3, SKIPs without python3).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -228,7 +269,7 @@ swallow** layer. None wired yet (scaffold).
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
 - v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4), multi-process
-  (v1.5.0), and signals (v1.6.0) shipped post-v1; epoll-timerfd-pipe / info-getters / winsize / the
+  (v1.5.0), signals (v1.6.0), and I/O multiplexing (v1.7.0) shipped post-v1; info-getters / winsize / the
   Linux→AGNOS swallow are the remaining planned minors (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
@@ -332,10 +373,11 @@ sovereign net band (#47–57, #61) is now COMPLETE.**
 
 **Post-v1** (see [`roadmap.md`](roadmap.md) planned minors): the **sovereign net band** #47–57/#61
 (TCP client + server + UDP + net_config + ICMP, 1.1–1.4), **multi-process** (`spawn#3`/`waitpid#4`/
-`getpid#2` — the agnsh crown jewel, v1.5.0), **and signals** (`pause#14`/`kill#16`/`sigprocmask#17`/
-`signalfd#18` — the shell's other half, v1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md))
-are **complete**. Remaining planned minors: **I/O mux** (epoll #19–21 /
-timerfd #22–23 / `pipe#25`, v1.7.0 next); **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`);
+`getpid#2` — the agnsh crown jewel, v1.5.0), **signals** (`pause#14`/`kill#16`/`sigprocmask#17`/
+`signalfd#18` — the shell's other half, v1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)),
+**and I/O multiplexing** (`epoll#19–21`/`timerfd#22–23`/`pipe#25` — the event loop, v1.7.0,
+[ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) are **complete**. Remaining planned
+minors: **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`, v1.8.0 next);
 **`winsize#60`** tty sizing; and **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the
 agnos kernel — the permanent compat layer), v2+. Each is
 its own validation surface; the translation core built here runs from both

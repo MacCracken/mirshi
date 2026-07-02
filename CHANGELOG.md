@@ -4,6 +4,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-07-01
+
+**I/O multiplexing — the event loop.** agnos `epoll#19–21` / `timerfd#22–23` / `pipe#25` now run: a server
+multiplexes a `timerfd`, a `signalfd`, and a socket on one `epoll` set and wakes on whichever fires. epoll
+and timerfd are **supervisor-emulated** (a server epolls sockets + signalfds, which aren't real child fds, so
+a real in-child epoll couldn't see them); pipe is **execute-in-child** (a real Linux pipe, the only
+agnos-reachable use being intra-process). ([ADR 0015](docs/adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)).
+
+### Added
+- **`pipe#25`** (execute-in-child): rewritten to Linux `pipe2(O_CLOEXEC)` run in the child; the exit stop
+  widens the two i32 host fds into the agnos `{u64 read; u64 write}` (16 B). The read/write ends are real
+  child fds, so `read#5`/`write#1`/`close#6` on them ride the existing execute-in-child path.
+- **`timerfd#22`/`#23`** (`src/dispatch.cyr`): a supervisor-side **`CLOCK_MONOTONIC` deadline** (per-child
+  8-slot table, no real Linux timerfd). `settime` arms it (seconds; capped at `TIMERFD_SEC_CAP`); `read#5`
+  delivers the u64 expiration count (deliver-then-consume, re-arm/disarm) once the deadline passes, else −1.
+- **`epoll#19`/`#20`/`#21`**: a per-child epoll instance (4 instances × an 8-watch list of raw agnos ids).
+  `epoll_ctl` op 1=ADD (dedup, first-empty, negative-reject, 8-cap) / op 2=CLEAR (whole list). `epoll_wait`
+  is a **heterogeneous bounded-yield readiness engine** — `ppoll` the supervisor-held socket host fds +
+  mask-test signalfds + clock-test timerfds, merge, write packed 12 B `{u32 EPOLLIN; u64 raw-id}` events.
+  Never parks (a readiness event has no `wait4` wake source).
+- **Tag ladder + pure helpers** (`src/children.cyr`): `TIMERFD_BASE`/`EPOLL_BASE`/`PIPE_BASE` (bit-30-clear,
+  descending below `SIGFD_BASE`) + `MIN_EMU_BASE`; the pure, unit-pinned `_emu_classify` (tier an id by tag)
+  and `_timer_ticks`; a `read#5`/`close#6` `>= MIN_EMU_BASE` front gate that sub-routes to each band. The
+  per-child record grew to hold `C_EPOLL_TBL` / `C_TIMERFD_TBL` (+ a reserved `C_PIPE_TBL`).
+- **New gates**: `scripts/it/pipe.sh`, `timerfd.sh`, `epoll.sh`, `epoll_wait.sh` (the heterogeneous
+  timerfd+signalfd wake — the roadmap gate — plus best-effort socket-watching). All CI-wired.
+
+### Security
+- **Sole child-seccomp delta: `pipe2` (293)** — epoll + timerfd add **zero** child syscalls (all
+  supervisor-side). A bad `pipe#25` `fds_ptr` is **write-probed at the enter stop** so it fails clean with no
+  fd leaked (the net band's fail-clean discipline). `timerfd_settime` rejects negative + caps huge seconds so
+  `sec·1000` can't overflow into a wrong timer. Each band was adversarially reviewed (pipe: 1 fd-leak MINOR
+  found + fixed; timerfd: 1 overflow MINOR found + fixed; epoll create/ctl + epoll_wait: clean).
+
+### Changed
+- **Frozen matrix**: rows #19–23 move ENOSYS → **EMULATE ⁵**, #25 ENOSYS → **EXECUTE ⁵** (`pipe2`). The
+  freeze test's `agnos_to_linux_nr` values stay pinned (all intercepted before the mapper; `pipe#25` stays −1).
+- **Socket-watching is best-effort** — a coordinated agnos-kernel + mirshi-shim fix for the guest/mirshi
+  socket-slot divergence lands later (documented, wait-time `SLOT_FREE`-revalidated). ADR 0015.
+- **Toolchain pin → `6.3.25`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.6.0] — 2026-07-01
 
 **Signals — the shell's other half.** agnos `pause#14` / `kill#16` / `sigprocmask#17` / `signalfd#18`
