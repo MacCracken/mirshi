@@ -5,6 +5,23 @@
 
 ## Version
 
+**1.8.0** — 2026-07-01. **Info getters + advisory locks — the ENOSYS long-tail** ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)).
+agnos `getuid#15` / `uname#34` / `sysinfo#35` / `flock#59` now run. The three info getters are **supervisor-
+emulated** (synthesized agnos-native structs — mirshi never leaks host identity in the wrong shape); `flock` is
+**execute-in-child** (the host kernel's inode-keyed advisory lock is exactly the agnos semantics). `getuid`
+(also `geteuid`, same #15) → **0** (always root). `uname#34` writes the agnos-NATIVE 64 B struct (4×16 NUL-
+padded: `sysname="AGNOS"`/`nodename="agnos"`/`release="mirshi"`/`machine="x86_64"`, NOT Linux `utsname`);
+`sysinfo#35` writes the agnos-NATIVE 40 B struct (5×u64: uptime/totalram/freeram/procs/cpus) from **live host
+values** (host `sysinfo#99` for uptime + RAM×`mem_unit`; `_child_count` for procs; `sched_getaffinity` popcount
+for cpus) — both **hard-reject −1 if `len` < the struct size** (no partial fill). `flock#59` renumbers to Linux
+`flock(73)` (op codes identical) — a real advisory lock on the child's fd; the sole child-seccomp delta. The
+info getters add **zero** child syscalls (all supervisor-side). Layouts verified against the sibling `agnos`
+repo (`docs/development/agnos-userland-abi.md` §4.3/§4.4 + `kernel/core/syscall.cyr` writers). Proven by
+`scripts/it/flock.sh` (getuid=0 + two-OFD `LOCK_EX` contention/release) + `scripts/it/info.sh` (uname 4-field
+layout + sysinfo live-value ranges + both `len`-guards); adversarially reviewed (flock-on-emulated-id→EBADF→−1;
+sysinfo struct offsets probe-verified). **Value assumptions** (revisit per a real consumer): `release="mirshi"`
+marks the shim (kernel writes `_AGNOS_VERSION`); `sysinfo.procs` = live count vs the kernel's high-water. Pin
+→ `6.3.26`.
 **1.7.0** — 2026-07-01. **I/O multiplexing — the event loop** ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)).
 agnos `epoll#19–21` / `timerfd#22–23` / `pipe#25` now run: a server multiplexes a timerfd + a signalfd + a
 socket on one epoll set. **epoll + timerfd are supervisor-emulated** (a server epolls sockets + signalfds,
@@ -89,7 +106,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.25` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.26` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -166,6 +183,14 @@ paths in the child red zone + repack output structs at the exit stop
   front gate. `pipe#25` → Linux `pipe2(O_CLOEXEC)` in the child (2×i32→2×u64 exit repack, enter-stop probe;
   seccomp `pipe2=293`). Known limits: best-effort socket-watching (slot divergence — agnos+shim fix later),
   real child fds not epoll-watchable, blocking-pipe wedge, `epoll_wait` ≤1 ms HOL (ADR 0015).
+- Info getters + locks (1.8.0, [ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)):
+  `getuid#15`/`uname#34`/`sysinfo#35` supervisor-emulated (synthesized), `flock#59` execute-in-child.
+  `getuid`/`geteuid`→0; `uname#34` writes the agnos-native 4×16 struct (`_put_field16` in `src/dispatch.cyr`;
+  sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `sysinfo#35` writes the agnos-native 5×u64
+  struct from live host values (host `sysinfo#99` uptime+RAM×`mem_unit`, `_child_count` procs,
+  `sched_getaffinity` popcount cpus) via `_info_scratch`; both hard-reject −1 if `len` < the struct size.
+  `flock#59` renumbers to Linux `flock(73)` (op codes identical) — sole child-seccomp delta. Value
+  assumptions (ADR 0016): `release="mirshi"`, `sysinfo.procs` = live count.
 
 ## Tests
 
@@ -250,6 +275,11 @@ paths in the child red zone + repack output structs at the exit stop
   set watching a timerfd + a signalfd wakes on whichever fires (EPOLLIN + the raw id; bounded-yield 0 when
   idle — the roadmap gate); plus best-effort socket-watching (a server epoll-wakes on an inbound connection,
   `--net` + python3, SKIPs without python3).
+- `scripts/it/flock.sh` — 1.8.0 getuid#15 + flock#59 gate (after epoll_wait): `getuid`/`geteuid`→0 (always
+  root) + a real two-OFD `LOCK_EX` contention (`LOCK_EX` then `LOCK_EX|NB`→−1) and release→retry succeeds.
+- `scripts/it/info.sh` — 1.8.0 uname#34 + sysinfo#35 gate (after flock): the exact 4×16 uname field layout +
+  values (AGNOS/agnos/mirshi/x86_64) and `len<64`→−1; sysinfo live-value ranges (uptime≥0, 0<freeram≤totalram,
+  procs≥1, cpus≥1) and `len<40`→−1.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -269,8 +299,8 @@ swallow** layer. None wired yet (scaffold).
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
 - v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4), multi-process
-  (v1.5.0), signals (v1.6.0), and I/O multiplexing (v1.7.0) shipped post-v1; info-getters / winsize / the
-  Linux→AGNOS swallow are the remaining planned minors (see the [roadmap](roadmap.md)).
+  (v1.5.0), signals (v1.6.0), I/O multiplexing (v1.7.0), and info-getters + locks (v1.8.0) shipped post-v1;
+  `winsize#60` / the Linux→AGNOS swallow are the remaining planned minors (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
 ## Next
@@ -375,11 +405,12 @@ sovereign net band (#47–57, #61) is now COMPLETE.**
 (TCP client + server + UDP + net_config + ICMP, 1.1–1.4), **multi-process** (`spawn#3`/`waitpid#4`/
 `getpid#2` — the agnsh crown jewel, v1.5.0), **signals** (`pause#14`/`kill#16`/`sigprocmask#17`/
 `signalfd#18` — the shell's other half, v1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)),
-**and I/O multiplexing** (`epoll#19–21`/`timerfd#22–23`/`pipe#25` — the event loop, v1.7.0,
-[ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) are **complete**. Remaining planned
-minors: **info getters + `flock#59`** (`getuid#15`/`uname#34`/`sysinfo#35`, v1.8.0 next);
-**`winsize#60`** tty sizing; and **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the
-agnos kernel — the permanent compat layer), v2+. Each is
+**I/O multiplexing** (`epoll#19–21`/`timerfd#22–23`/`pipe#25` — the event loop, v1.7.0,
+[ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)), **and info getters + locks**
+(`getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the ENOSYS long-tail, v1.8.0,
+[ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) are **complete**. Remaining planned
+minors: **`winsize#60`** tty sizing (v1.9.0 next); and **direction 2** — the Linux→AGNOS "swallow" (run Linux
+binaries on the agnos kernel — the permanent compat layer), v2+. Each is
 its own validation surface; the translation core built here runs from both
 sides. The mirshi/QEMU/iron discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md))
 holds: mirshi owns userland + Linux-compat-at-scale, never the agnos kernel or hardware truth.

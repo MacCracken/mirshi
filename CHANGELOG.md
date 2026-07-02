@@ -4,6 +4,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-07-01
+
+**Info getters + advisory locks — the ENOSYS long-tail.** agnos `getuid#15` / `uname#34` / `sysinfo#35` /
+`flock#59` now run: a general userland can read its identity + system stats and take advisory file locks.
+The three info getters are **supervisor-emulated** (synthesized agnos-native structs — mirshi never leaks
+host identity in the wrong shape); `flock` is **execute-in-child** (the host kernel's inode-keyed advisory
+lock is exactly the agnos semantics) ([ADR 0016](docs/adr/0016-info-getters-emulated-flock-executed.md)).
+
+### Added
+- **`getuid#15`** (also `geteuid`, same #15) EMULATE → **0** — the agnos environment is always root.
+- **`uname#34`** EMULATE: the agnos-NATIVE 64-byte identity struct (4×16 NUL-padded at 0/16/32/48 =
+  `sysname="AGNOS"` / `nodename="agnos"` / `release="mirshi"` / `machine="x86_64"`), **not** Linux
+  `utsname`. `len<64` → −1 (no partial fill).
+- **`sysinfo#35`** EMULATE: the agnos-NATIVE 40-byte struct (5×u64 at 0/8/16/24/32 = `uptime_secs` /
+  `totalram` / `freeram` / `procs` / `cpus`) from **live host values** — host Linux `sysinfo#99` for
+  uptime + RAM (×`mem_unit`→bytes), `_child_count` for procs, `sched_getaffinity` popcount for cpus.
+  `len<40` → −1.
+- **`flock#59`** EXECUTE-in-child → Linux `flock(73)` (op codes bit-identical: `SH`/`EX`/`UN`/`NB`) — a
+  real inode-keyed advisory lock on the child's fd.
+- **New gates**: `scripts/it/flock.sh` (getuid/geteuid=0 + two-OFD `LOCK_EX` contention/release),
+  `scripts/it/info.sh` (uname 4-field layout + sysinfo live-value ranges + both `len`-guards). CI-wired.
+
+### Security
+- **Sole child-seccomp delta: `flock(73)`** — the three info getters read supervisor-side, so they add
+  **zero** child syscalls. `getuid`→0 never leaks the host uid; `uname`/`sysinfo` synthesize agnos-native
+  structs, never the host `utsname`/`sysinfo` shape. Each band adversarially reviewed (getuid/flock:
+  clean, incl. `flock` on an emulated id → EBADF→−1; sysinfo: clean, struct offsets probe-verified).
+
+### Changed
+- **Frozen matrix**: rows #15/#34/#35 move ENOSYS → **EMULATE ⁶**, #59 ENOSYS → **EXECUTE ⁶** (`flock`).
+  The freeze test's `agnos_to_linux_nr` values: #15/#34/#35 stay −1 (dispatcher-intercepted); #59 gains
+  `→73` (a real execute-in-child peer).
+- **Value assumptions** (ADR 0016, revisit per a real consumer): `uname.release="mirshi"` (vs the kernel's
+  `_AGNOS_VERSION`), `sysinfo.procs` = live count (vs the kernel's high-water).
+- **Toolchain pin → `6.3.26`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.7.0] — 2026-07-01
 
 **I/O multiplexing — the event loop.** agnos `epoll#19–21` / `timerfd#22–23` / `pipe#25` now run: a server

@@ -34,3 +34,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0013 — Multi-process: supervisor-driven fork + memfd/execveat, a per-child record table, opaque-monotonic pids](0013-multiprocess-supervisor-fork-record-table.md) — *Accepted*
 - [0014 — Signal band: supervisor-emulated pending/blocked masks + an opaque-tagged signalfd](0014-signal-band-supervisor-emulated-masks-signalfd.md) — *Accepted*
 - [0015 — I/O multiplexing: supervisor-emulated epoll + timerfd, execute-in-child pipe](0015-io-mux-emulated-epoll-timerfd-executed-pipe.md) — *Accepted*
+- [0016 — Info getters supervisor-emulated (getuid / uname / sysinfo), flock execute-in-child](0016-info-getters-emulated-flock-executed.md) — *Accepted*

@@ -20,10 +20,10 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.7.0)
+## Shipped (v0.1.0 → v1.8.0)
 
 The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
-multi-process, signals, and I/O multiplexing are **done**. Full per-release detail:
+multi-process, signals, I/O multiplexing, and the info-getter long-tail are **done**. Full per-release detail:
 [`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen per-number contract:
 [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
 
@@ -36,6 +36,7 @@ multi-process, signals, and I/O multiplexing are **done**. Full per-release deta
 | **Multi-process (post-v1)** | v1.5.0 | `spawn#3`/`waitpid#4`/`getpid#2` — the **agnsh crown jewel**: a parent spawns in-memory-ELF children + waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor; opaque-monotonic pids, `MAX_CHILDREN` storm bound, deadlock guard ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)) |
 | **Signals (post-v1)** | v1.6.0 | `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — the shell's notification half: supervisor-emulated pending/blocked masks over the record table, `kill` self/child-scoped, a **bounded-yield** `pause`, and an opaque `signalfd` whose `read#5` delivers the raw signal number ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) |
 | **I/O multiplexing (post-v1)** | v1.7.0 | `epoll#19–21`/`timerfd#22–23`/`pipe#25` — the **event loop**: epoll + timerfd **supervisor-emulated** (a heterogeneous **bounded-yield** `epoll_wait` — `ppoll` sockets + mask-test signalfds + clock-test timerfds), `pipe` **execute-in-child**; the tag ladder + `_emu_classify` read#5/close#6 front gate; socket-watching best-effort ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) |
+| **Info getters + locks (post-v1)** | v1.8.0 | `getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the **ENOSYS long-tail**: the info getters **supervisor-emulated** (synthesized agnos-native structs — `getuid`→0, `uname`/`sysinfo` from live host values, never leaking host identity), `flock` **execute-in-child** (real inode-keyed advisory lock) ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) |
 
 ## Planned — post-v1 minors
 
@@ -43,12 +44,6 @@ Each remaining agnos-ABI surface is an additive **minor** (backward-compatible n
 same cadence the net band used). **Ordering is provisional + demand-driven** — a slice gets pulled
 forward when a real agnos consumer needs it. All rows below are **ENOSYS today**
 ([the matrix](../reference/syscall-coverage.md)).
-
-### v1.8.0 — Info getters + advisory locks (the ENOSYS long-tail)
-`getuid#15` (stub → 0) / `uname#34` (4×16-byte fields) / `sysinfo#35` (5×u64) / `flock#59`
-(inode-keyed advisory: SH/EX/UN, +NB). A grab-bag minor draining the remaining non-structural ENOSYS
-rows — mostly EMULATE (info getters) + execute-in-child (`flock`). *Gate*: agnos `uname`/`sysinfo`
-return plausible fields; two handles contend on `flock`.
 
 ### v1.9.0 — tty / framebuffer sizing
 `winsize#60` → `(cols<<16)|rows`, the live FB char-grid getter agnsh / darshana use for tty sizing.

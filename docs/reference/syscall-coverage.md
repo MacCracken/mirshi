@@ -45,7 +45,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 12 | sync | EXECUTE | `sync` (162) | |
 | 13 | reboot | ENOSYS | — | |
 | 14 | pause | EMULATE ⁴ | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
-| 15 | getuid | ENOSYS | — | |
+| 15 | getuid | EMULATE ⁶ | — | info getters (v1.8.0): `getuid`/`geteuid` → **0** (always root; never the host uid) |
 | 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
 | 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
 | 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
@@ -64,8 +64,8 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 31 | rename | EXECUTE | `rename` (82) ¹ | two paths staged; a4=r10 |
 | 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; **HARDLINK** (agnos has no symlink syscall) |
 | 33 | stat | EXECUTE | `stat` (4) ¹ | path staged; Linux 144 B → agnos 48 B repack at exit |
-| 34 | uname | ENOSYS | — | |
-| 35 | sysinfo | ENOSYS | — | |
+| 34 | uname | EMULATE ⁶ | — | info getters (v1.8.0): synthesized agnos-native 64 B struct (4×16 = sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `len<64`→−1 |
+| 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1 |
 | 36–39 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
@@ -84,7 +84,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
-| 59 | flock | ENOSYS | — | |
+| 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta |
 | 60 | winsize | ENOSYS | — | graphics — post-v1 |
 | 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
 
@@ -161,6 +161,22 @@ pipe is the reserved `PIPE_BASE` follow-up). `epoll_wait`'s ≤1 ms `ppoll` head
 (the `pause#14` class). The ABI-ambiguity defaults (epoll mask=EPOLLIN, op 2=whole-clear, timerfd flags
 relative) are baked pending a real consumer. See [ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md).
 
+⁶ **Info getters + advisory locks (v1.8.0).** `getuid#15` / `uname#34` / `sysinfo#35` are **supervisor-EMULATE**
+(synthesized), `flock#59` is **EXECUTE-in-child**
+([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) — the ENOSYS long-tail. `getuid`/`geteuid`
+→ 0 (always root; never the host uid). `uname#34` writes the agnos-NATIVE 64 B struct (4×16 NUL-padded at
+0/16/32/48 = `sysname="AGNOS"` / `nodename="agnos"` / `release="mirshi"` / `machine="x86_64"`, NOT Linux
+`utsname`); `sysinfo#35` writes the agnos-NATIVE 40 B struct (5×u64 at 0/8/16/24/32 = `uptime_secs` /
+`totalram` / `freeram` / `procs` / `cpus`, NOT the ~112 B Linux struct) from **live host values** (host
+`sysinfo#99` for uptime/RAM×`mem_unit`; `_child_count` for procs; `sched_getaffinity` popcount for cpus). Both
+**hard-reject −1 if `len` < the struct size** (no partial fill). `flock#59` renumbers to Linux `flock(73)`
+(op codes identical) — a real inode-keyed advisory lock on the child's real fd; the sole child-seccomp delta.
+The info getters add **zero** child syscalls (all supervisor-side). **Value assumptions** (no in-tree consumer;
+revisit per one): `uname.release="mirshi"` marks the shim vs the kernel's `_AGNOS_VERSION`; `nodename="agnos"`
+matches the kernel default; `sysinfo.procs` is mirshi's live agnos-process count vs the kernel's high-water.
+The canonical layouts are the sibling `agnos` repo's `docs/development/agnos-userland-abi.md` §4.3/§4.4 +
+`kernel/core/syscall.cyr` writers. See [ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md).
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -172,8 +188,9 @@ Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47
 — footnote ²), **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³),
 the **signal band** (`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18`, v1.6.0 — footnote ⁴), and the
 **I/O-multiplexing band** (`epoll#19–21`/`timerfd#22–23`/`pipe#25`, v1.7.0 — footnote ⁵) shipped as post-v1
-extensions. Still ENOSYS, as **planned post-v1 minors** (see the [roadmap](../development/roadmap.md)):
-info getters (#15/#34/#35), `flock#59`, and `winsize#60`.
+extensions, as was the **info-getters + advisory-locks band** (`getuid#15`/`uname#34`/`sysinfo#35`/`flock#59`,
+v1.8.0 — footnote ⁶). Still ENOSYS, as **planned post-v1 minors** (see the
+[roadmap](../development/roadmap.md)): `winsize#60`.
 
 ## Known gaps (carried forward, documented not fixed)
 
@@ -205,3 +222,8 @@ info getters (#15/#34/#35), `flock#59`, and `winsize#60`.
   head-of-line-blocks other children (the `pause#14` class); timerfd/signalfd reads are non-blocking. The
   ABI-ambiguity defaults (epoll mask=EPOLLIN, op 2=whole-clear, timerfd flags relative) await a real consumer.
   See [ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md).
+- **Info getters (`uname#34`/`sysinfo#35`, ⁶)**: `uname` **value assumptions** — `release="mirshi"` marks the
+  shim (the real kernel writes `_AGNOS_VERSION`), `nodename="agnos"` matches the kernel default (no
+  `sethostname` yet); `sysinfo.procs` is mirshi's live agnos-process count vs the kernel's `proc_count`
+  high-water (a cosmetic stat). `uptime`/`totalram`/`freeram`/`cpus` are the real host facts (degrade to 0/1 if
+  the host reads fail). All await confirmation against a real agnos consumer. See [ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md).
