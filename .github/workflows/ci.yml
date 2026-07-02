@@ -211,6 +211,13 @@ jobs:
         # (signalfd#18) lands in a later bite. Needs the same-uid ptrace requirement.
         run: bash scripts/it/signals.sh
 
+      - name: Pipe — pipe#25 execute-in-child (v1.7.0)
+        # v1.7.0 I/O-mux (BITE 2): agnos pipe#25 is rewritten to Linux pipe2(scratch, O_CLOEXEC) run
+        # IN the child; the exit stop widens the two i32 host fds into the agnos {u64 read; u64 write}.
+        # The ends are real child fds (read/write/close ride the execute-in-child path). Proves an
+        # intra-process round-trip + a create/close loop leaks no fds. Needs the same-uid ptrace req.
+        run: bash scripts/it/pipe.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

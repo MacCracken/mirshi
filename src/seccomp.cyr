@@ -72,6 +72,7 @@ fn _bound_allowlist(buf): i64 {
     n = _allow(buf, n, 162);    # sync
     n = _allow(buf, n, 201);    # time
     n = _allow(buf, n, 217);    # getdents64
+    n = _allow(buf, n, 293);    # pipe2       (v1.7.0: pipe#25 runs execute-in-child — the sole delta)
     n = _allow(buf, n, 231);    # exit_group  (agnos exit#0)
     n = _allow(buf, n, 318);    # getrandom
     n = _allow(buf, n, 437);    # openat2     (0.7.1: open#7 under --root rootfs confinement)
@@ -98,7 +99,7 @@ fn _bound_allowlist(buf): i64 {
 fn apply_child_bound(): i64 {
     sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    var allow = alloc(8 * 64);   # headroom: na=29 now; grows with the translation set
+    var allow = alloc(8 * 64);   # headroom: na=30 now; grows with the translation set
     if (allow == 0) { return 0 - 1; }                   # fail-closed: caller aborts the child
     var na = _bound_allowlist(allow);
 

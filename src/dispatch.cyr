@@ -58,6 +58,8 @@ enum MirshiConfine {
     SYS_RENAMEAT2 = 316;        # rename#31 -> renameat2(ROOTFD, oldrel, ROOTFD, newrel, 0)
     SYS_LINKAT = 265;           # link#32   -> linkat(ROOTFD, oldrel, ROOTFD, newrel, 0)
     AT_REMOVEDIR = 0x200;       # unlinkat flag for rmdir (remove a directory, not a file)
+    SYS_PIPE2 = 293;            # v1.7.0 pipe#25 -> pipe2(int fds[2], flags) run IN the child
+    O_CLOEXEC = 0x80000;        # pipe2 flag: the fds don't survive a later execveat (spawn#3 hygiene)
 }
 
 # Whether path confinement is active (a --root was configured). Set by intercept_run
@@ -228,11 +230,25 @@ fn _m2_getdents_exit(pid, lret): i64 {
     return abytes;                                   # agnos return = repacked byte count
 }
 
-# EXIT-stop return mapping for an executed fs call: stat/getdents need an output
+# EXIT-stop: pipe#25 — the kernel wrote the 2 x i32 host fds (read@0, write@4) into the red-zone
+# scratch; widen each to u64 and write the agnos {u64 read_fd; u64 write_fd} (16 B) into the child's
+# saved fds buffer. pipe2 returns 0 ok / -errno; a nonzero return or short copy -> agnos -1. Reuses
+# the M2 repack scratch (single in-flight call, strict enter/exit alternation).
+fn _m2_pipe_exit(pid, lret): i64 {
+    if (lret != 0) { return 0 - 1; }                                 # pipe2 failed (-errno)
+    if (pvm_read(pid, _m2_scratch, _m2_linbuf, 8) != 8) { return 0 - 1; }
+    store64(_m2_agnbuf + 0, load32(_m2_linbuf + 0) & 0xFFFFFFFF);     # read fd  (i32 -> u64, zero-extend)
+    store64(_m2_agnbuf + 8, load32(_m2_linbuf + 4) & 0xFFFFFFFF);     # write fd
+    if (pvm_write(pid, _m2_out_ptr, _m2_agnbuf, 16) != 16) { return 0 - 1; }
+    return 0;
+}
+
+# EXIT-stop return mapping for an executed fs call: stat/getdents/pipe need an output
 # repack; everything else just maps the Linux return to the agnos convention.
 fn fs_exit_return(pid, agnos_nr, lret): i64 {
     if (agnos_nr == 33) { return _m2_stat_exit(pid, lret); }
     if (agnos_nr == 29) { return _m2_getdents_exit(pid, lret); }
+    if (agnos_nr == 25) { return _m2_pipe_exit(pid, lret); }
     return linux_ret_to_agnos(agnos_nr, lret);
 }
 
@@ -1065,6 +1081,31 @@ fn translate_dispatch(pid, regs): i64 {
         store64(regs + REG_RSI, _m2_scratch);    # dir_fd in rdi passes through
         store64(regs + REG_RDX, gcap);
         store64(regs + REG_ORIG_RAX, 217);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+    # pipe#25(fds_ptr) -> Linux pipe2(scratch, O_CLOEXEC) run IN the child; the exit stop widens the
+    # two i32 host fds into the agnos {u64 read; u64 write} at fds_ptr. Handled here (NOT via
+    # agnos_to_linux_nr, which stays -1 for #25) because it needs arg synthesis + an output repack,
+    # like stat#33/getdents#29. Not path-confined (no path), so it runs the same under --root. The
+    # only child-seccomp-bound delta in v1.7.0 (pipe2=293). Every agnos pipe use is intra-process
+    # (agnos has no fork; spawn#3 passes no fds), so a real child pipe is correct — see ADR 0015.
+    if (nr == 25) {
+        _m2_init();                               # ensure the repack buffers exist
+        var fdsp = decode_arg(regs, 0);           # the agnos 16 B fds out-buffer
+        # Validate that fds buffer is writable BEFORE the side-effecting pipe2 — else a bad/unmapped
+        # fds_ptr would leak the 2 real fds pipe2 creates (the exit repack write would fail AFTER the
+        # fds exist, and there is no inject-close at the exit stop). Zero-probe it; a short write fails
+        # clean to agnos -1 with no pipe created (the net band's fail-clean discipline, adapted).
+        store64(_m2_agnbuf + 0, 0);
+        store64(_m2_agnbuf + 8, 0);
+        if (pvm_write(pid, fdsp, _m2_agnbuf, 16) != 16) { return _m2_fail(pid, regs); }
+        var psc = (load64(regs + REG_RSP) - RED_ZONE - 8) & (0 - 8);   # 8 B (2 x i32) red-zone scratch
+        _m2_scratch = psc;
+        _m2_out_ptr = fdsp;                       # for the exit repack
+        store64(regs + REG_RDI, psc);             # int pipefd[2] out-param
+        store64(regs + REG_RSI, O_CLOEXEC);       # flags
+        store64(regs + REG_ORIG_RAX, SYS_PIPE2);
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EXECUTE;
     }
