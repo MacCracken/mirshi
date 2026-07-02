@@ -4,6 +4,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-07-01
+
+**tty sizing — direction 1 is feature-complete.** agnos `winsize#60` now runs: an agnos TUI sizes to the
+real console under mirshi. This is the **entire direction-1 graphics surface** (there is no `fbinfo`/`blit`
+in the agnos ABI), and its landing means **every defined, non-kernel-only agnos syscall is now handled** —
+the only ENOSYS rows left are the agnos-kernel-only ops + the undefined ABI gaps
+([ADR 0017](docs/adr/0017-winsize-emulated-tiocgwinsz.md)).
+
+### Added
+- **`winsize#60`** EMULATE: a pure supervisor return (no child buffer, like `uptime_ms#40`) — mirshi reads
+  the controlling terminal's size via `TIOCGWINSZ` on its own stdio (the child inherits it) and returns
+  `(cols<<16)|rows` (cols high, rows low — matching the kernel's `fb_winsize` packing and darshana's
+  `tty_winsize` unpack). No tty → an 80×24 virtual default; **always returns a usable size** (faithful to
+  real agnos, whose framebuffer is always up).
+- **New gate**: `scripts/it/winsize.sh` — the no-tty default (→ 80×24) and a pty sized to 120×40
+  (→ `TIOCGWINSZ` reports 120×40, proving the real read, not just the fallback; SKIPs without python3).
+  CI-wired.
+
+### Security
+- **No child-seccomp delta** — the `ioctl(TIOCGWINSZ)` runs supervisor-side (the child never runs it);
+  `winsize` carries no child buffer/pointer (no TOCTOU surface) and no path (`--root`-orthogonal).
+  Adversarially reviewed clean — offsets/constants/packing verified against system headers **and the real
+  darshana consumer**.
+
+### Changed
+- **Frozen matrix**: row #60 moves ENOSYS → **EMULATE ⁷** (tty sizing). `agnos_to_linux_nr(60)` stays −1
+  (EMULATE, dispatcher-intercepted). With this, **direction 1 is feature-complete** — the matrix's only
+  remaining ENOSYS rows are the agnos-kernel-only ops (`mount#11`/`umount#24`/`reboot#13`/
+  `write_boot_checkpoint#26`) and the undefined gaps (#36–39, #42–44).
+- **Toolchain pin → `6.3.27`** (`cyrius.cyml`) — synced to the current wrapper at the release boundary.
+
 ## [1.8.0] — 2026-07-01
 
 **Info getters + advisory locks — the ENOSYS long-tail.** agnos `getuid#15` / `uname#34` / `sysinfo#35` /

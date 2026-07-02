@@ -20,10 +20,11 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.8.0)
+## Shipped (v0.1.0 → v1.9.0)
 
 The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
-multi-process, signals, I/O multiplexing, and the info-getter long-tail are **done**. Full per-release detail:
+multi-process, signals, I/O multiplexing, the info-getter long-tail, and tty sizing are **done** —
+**direction 1 is feature-complete** (every defined, non-kernel-only agnos syscall is handled). Full per-release detail:
 [`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen per-number contract:
 [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
 
@@ -37,20 +38,13 @@ multi-process, signals, I/O multiplexing, and the info-getter long-tail are **do
 | **Signals (post-v1)** | v1.6.0 | `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — the shell's notification half: supervisor-emulated pending/blocked masks over the record table, `kill` self/child-scoped, a **bounded-yield** `pause`, and an opaque `signalfd` whose `read#5` delivers the raw signal number ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) |
 | **I/O multiplexing (post-v1)** | v1.7.0 | `epoll#19–21`/`timerfd#22–23`/`pipe#25` — the **event loop**: epoll + timerfd **supervisor-emulated** (a heterogeneous **bounded-yield** `epoll_wait` — `ppoll` sockets + mask-test signalfds + clock-test timerfds), `pipe` **execute-in-child**; the tag ladder + `_emu_classify` read#5/close#6 front gate; socket-watching best-effort ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) |
 | **Info getters + locks (post-v1)** | v1.8.0 | `getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the **ENOSYS long-tail**: the info getters **supervisor-emulated** (synthesized agnos-native structs — `getuid`→0, `uname`/`sysinfo` from live host values, never leaking host identity), `flock` **execute-in-child** (real inode-keyed advisory lock) ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) |
+| **tty sizing (post-v1)** | v1.9.0 | `winsize#60` — the **whole direction-1 graphics surface** (no `fbinfo`/`blit` exists): **supervisor-emulated** `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default, always a usable size), consumer-verified against darshana ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)). **Direction 1 feature-complete.** |
 
-## Planned — post-v1 minors
+## Planned — the direction-2 major
 
-Each remaining agnos-ABI surface is an additive **minor** (backward-compatible new-syscall support, the
-same cadence the net band used). **Ordering is provisional + demand-driven** — a slice gets pulled
-forward when a real agnos consumer needs it. All rows below are **ENOSYS today**
-([the matrix](../reference/syscall-coverage.md)).
-
-### v1.9.0 — tty / framebuffer sizing
-`winsize#60` → `(cols<<16)|rows`, the live FB char-grid getter agnsh / darshana use for tty sizing.
-A headless container has no framebuffer, so this is EMULATE from the controlling terminal's window size
-(`TIOCGWINSZ`) or a virtual default. (There is **no** `fbinfo`/`blit` in the agnos ABI — the entire
-direction-1 graphics surface is this one getter.) *Gate*: an agnos tool sized to the terminal reports
-the correct cols×rows.
+**Direction 1 (AGNOS→Linux) is feature-complete** — every defined, non-kernel-only agnos syscall is
+handled (the matrix's only ENOSYS rows are the agnos-kernel-only ops + the undefined ABI gaps). What
+remains is the mirror half:
 
 ### v2.0.0 — Direction 2: the Linux→AGNOS "swallow"
 Run **Linux** binaries **on the agnos kernel** — the permanent compat layer, the mirror half of the

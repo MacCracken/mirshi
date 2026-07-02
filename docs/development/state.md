@@ -5,6 +5,19 @@
 
 ## Version
 
+**1.9.0** — 2026-07-01. **tty sizing — direction 1 is feature-complete** ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)).
+agnos `winsize#60` now runs — the **entire direction-1 graphics surface** (there is no `fbinfo`/`blit` in the
+agnos ABI). EMULATE, a pure supervisor return (no child buffer, like `uptime_ms#40`): mirshi reads the
+controlling terminal's size via `TIOCGWINSZ` on its own stdio (the child inherits it) and returns
+`(cols<<16)|rows` (cols high, rows low — matching the kernel's `fb_winsize` packing and darshana's
+`tty_winsize` unpack); no tty → an **80×24 virtual default**, and it **always returns a usable size** (never
+−1 — faithful to real agnos, whose framebuffer is always up). Supervisor-side `ioctl` → no child-seccomp delta;
+no child buffer/path → no TOCTOU, `--root`-orthogonal. Proven by `scripts/it/winsize.sh` (no-tty→80×24 + a
+pty(120×40)→120×40, proving the real `TIOCGWINSZ` read); adversarially reviewed clean (offsets/constants/
+packing verified against system headers + the real darshana consumer). **With this, direction 1 is
+feature-complete**: every defined, non-kernel-only agnos syscall is handled — the only ENOSYS rows left are the
+agnos-kernel-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26`) + the undefined ABI gaps.
+The one remaining milestone is the v2.0.0 direction-2 "swallow". Pin → `6.3.27`.
 **1.8.0** — 2026-07-01. **Info getters + advisory locks — the ENOSYS long-tail** ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)).
 agnos `getuid#15` / `uname#34` / `sysinfo#35` / `flock#59` now run. The three info getters are **supervisor-
 emulated** (synthesized agnos-native structs — mirshi never leaks host identity in the wrong shape); `flock` is
@@ -106,7 +119,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.26` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.3.27` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -191,6 +204,11 @@ paths in the child red zone + repack output structs at the exit stop
   `sched_getaffinity` popcount cpus) via `_info_scratch`; both hard-reject −1 if `len` < the struct size.
   `flock#59` renumbers to Linux `flock(73)` (op codes identical) — sole child-seccomp delta. Value
   assumptions (ADR 0016): `release="mirshi"`, `sysinfo.procs` = live count.
+- tty sizing (1.9.0, [ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)): `winsize#60` EMULATE — a pure
+  supervisor return (`_do_winsize` in `src/dispatch.cyr`, no child buffer). Reads `TIOCGWINSZ` on the
+  controlling terminal (stdio 0/1/2, inherited by the child), packs `(cols<<16)|rows` (matching `fb_winsize`
+  + darshana's unpack), 80×24 default if no tty; always a usable size. The whole direction-1 graphics surface
+  (no `fbinfo`/`blit`). No child-seccomp delta (supervisor-side `ioctl`).
 
 ## Tests
 
@@ -280,6 +298,9 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/info.sh` — 1.8.0 uname#34 + sysinfo#35 gate (after flock): the exact 4×16 uname field layout +
   values (AGNOS/agnos/mirshi/x86_64) and `len<64`→−1; sysinfo live-value ranges (uptime≥0, 0<freeram≤totalram,
   procs≥1, cpus≥1) and `len<40`→−1.
+- `scripts/it/winsize.sh` — 1.9.0 winsize#60 gate (after info): the no-tty default (`(cols<<16)|rows` == 80×24)
+  + a pty sized to 120×40 → `TIOCGWINSZ` reports 120×40 (proves the real read, not just the fallback; the pty
+  sub-test needs python3, SKIPs without).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 
@@ -299,8 +320,9 @@ swallow** layer. None wired yet (scaffold).
 
 - mirshi itself is a **Linux-target** Cyrius binary; it supervises **agnos-target** ELFs.
 - v1 scope = direction 1 (AGNOS→Linux), headless CLI, no QEMU. The net band (v1.1–v1.4), multi-process
-  (v1.5.0), signals (v1.6.0), I/O multiplexing (v1.7.0), and info-getters + locks (v1.8.0) shipped post-v1;
-  `winsize#60` / the Linux→AGNOS swallow are the remaining planned minors (see the [roadmap](roadmap.md)).
+  (v1.5.0), signals (v1.6.0), I/O multiplexing (v1.7.0), info-getters + locks (v1.8.0), and tty sizing
+  (v1.9.0) shipped post-v1 — **direction 1 is now feature-complete**; the Linux→AGNOS swallow (v2.0.0) is
+  the one remaining milestone (see the [roadmap](roadmap.md)).
 - Complements QEMU+KVM (real kernel) + iron (hardware truth); does not replace them.
 
 ## Next
@@ -406,11 +428,13 @@ sovereign net band (#47–57, #61) is now COMPLETE.**
 `getpid#2` — the agnsh crown jewel, v1.5.0), **signals** (`pause#14`/`kill#16`/`sigprocmask#17`/
 `signalfd#18` — the shell's other half, v1.6.0, [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)),
 **I/O multiplexing** (`epoll#19–21`/`timerfd#22–23`/`pipe#25` — the event loop, v1.7.0,
-[ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)), **and info getters + locks**
+[ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)), **info getters + locks**
 (`getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the ENOSYS long-tail, v1.8.0,
-[ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) are **complete**. Remaining planned
-minors: **`winsize#60`** tty sizing (v1.9.0 next); and **direction 2** — the Linux→AGNOS "swallow" (run Linux
-binaries on the agnos kernel — the permanent compat layer), v2+. Each is
+[ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)), **and tty sizing** (`winsize#60` — the whole
+direction-1 graphics surface, v1.9.0, [ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)) are **complete**.
+**Direction 1 (AGNOS→Linux) is feature-complete** — every defined, non-kernel-only agnos syscall is handled.
+The one remaining milestone is **direction 2** — the Linux→AGNOS "swallow" (run Linux binaries on the agnos
+kernel — the permanent compat layer), v2.0.0. Each direction is
 its own validation surface; the translation core built here runs from both
 sides. The mirshi/QEMU/iron discipline ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md))
 holds: mirshi owns userland + Linux-compat-at-scale, never the agnos kernel or hardware truth.

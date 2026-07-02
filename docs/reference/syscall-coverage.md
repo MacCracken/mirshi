@@ -85,7 +85,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
 | 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta |
-| 60 | winsize | ENOSYS | — | graphics — post-v1 |
+| 60 | winsize | EMULATE ⁷ | — | tty sizing (v1.9.0): `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default if no tty); the whole direction-1 graphics surface |
 | 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
 
 Any number > 61 (and the undefined gaps) → **ENOSYS**.
@@ -177,6 +177,16 @@ matches the kernel default; `sysinfo.procs` is mirshi's live agnos-process count
 The canonical layouts are the sibling `agnos` repo's `docs/development/agnos-userland-abi.md` §4.3/§4.4 +
 `kernel/core/syscall.cyr` writers. See [ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md).
 
+⁷ **tty sizing (v1.9.0).** `winsize#60` is **supervisor-EMULATE**
+([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)) — the **entire direction-1 graphics surface** (there
+is no `fbinfo`/`blit` in the agnos ABI). A pure supervisor return (no child buffer, like `uptime_ms#40`):
+mirshi reads the controlling terminal's size via `TIOCGWINSZ` on its own stdio (the child inherits it) and
+returns `(cols<<16)|rows` — cols high, rows low, matching the kernel's `fb_winsize` packing and darshana's
+`tty_winsize` unpack. No tty (redirected stdio / a plain container) → an **80×24 virtual default**. mirshi
+**always returns a usable size (never −1)** — faithful to real agnos (the framebuffer is always up on iron,
+so `winsize` never −1 there; darshana treats a size as "is a tty"). Supervisor-side `ioctl` → no child-seccomp
+delta; `--root`-orthogonal. See [ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md).
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -188,9 +198,12 @@ Everything else was **ENOSYS** at the v1.0 cut. Since then the **net band** (#47
 — footnote ²), **multi-process** (`spawn#3`/`waitpid#4` + `getpid#2` now coined, v1.5.0 — footnote ³),
 the **signal band** (`pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18`, v1.6.0 — footnote ⁴), and the
 **I/O-multiplexing band** (`epoll#19–21`/`timerfd#22–23`/`pipe#25`, v1.7.0 — footnote ⁵) shipped as post-v1
-extensions, as was the **info-getters + advisory-locks band** (`getuid#15`/`uname#34`/`sysinfo#35`/`flock#59`,
-v1.8.0 — footnote ⁶). Still ENOSYS, as **planned post-v1 minors** (see the
-[roadmap](../development/roadmap.md)): `winsize#60`.
+extensions, as were the **info-getters + advisory-locks band** (`getuid#15`/`uname#34`/`sysinfo#35`/`flock#59`,
+v1.8.0 — footnote ⁶) and **tty sizing** (`winsize#60`, v1.9.0 — footnote ⁷). **Direction 1 is now
+feature-complete**: every *defined, non-kernel-only* agnos syscall is handled. The only remaining ENOSYS rows
+are the agnos-**kernel**-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26` — permanent by
+design) and the undefined ABI gaps (#36–39, #42–44). What remains on the [roadmap](../development/roadmap.md) is
+the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 
 ## Known gaps (carried forward, documented not fixed)
 
