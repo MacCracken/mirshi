@@ -926,6 +926,124 @@ fn _sigfd_read(pid, regs): i64 {
     return _net_emu(pid, regs, 8);                                 # bytes delivered
 }
 
+# --- v1.7.0 timerfd band (#22/#23 + read#5). SUPERVISOR-EMULATED as a stored DEADLINE (no real Linux
+#     timerfd fd): a real child timerfd would be invisible to the supervisor-emulated epoll (BITE 5),
+#     the same stranding as sockets, so a timerfd is a supervisor-side clock entry epoll_wait folds in
+#     with a pure _mono_ms compare. Per-child C_TIMERFD_TBL, lazy-alloc-once (mirrors _sigfd_tbl). ---
+
+# 24-byte supervisor scratch for the timerfd val pvm I/O (settime reads a 24 B itimerspec; read writes
+# an 8 B count), lazy-alloc-once — one call in flight, never a per-call alloc (same as _sig_buf).
+var _timer_buf = 0;
+fn _timer_buf_get(): i64 {
+    if (_timer_buf == 0) { _timer_buf = alloc(24); }
+    return _timer_buf;
+}
+
+# The caller's per-child timerfd slot table (lazy-alloc-once). Each 32 B slot is
+# {flags@0 (-1 = FREE), deadline_ms@8, interval_ms@16, armed@24}. _cur_rec is the current child.
+fn _timerfd_tbl(): i64 {
+    var t = load64(_cur_rec + C_TIMERFD_TBL);
+    if (t == 0) {
+        t = alloc(TIMERFD_SLOTS * TIMERFD_SLOT_SIZE);
+        var i = 0;
+        while (i < TIMERFD_SLOTS) {
+            store64(t + i * TIMERFD_SLOT_SIZE + 0, 0 - 1);     # flags = -1 -> FREE
+            store64(t + i * TIMERFD_SLOT_SIZE + 8, 0);         # deadline_ms
+            store64(t + i * TIMERFD_SLOT_SIZE + 16, 0);        # interval_ms
+            store64(t + i * TIMERFD_SLOT_SIZE + 24, 0);        # armed
+            i = i + 1;
+        }
+        store64(_cur_rec + C_TIMERFD_TBL, t);
+    }
+    return t;
+}
+
+# timerfd_create#22 (no args) -> TIMERFD_BASE+slot / -1. Allocate the first FREE slot, disarmed.
+fn _do_timerfd_create(pid, regs): i64 {
+    var tbl = _timerfd_tbl();
+    var i = 0;
+    var slot = 0 - 1;
+    while (i < TIMERFD_SLOTS) {
+        if (load64(tbl + i * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { slot = i; i = TIMERFD_SLOTS; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }               # table full
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 0, 0);                    # in use (not FREE)
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 8, 0);                    # deadline_ms
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 16, 0);                   # interval_ms
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);                   # armed = 0
+    return _net_emu(pid, regs, TIMERFD_BASE + slot);
+}
+
+# timerfd_settime#23(fd, flags, val_ptr) -> 0 / -1. The agnos val is {u64 interval_sec@0; _@8; u64
+# initial_sec@16} (24 B, SECONDS only). CLOCK_MONOTONIC (supervisor-chosen; agnos gives no clockid).
+# initial_sec==0 disarms; else the next deadline is now + initial_sec. `flags` is treated as RELATIVE
+# (TFD_TIMER_ABSTIME ignored — murky with seconds-only vals + no clockid; a documented limit, ADR 0015).
+fn _do_timerfd_settime(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var val_ptr = decode_arg(regs, 2);
+    if (fd < TIMERFD_BASE) { return _net_emu(pid, regs, 0 - 1); }
+    var slot = fd - TIMERFD_BASE;
+    if (slot >= TIMERFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _timerfd_tbl();
+    if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }  # not open
+    var tb = _timer_buf_get();
+    if (pvm_read(pid, val_ptr, tb, 24) != 24) { return _net_emu(pid, regs, 0 - 1); }
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 16, load64(tb + 0) * 1000);   # interval_ms = interval_sec*1000
+    var initial_sec = load64(tb + 16);
+    if (initial_sec == 0) {
+        store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);              # disarm
+    } else {
+        store64(tbl + slot * TIMERFD_SLOT_SIZE + 8, _mono_ms() + initial_sec * 1000);   # next deadline
+        store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 1);             # armed
+    }
+    return _net_emu(pid, regs, 0);
+}
+
+# read#5 on an emulated timerfd (TIMERFD_BASE <= fd < SIGFD_BASE): if armed AND the deadline has passed,
+# deliver the u64 expiration count (8 B) and re-arm (periodic) / disarm (one-shot). Not expired / disarmed
+# -> agnos -1 (NON-BLOCKING; the caller polls, yielding via pause#14 — matching the signalfd MVP). Delivers
+# the count BEFORE advancing the deadline (deliver-then-consume: a failed write never loses expirations).
+fn _timerfd_read(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    var slot = fd - TIMERFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (slot >= TIMERFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _timerfd_tbl();
+    if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }  # not open
+    if (len < 8) { return _net_emu(pid, regs, 0 - 1); }
+    if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 24) == 0) { return _net_emu(pid, regs, 0 - 1); }       # disarmed
+    var now = _mono_ms();
+    var deadline = load64(tbl + slot * TIMERFD_SLOT_SIZE + 8);
+    if (now < deadline) { return _net_emu(pid, regs, 0 - 1); }        # not expired yet
+    var interval = load64(tbl + slot * TIMERFD_SLOT_SIZE + 16);
+    var ticks = _timer_ticks(now, deadline, interval);
+    var tb = _timer_buf_get();
+    store64(tb, ticks);
+    if (pvm_write(pid, buf, tb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }   # deliver FIRST
+    if (interval <= 0) {
+        store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);             # one-shot -> disarm (THEN consume)
+    } else {
+        store64(tbl + slot * TIMERFD_SLOT_SIZE + 8, deadline + ticks * interval);   # periodic -> next deadline
+    }
+    return _net_emu(pid, regs, 8);
+}
+
+# close#6 on an emulated timerfd -> free the slot (returns 0). A real close(3) in the child would EBADF
+# (a timerfd id is not a real child fd), so the dispatcher diverts it here.
+fn _timerfd_close(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var slot = fd - TIMERFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (slot >= TIMERFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _timerfd_tbl();
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 0, 0 - 1);              # flags = -1 -> FREE
+    store64(tbl + slot * TIMERFD_SLOT_SIZE + 24, 0);                # disarm
+    return _net_emu(pid, regs, 0);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -986,6 +1104,11 @@ fn translate_dispatch(pid, regs): i64 {
 
     # signalfd#18 -> an opaque emulated signalfd (per-child slot table); read#5 on it delivers signals.
     if (nr == 18) { return _do_signalfd(pid, regs); }
+
+    # timerfd#22/#23 -> a supervisor-emulated deadline (per-child slot table); read#5 on the returned
+    # id delivers the expiration count. No real Linux timerfd fd (invisible to the emulated epoll).
+    if (nr == 22) { return _do_timerfd_create(pid, regs); }
+    if (nr == 23) { return _do_timerfd_settime(pid, regs); }
 
     # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
     #     path(s) into the child red zone (NUL-terminated) before executing. ---
@@ -1129,11 +1252,26 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 61) { return _net_config(pid, regs); }       # net_config -> packed ip / 0 / -1
     }
 
-    # read#5 on an emulated signalfd (fd >= SIGFD_BASE) -> deliver a pending signal; a NORMAL read
-    # (any real fd, which the rlimit caps far below SIGFD_BASE) falls straight through to the EXECUTE
-    # tail below (renumber to Linux read#0). One decode_arg + one compare on the read#5 path only.
+    # read#5 on an emulated fd (fd >= MIN_EMU_BASE) -> route by the descending tag ladder: a signalfd
+    # delivers a pending signal, a timerfd delivers its expiration count, an epoll / reserved-pipe id is
+    # not readable (-1). A NORMAL read (any real child fd, rlimit-capped far below MIN_EMU_BASE — incl. a
+    # real pipe read-end) falls straight through to the EXECUTE tail (renumber to Linux read#0). One
+    # decode_arg + one compare on the common (real-fd) read#5 path.
     if (nr == 5) {
-        if (decode_arg(regs, 0) >= SIGFD_BASE) { return _sigfd_read(pid, regs); }
+        var rfd = decode_arg(regs, 0);
+        if (rfd >= MIN_EMU_BASE) {
+            var rk = _emu_classify(rfd);
+            if (rk == KIND_SIGFD) { return _sigfd_read(pid, regs); }
+            if (rk == KIND_TIMERFD) { return _timerfd_read(pid, regs); }
+            return _net_emu(pid, regs, 0 - 1);           # epoll / reserved-pipe / (routed-away) sock id
+        }
+    }
+
+    # close#6 on an emulated timerfd -> free the slot (a real close would EBADF). signalfd close stays a
+    # real close (the v1.6.0 slot-leak limit); epoll close lands in BITE 4. Real child fds (incl. pipe
+    # ends, < MIN_EMU_BASE) fall through to the EXECUTE tail (renumber to Linux close#3).
+    if (nr == 6) {
+        if (_emu_classify(decode_arg(regs, 0)) == KIND_TIMERFD) { return _timerfd_close(pid, regs); }
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg

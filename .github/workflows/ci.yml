@@ -218,6 +218,14 @@ jobs:
         # intra-process round-trip + a create/close loop leaks no fds. Needs the same-uid ptrace req.
         run: bash scripts/it/pipe.sh
 
+      - name: Timerfd — timerfd#22/#23 (v1.7.0)
+        # v1.7.0 I/O-mux (BITE 3): agnos timerfd#22/#23 are supervisor-emulated as a stored deadline
+        # (no real Linux timerfd fd — invisible to the emulated epoll otherwise). timerfd_create hands
+        # out a TIMERFD_BASE+slot id; settime arms it (seconds, CLOCK_MONOTONIC); read#5 delivers the
+        # u64 expiration count once the deadline passes (non-blocking, poll-with-pause#14). Proves a
+        # one-shot fires ~1s + a periodic re-arms + close frees the slot. Needs the same-uid ptrace req.
+        run: bash scripts/it/timerfd.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
