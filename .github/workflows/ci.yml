@@ -233,6 +233,13 @@ jobs:
         # close#6 frees the instance. Proves create/ctl/close semantics (epoll_wait#21 is BITE 5). Same-uid.
         run: bash scripts/it/epoll.sh
 
+      - name: Epoll_wait — epoll_wait#21 keystone (v1.7.0)
+        # v1.7.0 I/O-mux (BITE 5): the heterogeneous bounded-yield readiness engine. One epoll set watches
+        # a timerfd (supervisor deadline) + a signalfd (supervisor mask) + a socket (ppoll the supervisor-
+        # held host fd) and wakes on whichever fires, returning the raw watched id + EPOLLIN. Never parks
+        # (single-threaded supervisor). The roadmap gate (epoll set + timerfd) + best-effort socket. Same-uid.
+        run: bash scripts/it/epoll_wait.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

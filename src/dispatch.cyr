@@ -298,6 +298,10 @@ enum MirshiNetSys {
     ICMP_HDR_LEN = 8;            # sizeof(struct icmphdr) — the minimum a ping socket will send
     ICMP_TIMEOUT_S = 3;          # bound the supervisor echo-reply wait to agnos's ~3s budget
     POLLIN = 1;                  # ppoll event: the echo reply is readable
+    POLLERR = 8;                 # v1.7.0 epoll_wait: a socket error also counts as "ready"
+    POLLHUP = 16;                # v1.7.0 epoll_wait: peer hangup also counts as "ready"
+    EPOLLIN = 1;                 # v1.7.0 epoll_wait: the event mask reported to the agnos program
+    EPOLL_YIELD_NS = 1000000;    # v1.7.0 epoll_wait bounded-yield quantum (1 ms, the pause#14 quantum)
 }
 
 # The conn_id/listener_id(0..7) slot table. Each 24-byte slot is {i64 fd; i64 kind; i64 parent}:
@@ -456,6 +460,17 @@ fn _net_fd_conn(cid): i64 {
     if (cid >= NET_SLOTS) { return 0 - 1; }
     var b = _net_tbl() + cid * NET_SLOT_SIZE;
     if (load64(b + 8) != SLOT_CONN) { return 0 - 1; }
+    return load64(b + 0);
+}
+
+# conn_id/listen_id -> host fd for POLLING (v1.7.0 epoll_wait). Unlike _net_fd_conn this ACCEPTS any LIVE
+# slot (CONN / LISTEN / UDP) — a listener is POLLIN-readable on an incoming connection, which is exactly
+# what a server epolls for. -1 if out of range or FREE (the stale-slot-reuse guard at wait time).
+fn _net_fd_pollable(cid): i64 {
+    if (cid < 0) { return 0 - 1; }
+    if (cid >= NET_SLOTS) { return 0 - 1; }
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) == SLOT_FREE) { return 0 - 1; }
     return load64(b + 0);
 }
 
@@ -1137,6 +1152,130 @@ fn _epoll_close(pid, regs): i64 {
     return _net_emu(pid, regs, 0);
 }
 
+# Supervisor scratch for epoll_wait: 8 pollfd (@0, 8x8) + 8 events (@64, 8x12) + a timespec (@160, 16).
+# Lazy-alloc-once (single call in flight; never a per-call alloc).
+var _epoll_scr = 0;
+fn _epoll_scratch(): i64 {
+    if (_epoll_scr == 0) { _epoll_scr = alloc(256); }
+    return _epoll_scr;
+}
+
+# READ-ONLY readiness probes for epoll_wait (they must NOT consume — the program read#5's after the wake).
+# A signalfd is ready iff it has a deliverable & watched signal; a timerfd iff armed and its deadline passed.
+fn _sigfd_ready(id): i64 {
+    var slot = id - SIGFD_BASE;
+    if (slot < 0) { return 0; }
+    if (slot >= SIGNALFD_SLOTS) { return 0; }
+    var tbl = _sigfd_tbl();
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return 0; }    # not open
+    var watched = load64(tbl + slot * SIGFD_SLOT_SIZE + 0);
+    if ((_sig_deliverable(load64(_cur_rec + C_PENDING_SIG), load64(_cur_rec + C_SIG_BLOCKED)) & watched) != 0) { return 1; }
+    return 0;
+}
+fn _timerfd_ready(id, now): i64 {
+    var slot = id - TIMERFD_BASE;
+    if (slot < 0) { return 0; }
+    if (slot >= TIMERFD_SLOTS) { return 0; }
+    var tbl = _timerfd_tbl();
+    if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { return 0; }  # not open
+    if (load64(tbl + slot * TIMERFD_SLOT_SIZE + 24) == 0) { return 0; }        # disarmed
+    if (now >= load64(tbl + slot * TIMERFD_SLOT_SIZE + 8)) { return 1; }
+    return 0;
+}
+
+# epoll_wait#21(epfd, events_ptr, max) -> nready (>=0) / -1. A HETEROGENEOUS BOUNDED-YIELD readiness pass
+# (the pause#14 model, NEVER a park — a readiness event has no wait4 wake source, so parking would wedge
+# the single-threaded supervisor). Per watched id: signalfd -> mask test; timerfd -> deadline test; socket
+# -> ppoll the supervisor-held host fd; nested-epoll / reserved-pipe / real child fd -> skipped (a real
+# child fd isn't supervisor-observable). Writes packed 12 B events {u32 mask=EPOLLIN@0; u64 data=raw id@4}.
+# 0 = nothing ready (valid; the caller re-polls, yielding). Socket resolution is BEST-EFFORT: strip bit30
+# -> conn_id (the guest's tagged-fd low bits); correct for sequential server flows, but the guest/mirshi
+# slot map can diverge under connect-failure churn (a coordinated agnos+shim fix lands later; ADR 0015).
+fn _do_epoll_wait(pid, regs): i64 {
+    var epfd = decode_arg(regs, 0);
+    var events_ptr = decode_arg(regs, 1);
+    var max = decode_arg(regs, 2);
+    if (epfd < EPOLL_BASE) { return _net_emu(pid, regs, 0 - 1); }
+    var eslot = epfd - EPOLL_BASE;
+    if (eslot >= EPOLL_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var eb = _epoll_tbl() + eslot * EPOLL_SLOT_SIZE;
+    if (load64(eb + 0) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }     # not an open epoll
+    var scr = _epoll_scratch();
+    var pfds = scr + 0;
+    var ev = scr + 64;
+    var ts = scr + 160;
+    var now = _mono_ms();
+    # pass A: build the socket pollfd array + note whether any signalfd/timerfd is ALREADY ready.
+    var npfd = 0;
+    var anyready = 0;
+    var k = 0;
+    while (k < 8) {
+        var w = load64(eb + 8 + k * 8);
+        if (w != (0 - 1)) {
+            var kind = _emu_classify(w);
+            if (kind == KIND_SIGFD) { if (_sigfd_ready(w) == 1) { anyready = 1; } }
+            if (kind == KIND_TIMERFD) { if (_timerfd_ready(w, now) == 1) { anyready = 1; } }
+            if (kind == KIND_SOCK) {
+                var hf = _net_fd_pollable(w & 7);
+                if (hf >= 0) {
+                    store32(pfds + npfd * 8 + 0, hf);       # pollfd.fd
+                    store16(pfds + npfd * 8 + 4, POLLIN);   # pollfd.events
+                    store16(pfds + npfd * 8 + 6, 0);        # pollfd.revents
+                    npfd = npfd + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    # bounded wait: ppoll the sockets (timeout 0 if something's already ready, else 1 quantum); no sockets
+    # and nothing ready -> one bounded nanosleep. NEVER unbounded (would wedge the single-threaded loop).
+    if (npfd > 0) {
+        store64(ts + 0, 0);
+        if (anyready == 1) { store64(ts + 8, 0); } else { store64(ts + 8, EPOLL_YIELD_NS); }
+        syscall(SYS_PPOLL, pfds, npfd, ts, 0, 0);
+    } else {
+        if (anyready == 0) {
+            store64(ts + 0, 0);
+            store64(ts + 8, EPOLL_YIELD_NS);
+            syscall(SYS_NANOSLEEP, ts, 0);
+        }
+    }
+    # pass B: emit ready events (fresh `now` — time passed during the wait). A socket's readiness comes
+    # from its pollfd revents; pcur walks the sockets in the SAME order pass A added them.
+    var now2 = _mono_ms();
+    var n = 0;
+    var pcur = 0;
+    var j = 0;
+    while (j < 8) {
+        var w2 = load64(eb + 8 + j * 8);
+        if (w2 != (0 - 1)) {
+            var kind2 = _emu_classify(w2);
+            var ready = 0;
+            if (kind2 == KIND_SIGFD) { if (_sigfd_ready(w2) == 1) { ready = 1; } }
+            if (kind2 == KIND_TIMERFD) { if (_timerfd_ready(w2, now2) == 1) { ready = 1; } }
+            if (kind2 == KIND_SOCK) {
+                var hf2 = _net_fd_pollable(w2 & 7);
+                if (hf2 >= 0) {
+                    if ((load16(pfds + pcur * 8 + 6) & (POLLIN | POLLERR | POLLHUP)) != 0) { ready = 1; }
+                    pcur = pcur + 1;
+                }
+            }
+            if (ready == 1) {
+                if (n < max) {
+                    store32(ev + n * 12 + 0, EPOLLIN);
+                    store64(ev + n * 12 + 4, w2);           # data = the RAW agnos watched id
+                    n = n + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+    if (n > 0) {
+        if (pvm_write(pid, events_ptr, ev, n * 12) != (n * 12)) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    return _net_emu(pid, regs, n);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -1207,6 +1346,9 @@ fn translate_dispatch(pid, regs): i64 {
     # (BITE 5) resolves them fresh. epoll_create#19 (no args) / epoll_ctl#20(epfd, op, fd).
     if (nr == 19) { return _do_epoll_create(pid, regs); }
     if (nr == 20) { return _do_epoll_ctl(pid, regs); }
+    # epoll_wait#21 -> the heterogeneous bounded-yield readiness pass (ppoll sockets + mask-test signalfds
+    # + clock-test timerfds, merge, write packed 12 B events). Never parks (single-threaded supervisor).
+    if (nr == 21) { return _do_epoll_wait(pid, regs); }
 
     # --- M2 filesystem: path-bearing calls stage their explicit-length agnos
     #     path(s) into the child red zone (NUL-terminated) before executing. ---
