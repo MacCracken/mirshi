@@ -31,7 +31,18 @@ fn main(): i64 {
     if (feq(buf + 32, "mirshi") == 0) { return 5; }        # release (marks the shim)
     if (feq(buf + 48, "x86_64") == 0) { return 6; }        # machine
     if (syscall(SYS_UNAME, buf, 32) != (0 - 1)) { return 7; }   # len < 64 -> hard -1 (no partial fill)
-    var ok = "UNAME-OK\n";
+    # --- sysinfo#35: 5×u64 LE at 0/8/16/24/32 = uptime_secs / totalram / freeram / procs / cpus. Live
+    # host values, so check plausible RANGES (not exact). ---
+    var si = alloc(40);
+    if (syscall(SYS_SYSINFO, si, 40) != 0) { return 10; }
+    if (load64(si +  0) < 0) { return 11; }                # uptime_secs >= 0
+    if (load64(si +  8) <= 0) { return 12; }               # totalram > 0
+    if (load64(si + 16) <= 0) { return 13; }               # freeram > 0
+    if (load64(si + 16) > load64(si + 8)) { return 14; }   # freeram <= totalram
+    if (load64(si + 24) < 1) { return 15; }                # procs >= 1 (at least this process)
+    if (load64(si + 32) < 1) { return 16; }                # cpus >= 1
+    if (syscall(SYS_SYSINFO, si, 24) != (0 - 1)) { return 17; }   # len < 40 -> hard -1
+    var ok = "INFO-OK\n";
     sys_write(1, ok, strlen(ok));
     return 0;
 }
@@ -41,12 +52,12 @@ EOF
 cyrius build --agnos "$sbox/un.cyr" "$sbox/un" >/dev/null 2>&1
 
 set +e; out="$(timeout 25 "$mirshi" "$sbox/un" 2>/dev/null)"; rc=$?; set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "UNAME-OK"; then
-    echo "OK: uname#34 -> agnos-native struct (sysname=AGNOS / nodename=agnos / release=mirshi / machine=x86_64) + len<64 -> -1"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "INFO-OK"; then
+    echo "OK: uname#34 (AGNOS/agnos/mirshi/x86_64 + len<64->-1) + sysinfo#35 (uptime/ram/procs/cpus plausible + len<40->-1)"
 else
-    echo "FAIL: uname rc=$rc out='$(printf '%s' "$out" | tr '\n' '|')' (3-6=field mismatch, 7=short-len not -1)" >&2
+    echo "FAIL: info rc=$rc out='$(printf '%s' "$out" | tr '\n' '|')' (3-7=uname, 12/13/14=ram, 15/16=procs/cpus, 17=short-len)" >&2
     fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then echo "info: FAILED" >&2; exit 1; fi
-echo "OK: info — uname#34 (v1.8.0 BITE 2)"
+echo "OK: info — uname#34 + sysinfo#35 (v1.8.0 BITE 2+3)"

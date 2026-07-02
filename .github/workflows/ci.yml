@@ -246,11 +246,11 @@ jobs:
         # identical). Proves getuid/geteuid=0 + a real two-OFD LOCK_EX contention/release. Same-uid ptrace.
         run: bash scripts/it/flock.sh
 
-      - name: Info — uname#34 (v1.8.0)
-        # v1.8.0 info-getters (BITE 2): agnos uname#34 is EMULATE — mirshi synthesizes the agnos-NATIVE
-        # 64-byte identity struct (4×16 NUL-padded: sysname=AGNOS / nodename=agnos / release=mirshi /
-        # machine=x86_64), NOT Linux utsname; a len < 64 is hard-rejected (-1, no partial fill). sysinfo#35
-        # is added in BITE 3. Same-uid ptrace requirement.
+      - name: Info — uname#34 + sysinfo#35 (v1.8.0)
+        # v1.8.0 info-getters (BITE 2+3): both EMULATE, agnos-NATIVE structs (NOT Linux utsname/sysinfo).
+        # uname#34 = 4×16 identity (sysname=AGNOS / nodename=agnos / release=mirshi / machine=x86_64).
+        # sysinfo#35 = 5×u64 (uptime/totalram/freeram from the host Linux sysinfo(99); procs = mirshi's
+        # agnos-process count; cpus = affinity popcount). Both hard-reject -1 if len < the struct size.
         run: bash scripts/it/info.sh
 
       - name: M3 docker smoke test

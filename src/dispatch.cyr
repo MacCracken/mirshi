@@ -27,6 +27,8 @@ enum MirshiXlatNr {
     SYS_CLOCK_GETTIME = 228;
     SYS_NANOSLEEP = 35;
     SLEEP_MS_CAP = 3600000;     # mirror agnos's 1 h sleep cap
+    SYS_SYSINFO = 99;           # v1.8.0 sysinfo#35: read the host's real uptime / total+free RAM
+    SYS_SCHED_GETAFFINITY = 204;# v1.8.0 sysinfo#35: the mirshi process's usable CPU mask -> cpu count
 }
 
 # 0.7.1 rootfs confinement (docs/audit/2026-06-30-audit.md class-c fix). When a
@@ -1321,6 +1323,59 @@ fn _do_uname(pid, regs): i64 {
     return _net_emu(pid, regs, 0);
 }
 
+# sysinfo#35(buf, len) -> 0 / -1. EMULATE: write the 40-byte agnos counters struct — 5×u64 LE at
+# 0/8/16/24/32 = uptime_secs / totalram / freeram / procs / cpus (agnos-NATIVE, NOT the ~112 B Linux
+# struct). Hard-reject -1 if len < 40 (the ABI: no partial fill). mirshi sources LIVE HOST values: uptime
+# + total/free RAM from the host Linux sysinfo(99) (RAM = value * mem_unit -> bytes, matching the agnos
+# kernel's pages*4096); procs = mirshi's tracked agnos-process count (`_child_count`, the faithful "agnos
+# procs"); cpus = the mirshi process's usable CPU count (popcount of sched_getaffinity). All supervisor-
+# side — no child-seccomp delta.
+fn _do_sysinfo(pid, regs): i64 {
+    if (decode_arg(regs, 1) < 40) { return _net_emu(pid, regs, 0 - 1); }
+    var s = _info_scratch();
+    # (1) host uptime + RAM via Linux sysinfo(99) into s+0 (a ~112 B struct: uptime@0, totalram@32,
+    # freeram@40, mem_unit@104 u32). mem_unit scales totalram/freeram to bytes (usually 1).
+    var i = 0;
+    while (i < 112) { store8(s + i, 0); i = i + 1; }
+    var uptime = 0;
+    var totalram = 0;
+    var freeram = 0;
+    if (syscall(SYS_SYSINFO, s) == 0) {
+        var mu = load32(s + 104) & 0xFFFFFFFF;
+        if (mu == 0) { mu = 1; }
+        uptime = load64(s + 0);
+        totalram = load64(s + 32) * mu;
+        freeram = load64(s + 40) * mu;
+    }
+    # (2) cpu count = popcount of the process's affinity mask (raw sched_getaffinity returns the mask
+    # byte count). Reuses s+0 (the sysinfo values are already extracted into locals above).
+    var cpus = 0;
+    var nb = syscall(SYS_SCHED_GETAFFINITY, 0, 128, s);
+    if (nb > 0) {
+        if (nb > 128) { nb = 128; }
+        var bi = 0;
+        while (bi < nb) {
+            var b = load8(s + bi) & 0xFF;
+            var k = 0;
+            while (k < 8) {
+                if (((b >> k) & 1) != 0) { cpus = cpus + 1; }
+                k = k + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+    if (cpus < 1) { cpus = 1; }                          # fallback (never report 0 CPUs)
+    # (3) build the agnos 40-byte struct at s+128 (the sysinfo read + mask at s+0 are consumed).
+    var o = s + 128;
+    store64(o +  0, uptime);                             # uptime seconds
+    store64(o +  8, totalram);                           # total RAM bytes
+    store64(o + 16, freeram);                            # free RAM bytes
+    store64(o + 24, _child_count());                     # agnos procs mirshi supervises
+    store64(o + 32, cpus);                               # usable CPUs
+    if (pvm_write(pid, decode_arg(regs, 0), o, 40) != 40) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -1348,8 +1403,9 @@ fn translate_dispatch(pid, regs): i64 {
     # always root"); return 0, NOT the host's real uid (which an execute-in-child getuid#102 would leak).
     if (nr == 15) { return _net_emu(pid, regs, 0); }
 
-    # uname#34 -> the agnos-native 64-byte identity struct (EMULATE, synthesized). sysinfo#35 lands next.
+    # uname#34 / sysinfo#35 -> the agnos-native info structs (EMULATE, synthesized from live host values).
     if (nr == 34) { return _do_uname(pid, regs); }
+    if (nr == 35) { return _do_sysinfo(pid, regs); }
 
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert
