@@ -1276,6 +1276,51 @@ fn _do_epoll_wait(pid, regs): i64 {
     return _net_emu(pid, regs, n);
 }
 
+# --- v1.8.0 info getters. uname#34 is EMULATE — mirshi synthesizes the agnos-NATIVE identity struct
+#     (NOT Linux utsname). Both uname/sysinfo hard-reject -1 if the caller's len is below the struct size
+#     (no partial fill — the agnos ABI; see ../agnos/docs/development/agnos-userland-abi.md §4.3/§4.4 and
+#     the kernel writers in ../agnos/kernel/core/syscall.cyr syscalls 34/35). ---
+
+# Copy a NUL-terminated string into a fixed 16-byte NUL-padded field at dst (the uname slot format).
+fn _put_field16(dst, src): i64 {
+    var i = 0;
+    var go = 1;
+    while (i < 16) {
+        var c = 0;
+        if (go == 1) {
+            c = load8(src + i);
+            if (c == 0) { go = 0; c = 0; }
+        }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Supervisor scratch for the v1.8.0 info structs (uname 64 B / sysinfo 40 B / a Linux sysinfo read),
+# lazy-alloc-once — one call in flight, never a per-call alloc.
+var _info_buf = 0;
+fn _info_scratch(): i64 {
+    if (_info_buf == 0) { _info_buf = alloc(256); }
+    return _info_buf;
+}
+
+# uname#34(buf, len) -> 0 / -1. EMULATE: write the 64-byte agnos identity struct — four 16-byte NUL-padded
+# fields at 0/16/32/48 = sysname / nodename / release / machine (agnos-NATIVE, NOT Linux utsname). Hard-
+# reject -1 if len < 64 (the ABI: no partial fill). sysname/machine are the fixed AGNOS identity (match the
+# kernel); nodename="agnos" (the kernel default — no sethostname yet); release="mirshi" marks the shim (the
+# real agnos kernel writes _AGNOS_VERSION — a documented value assumption, ADR 0016).
+fn _do_uname(pid, regs): i64 {
+    if (decode_arg(regs, 1) < 64) { return _net_emu(pid, regs, 0 - 1); }
+    var s = _info_scratch();
+    _put_field16(s +  0, "AGNOS");     # sysname
+    _put_field16(s + 16, "agnos");     # nodename
+    _put_field16(s + 32, "mirshi");    # release
+    _put_field16(s + 48, "x86_64");    # machine
+    if (pvm_write(pid, decode_arg(regs, 0), s, 64) != 64) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
@@ -1302,6 +1347,9 @@ fn translate_dispatch(pid, regs): i64 {
     # getuid#15 (also geteuid) -> 0 (EMULATE). The agnos environment is always root (spec: "getuid() -> 0,
     # always root"); return 0, NOT the host's real uid (which an execute-in-child getuid#102 would leak).
     if (nr == 15) { return _net_emu(pid, regs, 0); }
+
+    # uname#34 -> the agnos-native 64-byte identity struct (EMULATE, synthesized). sysinfo#35 lands next.
+    if (nr == 34) { return _do_uname(pid, regs); }
 
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert

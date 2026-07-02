@@ -167,7 +167,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(24), 0 - 1, "umount#24 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(25), 0 - 1, "pipe#25 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(26), 0 - 1, "write_boot_checkpoint#26 -> ENOSYS");
-    assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> no peer (v1.8.0: EMULATE, agnos-native struct)");
     assert_eq(agnos_to_linux_nr(35), 0 - 1, "sysinfo#35 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(36), 0 - 1, "undefined#36 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(37), 0 - 1, "undefined#37 -> ENOSYS (ABI gap)");

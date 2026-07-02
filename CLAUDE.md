@@ -71,6 +71,8 @@ cyrius test                          # run [build].test + tests/*.tcyr
 - [`docs/development/state.md`](docs/development/state.md) — Live state snapshot
 - [`docs/development/roadmap.md`](docs/development/roadmap.md) — Milestones through v1.0
 
+> **⚑ Transitional pointer — the agnos-side ABI mirshi translates to/from (safe to delete once vendored into `docs/reference/`).** The canonical agnos struct layouts + syscall struct-writes live in the **sibling `agnos` repo**, NOT here — that's why they're easy to miss: [`../agnos/docs/development/agnos-userland-abi.md`](../agnos/docs/development/agnos-userland-abi.md). Sections: §4.1 `stat` · §4.2 `getdents` · **§4.3 `uname` (syscall 34)** · **§4.4 `sysinfo` (syscall 35)** · §4.5 `klug`/dmesg · §4.6 exec argv/envp init stack. These are **agnos-NATIVE, not Linux** — e.g. `uname` = 4 × 16-byte NUL-padded slots at 0/16/32/48 (`sysname`/`nodename`/`release`/`machine`), *not* `utsname`; `sysinfo` = 5 × u64 LE at 0/8/16/24/32 (`uptime_secs`/`totalram`/`freeram`/`procs`/`cpus`), *not* the ~112-byte Linux struct with `mem_unit`/`loads[]`/swap. Both take `(buf,len)` in arg1/arg2 (arg3 unused) and **hard-reject `-1` if `len` < the struct size — no partial fill.** The doc tracks the kernel but **the code is truth**: verify against the writers in [`../agnos/kernel/core/syscall.cyr`](../agnos/kernel/core/syscall.cyr) (syscalls 34/35). Once mirshi's own `docs/reference/` mirrors these layouts, delete this note.
+
 ## Process
 
 1. **Work phase** — features, roadmap items, bug fixes

@@ -246,6 +246,13 @@ jobs:
         # identical). Proves getuid/geteuid=0 + a real two-OFD LOCK_EX contention/release. Same-uid ptrace.
         run: bash scripts/it/flock.sh
 
+      - name: Info — uname#34 (v1.8.0)
+        # v1.8.0 info-getters (BITE 2): agnos uname#34 is EMULATE — mirshi synthesizes the agnos-NATIVE
+        # 64-byte identity struct (4×16 NUL-padded: sysname=AGNOS / nodename=agnos / release=mirshi /
+        # machine=x86_64), NOT Linux utsname; a len < 64 is hard-rejected (-1, no partial fill). sysinfo#35
+        # is added in BITE 3. Same-uid ptrace requirement.
+        run: bash scripts/it/info.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
