@@ -129,7 +129,22 @@ fn main(): i64 {
     }
 
     var target = argv(i);
-    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any);
+
+    # Forward the child's argv: [argv(i) (=program), argv(i+1)…argv(n-1), NULL].
+    # v1.10.0 — before this the root child ran with argv = [path, NULL] and every
+    # argument past the ELF was dropped (an arg-taking tool like kii/descent saw none).
+    # Built on the supervisor heap PRE-fork so the child inherits it (like net_entries);
+    # the pointers are into the init stack, valid for the process lifetime.
+    var nfwd = n - i;                            # program path + trailing args
+    var child_argv = alloc((nfwd + 1) * 8);      # +1 for the NULL terminator; 8 bytes / pointer
+    var k = 0;
+    while (k < nfwd) {
+        store64(child_argv + k * 8, argv(i + k));
+        k = k + 1;
+    }
+    store64(child_argv + nfwd * 8, 0);           # NULL-terminate the argv vector
+
+    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any, child_argv);
 }
 
 var r = main();

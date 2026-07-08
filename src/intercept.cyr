@@ -203,14 +203,14 @@ fn _child_setup(bound, rootpath): i64 {
 
 # The root child: run the gauntlet, then load the agnos ELF from `path` via execve (returns only on
 # failure).
-fn _child_exec(path, bound, rootpath): i64 {
+fn _child_exec(path, bound, rootpath, child_argv): i64 {
     _child_setup(bound, rootpath);          # never returns on a setup failure
-    var argv[24];                           # 3 slots: [path, NULL, spare] — bytes, not entries
-    store64(&argv, path);
-    store64(&argv + 8, 0);
+    # child_argv (v1.10.0): the NULL-terminated [path, args…] vector built by main() on the
+    # supervisor heap pre-fork (inherited across the fork). Before this the child ran with a
+    # hard-coded [path, NULL] and lost every argument past the ELF.
     var envp[8];
     store64(&envp, 0);
-    sys_execve(path, &argv, &envp);
+    sys_execve(path, child_argv, &envp);
     syscall(SYS_EXIT, EXECVE_FAILED);
     return EXECVE_FAILED;
 }
@@ -331,6 +331,70 @@ fn _do_waitpid(pid, regs, rec): i64 {
     pt(PTRACE_SETREGS, pid, 0, regs);
     store64(rec + C_STATE, CS_BLOCKED);
     store64(rec + C_WAIT_TARGET, target);
+    return STRAT_EMULATE;
+}
+
+# execwait#37 staging: the NUL-split command line + the NULL-terminated argv pointer vector into it.
+# Lazy-alloc-once (ADR 0008 — never per-call, or a looping execwait grows the bump heap unbounded, like
+# _spawn_elf_buffer). agnos caps the cmdline at 127 bytes (syscall.cyr #37: arg2 > 127 -> -1), so 129 =
+# 127 + NUL + slack; 65*8 = 64 tokens + the NULL terminator. Both inherited across the spawn fork.
+var _ew_cl = 0;
+var _ew_argv = 0;
+fn _ew_cl_buf(): i64 { if (_ew_cl == 0) { _ew_cl = alloc(129); } return _ew_cl; }
+fn _ew_argv_buf(): i64 { if (_ew_argv == 0) { _ew_argv = alloc(65 * 8); } return _ew_argv; }
+
+# execwait#37(cmdline_addr, cmdline_len) -> child exit code / -1. agnos's ring-3 BLOCKING-exec: load a
+# static ELF from a PATH and RUN IT TO COMPLETION, returning its exit code (agnsh's `run /bin/x`). In
+# mirshi this is spawn-from-PATH + park-on-that-pid — the fusion of _do_spawn (fork a traced grandchild)
+# and _do_waitpid (leave the caller stopped until the child exits). Unlike spawn#3 (in-memory ELF ->
+# memfd), execwait's ELF is a real FILE, so the grandchild execve's the path directly via _child_exec
+# (the exact path the top-level program takes — _child_setup re-establishes ROOTFD + the bound). The
+# cmdline is "PATH arg1 arg2 .." (agnos tokenizes on spaces, argv[0]=path); we stage it NUL-split + build
+# the argv vector on the supervisor heap (inherited across the fork). SUPERVISOR-CONTROL op — dispatched
+# at the loop level (enr==37) like spawn#3/waitpid#4. Fail-closed to agnos -1. `rec` = the CALLER's record.
+fn _do_execwait(pid, regs, rec): i64 {
+    if (_child_count() >= MAX_CHILDREN) { return _net_emu(pid, regs, 0 - 1); }
+    var cl_addr = decode_arg(regs, 0);
+    var cl_len = decode_arg(regs, 1);
+    if (cl_len < 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (cl_len > 127) { return _net_emu(pid, regs, 0 - 1); }        # agnos caps the cmdline at 127
+    # Stage the command line into the supervisor heap (inherited across the fork), NUL-terminate it.
+    var cl = _ew_cl_buf();
+    if (_spawn_read_elf(pid, cl_addr, cl_len, cl) < 0) { return _net_emu(pid, regs, 0 - 1); }
+    store8(cl + cl_len, 0);
+    # Tokenize on spaces IN PLACE (space -> NUL), building the NULL-terminated argv vector: [path, args…].
+    var av = _ew_argv_buf();
+    var nfwd = 0;
+    var i = 0;
+    while (i < cl_len) {
+        while (i < cl_len) { if (load8(cl + i) != 32) { break; } i = i + 1; }   # skip leading spaces
+        if (i >= cl_len) { break; }
+        if (nfwd >= 64) { break; }                                             # token cap
+        store64(av + nfwd * 8, cl + i);                                        # token start
+        nfwd = nfwd + 1;
+        while (i < cl_len) { if (load8(cl + i) == 32) { break; } i = i + 1; }   # to the next space
+        if (i < cl_len) { store8(cl + i, 0); i = i + 1; }                       # terminate the token
+    }
+    store64(av + nfwd * 8, 0);                                                  # NULL-terminate argv
+    if (nfwd < 1) { return _net_emu(pid, regs, 0 - 1); }                        # empty / all-spaces
+    var path = load64(av + 0);                                                  # argv[0] = the ELF path token
+    # Fork a traced grandchild that execve's the path with the argv (never returns on success).
+    var cpid = sys_fork();
+    if (cpid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (cpid == 0) {
+        _child_exec(path, _spawn_bound, _spawn_rootpath, av);
+        syscall(SYS_EXIT, EXECVE_FAILED);
+        return EXECVE_FAILED;
+    }
+    # Register the grandchild (CALLER = parent, needs_attach — the demux loop attaches on its first stop),
+    # then PARK the caller on the coined pid until it exits — exactly _do_waitpid's park. _wake_waiters
+    # injects the child's exit code into rax at the caller's resume, so execwait returns that code.
+    var crec = _child_alloc(cpid, load64(rec + C_AGNOS_PID));
+    store64(crec + C_NEEDS_ATTACH, 1);
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    store64(rec + C_STATE, CS_BLOCKED);
+    store64(rec + C_WAIT_TARGET, load64(crec + C_AGNOS_PID));
     return STRAT_EMULATE;
 }
 
@@ -603,14 +667,16 @@ fn _trace_run(root_pid): i64 {
                         pt(PTRACE_GETREGS, wpid, 0, regs);
                         var enr = decode_nr(regs);
                         store64(rec + C_AGNOS_NR, enr);
-                        # spawn#3 + waitpid#4 are SUPERVISOR-CONTROL ops (fork a new tracee / park the
-                        # caller), handled here at the loop level not in translate_dispatch — they need
-                        # loop cooperation (a new tracee to attach; the caller left stopped). Everything
-                        # else -> normal per-syscall translation.
+                        # spawn#3 + waitpid#4 + execwait#37 are SUPERVISOR-CONTROL ops (fork a new tracee
+                        # / park the caller), handled here at the loop level not in translate_dispatch —
+                        # they need loop cooperation (a new tracee to attach; the caller left stopped).
+                        # execwait#37 = spawn-from-path + park (run-to-completion). Everything else ->
+                        # normal per-syscall translation.
                         var verdict = 0;
                         var handled = 0;
                         if (enr == 3) { verdict = _do_spawn(wpid, regs, rec); handled = 1; }
                         if (enr == 4) { verdict = _do_waitpid(wpid, regs, rec); handled = 1; }
+                        if (enr == 37) { verdict = _do_execwait(wpid, regs, rec); handled = 1; }
                         if (enr == 14) { verdict = _do_pause(wpid, regs, rec); handled = 1; }
                         if (enr == 16) { verdict = _do_kill(wpid, regs, rec); handled = 1; }
                         if (handled == 0) { verdict = translate_dispatch(wpid, regs); }
@@ -682,7 +748,7 @@ fn _trace_run(root_pid): i64 {
 }
 
 # Public entry: fork the agnos child, trace it to completion, return its code.
-fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any): i64 {
+fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any, child_argv): i64 {
     # Confinement (and the child rootfd setup) applies only in RUN mode — selftest
     # (SYSEMU) executes nothing, so the child's paths never reach the kernel.
     var rp = rootpath;
@@ -714,7 +780,7 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
         return 1;
     }
     if (pid == 0) {
-        _child_exec(path, b, rp);   # never returns on success
+        _child_exec(path, b, rp, child_argv);   # never returns on success
         return EXECVE_FAILED;
     }
     if (selftest == 1) { return _trace_log(pid); }

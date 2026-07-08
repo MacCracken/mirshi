@@ -5,6 +5,18 @@
 
 ## Version
 
+**1.10.0** — 2026-07-02. **argv forwarding — the root child gets its command line.** Before this the target
+agnos ELF ran with a hard-coded `argv = [path, NULL]` and every argument past the ELF path was **silently
+dropped** — any arg-taking tool (kii `<image>`, descent `serve <port>`, kriya/dig/cmdrs…) saw none; iam
+(arg-free) was the sole tool unaffected. `main()` now collects the trailing command line (`argv(i)…argv(n-1)`,
+`i` = the target after mirshi's own flags) into a NULL-terminated vector built on the supervisor heap
+**pre-fork** (inherited across the fork like the net allow-list), threaded `intercept_run` → `_child_exec` →
+`sys_execve` in place of the fixed `[path, NULL]`. spawn#3 grandchildren stay `[NULL]` (agnos `spawn` passes
+no argv; `_child_exec_memfd` untouched); envp stays `[NULL]` (no consumer yet). Verified: `kii <image.png>`
+renders an 8 KB ANSI halfblock frame under mirshi (positional forwarded) + `--version`/`--width` (flags
+forwarded); the m1_run + m2_fs exec-path gates stay green (295/0 unit unchanged). **Surfaced by the agnosticos
+`mirshi-fanout` vehicle** running the ecosystem's real userland tools — the first consumer past the toy set.
+Pin → `6.3.27` (unchanged — sync deferred to the tag). VERSION file bump + tag are the user's step.
 **1.9.0** — 2026-07-01. **tty sizing — direction 1 is feature-complete** ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)).
 agnos `winsize#60` now runs — the **entire direction-1 graphics surface** (there is no `fbinfo`/`blit` in the
 agnos ABI). EMULATE, a pure supervisor return (no child buffer, like `uptime_ms#40`): mirshi reads the
@@ -127,7 +139,9 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 `mirshi <agnos-elf>` runs (translates+executes); `--selftest-trace` is the M0
 trap-log mode.
 
-- `src/main.cyr` — supervisor entry: argv dispatch. `mirshi [--selftest-trace] <agnos-elf>`.
+- `src/main.cyr` — supervisor entry: argv dispatch. `mirshi [--selftest-trace] <agnos-elf> [args…]`.
+  v1.10.0: after consuming mirshi's own leading flags, forwards the child's trailing command line
+  (`argv(i)…argv(n-1)`) as a NULL-terminated heap vector into `intercept_run` → `_child_exec` → `execve`.
 - `src/intercept.cyr` — the impure core: `fork`/`PTRACE_TRACEME`/`execve`, `_attach`,
   and the two loops — `_trace_log` (M0 `PTRACE_SYSEMU`, trap+log) and `_trace_run`
   (M1 `PTRACE_SYSCALL` enter/exit, translate+execute). Defines the ptrace ABI the

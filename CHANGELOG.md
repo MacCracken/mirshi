@@ -4,6 +4,58 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**exec band — `execwait#37` (agnsh's `run`).** agnos grew a ring-3 blocking-exec primitive past mirshi's
+frozen 0–61 surface: `execwait#37` loads a static ELF from a **path** and runs it **to completion**,
+returning its exit code — the syscall agnsh binds for `run /bin/x`. It sat in mirshi's `#36–39` gap and
+returned ENOSYS, so agnsh couldn't launch programs in a container. This closes it, re-syncing mirshi to
+the current agnos userland ABI.
+
+### Added
+- **`execwait#37` — EMULATE at the loop level** (`_do_execwait`, `src/intercept.cyr`). The fusion of the
+  existing `spawn#3` fork machinery and `waitpid#4` parking: fork a traced grandchild that execve's the
+  path token via `_child_exec` (the same path the root child takes — no memfd, since execwait's ELF is a
+  real file), register it (caller = parent), then **park the caller** on the coined agnos pid until it
+  exits; `_wake_waiters` injects the child's exit code as execwait's return. The cmdline `"PATH args.."`
+  is staged NUL-split on the supervisor heap (inherited across the fork) and space-tokenized into the
+  argv vector, argv[0]=path. Storm-bounded by `MAX_CHILDREN`; cmdline capped at 127 (matches agnos).
+  Dispatched at the demux loop (`enr == 37`) alongside `spawn#3`/`waitpid#4`/`pause#14`/`kill#16`.
+- **Behavioral smoke** `docker/tools/ewtest.cyr`: raw `syscall(37,"./hello",…)` runs the agnos `hello`
+  ELF to completion under mirshi and confirms control returns with exit code 0. Verified end-to-end
+  (`mirshi ./ewtest` → hello's output prints between ewtest's markers).
+- Freeze contract + `docs/reference/syscall-coverage.md` updated: `#37` row moved from the undefined
+  `#36–39` gap to **execwait / EMULATE**; the loop-level freeze assertion re-messaged. Full suite green
+  (295 passed, 0 failed).
+
+_Next in the exec-band re-sync: `spawn_path#43` (the stdlib `exec_*` path — `_agnos_spawn_path` +
+`waitpid`), `exec_redirect#62` (agnsh `>` / pipes), `symlink#63`._
+
+## [1.10.0] — 2026-07-02
+
+**argv forwarding — the root child gets its command line.** Before this, mirshi ran the target agnos ELF
+with a hard-coded `argv = [path, NULL]` — **every argument past the ELF path was silently dropped**. Any
+arg-taking tool (kii `<image>`, descent `serve <port>`, kriya subcommands, dig, cmdrs…) saw no arguments
+and fell back to its usage/error path; iam was the only tool unaffected (it takes none). Surfaced by the
+agnosticos **mirshi-fanout** vehicle running the ecosystem's real userland tools.
+
+### Fixed
+- **Root-child argv is now forwarded.** `main()` collects the trailing command line (`argv(i)…argv(n-1)`,
+  where `i` is the target after mirshi's own flags) into a NULL-terminated vector built on the supervisor
+  heap **pre-fork** (inherited across the fork like the net allow-list), and `intercept_run` →
+  `_child_exec` hands it straight to `sys_execve` — replacing the hard-coded `[path, NULL]`. Verified end
+  to end: `kii <image.png>` renders an 8 KB ANSI halfblock frame under mirshi (positional path forwarded);
+  `kii --version` / `--width <n>` (flags forwarded). Backward-compatible — an arg-free tool (iam) still
+  gets `[path, NULL]`.
+
+### Unchanged (by design)
+- **spawn#3 grandchildren stay `argv = [NULL]`** — agnos `spawn#3` passes no argv/envp; `_child_exec_memfd`
+  is untouched. Only the root child (`_child_exec`) takes a command line.
+- **envp stays `[NULL]`** — agnos userland reads no environment yet; revisit per a real consumer.
+
+### Tests
+- 295/0 unit assertions unchanged; the two exec-path integration gates (`scripts/it/m1_run.sh`,
+  `scripts/it/m2_fs.sh`) stay green (their tools hardcode paths — arg-free — so they exercise the
+  `[path, NULL]` case and confirm no regression).
+
 ## [1.9.0] — 2026-07-01
 
 **tty sizing — direction 1 is feature-complete.** agnos `winsize#60` now runs: an agnos TUI sizes to the

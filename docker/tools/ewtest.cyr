@@ -1,0 +1,24 @@
+# ewtest.cyr — behavioral smoke for mirshi execwait#37.
+# Raw syscall(37, "./hello", len) runs the agnos ./hello ELF to completion under
+# mirshi, then reports that control returned with the child's exit code. Proving
+# execwait#37 = spawn-from-path + park-to-completion works end-to-end.
+#   cyrius build --agnos docker/tools/ewtest.cyr <stage>/ewtest
+#   (cd <stage> && mirshi ./ewtest)   # ./hello must be staged alongside
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var a = "ewtest: calling execwait#37 -> ./hello\n";
+    sys_write(1, a, strlen(a));
+    var cmd = "./hello";
+    var rc = syscall(37, cmd, strlen(cmd));     # agnos execwait(path=a1, pathlen=a2)
+    var b = "ewtest: execwait returned; control back in ewtest\n";
+    sys_write(1, b, strlen(b));
+    if (rc == 0) {
+        var ok = "ewtest: PASS (child exit code 0)\n";
+        sys_write(1, ok, strlen(ok));
+    }
+    return rc;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
