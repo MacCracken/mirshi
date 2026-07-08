@@ -91,8 +91,10 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta |
 | 60 | winsize | EMULATE ⁷ | — | tty sizing (v1.9.0): `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default if no tty); the whole direction-1 graphics surface |
 | 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
+| 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
+| 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
 
-Any number > 61 (and the undefined gaps) → **ENOSYS**.
+**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x). Any number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
 ¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) the
 filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLVE_IN_ROOT`),
@@ -206,7 +208,7 @@ extensions, as were the **info-getters + advisory-locks band** (`getuid#15`/`una
 v1.8.0 — footnote ⁶) and **tty sizing** (`winsize#60`, v1.9.0 — footnote ⁷). **Direction 1 is now
 feature-complete**: every *defined, non-kernel-only* agnos syscall is handled. The only remaining ENOSYS rows
 are the agnos-**kernel**-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26` — permanent by
-design) and the undefined ABI gaps (#36, #38–39, #42, #44 — the exec-band #37 execwait + #43 spawn_path are now handled). What remains on the [roadmap](../development/roadmap.md) is
+design) and the undefined ABI gaps (#36, #38–39, #42, #44). The exec-band re-sync landed **#37 execwait + #43 spawn_path + #62 exec_redirect + #63 symlink**. What remains on the [roadmap](../development/roadmap.md) is
 the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 
 ## Known gaps (carried forward, documented not fixed)

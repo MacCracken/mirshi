@@ -343,6 +343,13 @@ var _ew_argv = 0;
 fn _ew_cl_buf(): i64 { if (_ew_cl == 0) { _ew_cl = alloc(129); } return _ew_cl; }
 fn _ew_argv_buf(): i64 { if (_ew_argv == 0) { _ew_argv = alloc(65 * 8); } return _ew_argv; }
 
+# exec_redirect#62 one-shot arm state: the next _spawn_from_path steals the caller's dst_fd (pidfd_getfd)
+# and dup3's it onto src_fd in the grandchild, then clears armed. Global — mirshi is single-threaded + the
+# arm->exec is one agnsh, sequential.
+var _redir_armed = 0;
+var _redir_src = 0;
+var _redir_dst = 0;
+
 # _spawn_from_path(pid, regs, rec) -> new child record / 0. The shared core of the from-PATH exec band:
 # read the cmdline "PATH arg1 arg2 .." (a1=ptr, a2=len) from the child, stage it NUL-split on the
 # supervisor heap (inherited across the fork) + build the NULL-terminated argv vector [path, args…]
@@ -377,13 +384,33 @@ fn _spawn_from_path(pid, regs, rec): i64 {
     store64(av + nfwd * 8, 0);                                                  # NULL-terminate argv
     if (nfwd < 1) { return 0; }                                                 # empty / all-spaces
     var path = load64(av + 0);                                                  # argv[0] = the ELF path token
+    # exec_redirect#62 (one-shot): if armed, STEAL the caller's dst_fd via pidfd_getfd (works for files AND
+    # pipes, unlike /proc) BEFORE the fork, so the grandchild inherits it + dup3's it onto src_fd. mirshi's
+    # child is a separate process from agnsh, so agnsh's own fds are untouched — no restore needed.
+    var stolen = 0 - 1;
+    if (_redir_armed == 1) {
+        var pfd = syscall(SYS_PIDFD_OPEN, pid, 0);          # pid = the exec caller (agnsh)
+        if (pfd >= 0) {
+            stolen = syscall(SYS_PIDFD_GETFD, pfd, _redir_dst, 0);
+            syscall(HOST_CLOSE, pfd);
+        }
+    }
     var cpid = sys_fork();
-    if (cpid < 0) { return 0; }
+    if (cpid < 0) {
+        if (stolen >= 0) { syscall(HOST_CLOSE, stolen); }
+        _redir_armed = 0;
+        return 0;
+    }
     if (cpid == 0) {
+        # grandchild: apply the redirect (dup the stolen fd onto src_fd) BEFORE seccomp/execve.
+        if (stolen >= 0) { syscall(HOST_DUP3, stolen, _redir_src, 0); syscall(HOST_CLOSE, stolen); }
         _child_exec(path, _spawn_bound, _spawn_rootpath, av);
         syscall(SYS_EXIT, EXECVE_FAILED);
         return EXECVE_FAILED;
     }
+    # supervisor: drop our copy of the stolen fd (the grandchild has its own); clear the one-shot arm.
+    if (stolen >= 0) { syscall(HOST_CLOSE, stolen); }
+    _redir_armed = 0;
     var crec = _child_alloc(cpid, load64(rec + C_AGNOS_PID));
     store64(crec + C_NEEDS_ATTACH, 1);
     return crec;
@@ -412,6 +439,17 @@ fn _do_spawn_path(pid, regs, rec): i64 {
     var crec = _spawn_from_path(pid, regs, rec);
     if (crec == 0) { return _net_emu(pid, regs, 0 - 1); }
     return _net_emu(pid, regs, load64(crec + C_AGNOS_PID));
+}
+
+# exec_redirect#62(src_fd, dst_fd) -> 0. agnos's one-shot fd-redirect ARM: the NEXT from-path exec
+# (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd (an open
+# file or a pipe end). Here it just records the arm; _spawn_from_path consumes it — steals dst_fd from the
+# caller (pidfd_getfd) + dup3's it onto src_fd in the grandchild. EMULATE, returns 0. Loop-level (enr==62).
+fn _do_exec_redirect(pid, regs): i64 {
+    _redir_src = decode_arg(regs, 0);
+    _redir_dst = decode_arg(regs, 1);
+    _redir_armed = 1;
+    return _net_emu(pid, regs, 0);
 }
 
 # When agnos pid `target` exits, release any waiters parked in waitpid#4 on it: for EACH BLOCKED
@@ -694,6 +732,7 @@ fn _trace_run(root_pid): i64 {
                         if (enr == 4) { verdict = _do_waitpid(wpid, regs, rec); handled = 1; }
                         if (enr == 37) { verdict = _do_execwait(wpid, regs, rec); handled = 1; }
                         if (enr == 43) { verdict = _do_spawn_path(wpid, regs, rec); handled = 1; }
+                        if (enr == 62) { verdict = _do_exec_redirect(wpid, regs); handled = 1; }
                         if (enr == 14) { verdict = _do_pause(wpid, regs, rec); handled = 1; }
                         if (enr == 16) { verdict = _do_kill(wpid, regs, rec); handled = 1; }
                         if (handled == 0) { verdict = translate_dispatch(wpid, regs); }

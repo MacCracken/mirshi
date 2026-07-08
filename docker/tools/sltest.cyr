@@ -1,0 +1,23 @@
+# sltest.cyr — behavioral smoke for mirshi symlink#63.
+# Raw syscall(63, target, targetlen, linkpath, linkpathlen) creates a symlink under
+# mirshi (EXECUTE-in-child -> Linux symlink(88)); the target is a literal string.
+#   cyrius build --agnos docker/tools/sltest.cyr <stage>/sltest
+#   (cd <stage> && mirshi ./sltest && ls -l slink)
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var tgt = "hello";           # symlink target (a literal string, not resolved)
+    var lnk = "./slink";         # the link path to create
+    var rc = syscall(63, tgt, strlen(tgt), lnk, strlen(lnk));
+    if (rc == 0) {
+        var ok = "sltest: symlink#63 PASS (./slink -> hello)\n";
+        sys_write(1, ok, strlen(ok));
+    } else {
+        var e = "sltest: symlink#63 FAILED\n";
+        sys_write(1, e, strlen(e));
+    }
+    return rc;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

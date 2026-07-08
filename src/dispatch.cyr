@@ -54,6 +54,8 @@ enum MirshiConfine {
     HOST_OPEN = 2;              # Linux open(2)  — used pre-execve in the child to get rootfd
     HOST_CLOSE = 3;             # Linux close(2) — close the temporary low rootfd after dup3
     HOST_DUP3 = 292;            # Linux dup3(2)  — pin rootfd at ROOTFD (flags=0, survives execve)
+    SYS_PIDFD_OPEN = 434;       # exec_redirect#62: open a pidfd for the exec caller (agnsh)
+    SYS_PIDFD_GETFD = 438;      # exec_redirect#62: dup the caller's dst_fd into the supervisor (files + pipes)
     # bite 2: the path-mutation/metadata *at peers, anchored at ROOTFD with a
     # lexically-sanitized relative path (the *at family has no RESOLVE_* of its own).
     SYS_NEWFSTATAT = 262;       # stat#33  -> newfstatat(ROOTFD, rel, statbuf, flag=0)
@@ -1538,6 +1540,7 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 30) { return _cf_one(pid, regs, SYS_UNLINKAT, 0); }              # unlink
         if (nr == 31) { return _cf_two(pid, regs, SYS_RENAMEAT2); }                # rename
         if (nr == 32) { return _cf_two(pid, regs, SYS_LINKAT); }                   # link
+        if (nr == 63) { return _m2_fail(pid, regs); }                             # symlink: --root deferred (raw target isn't a confinable path; needs a custom symlinkat)
         if (nr == 33) { return _cf_stat(pid, regs); }                             # stat
     }
 
@@ -1556,6 +1559,7 @@ fn translate_dispatch(pid, regs): i64 {
     if (nr == 30) { return _m2_one_path(pid, regs, 87); }   # unlink
     if (nr == 31) { return _m2_two_path(pid, regs, 82); }   # rename
     if (nr == 32) { return _m2_two_path(pid, regs, 86); }   # link (HARDLINK, never symlink)
+    if (nr == 63) { return _m2_two_path(pid, regs, 88); }   # symlink -> Linux symlink(88); target is a literal string, linkpath a real path — same (path,len,path,len) shape as link#32
     if (nr == 33) {
         # stat(path,pathlen,statbuf48) -> Linux stat(path, statbuf144); the exit
         # stop repacks the 144 B Linux struct into the saved agnos 48 B statbuf.

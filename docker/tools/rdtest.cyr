@@ -1,0 +1,27 @@
+# rdtest.cyr — behavioral smoke for mirshi exec_redirect#62.
+# Opens a file, arms exec_redirect(stdout=1 -> file fd), then execwait#37 ./hello: hello's
+# output must land in the FILE, not the terminal (mirshi steals the fd via pidfd_getfd + dup3's
+# it onto the grandchild's stdout). rdtest's OWN stdout is untouched (the redirect is one-shot,
+# consumed by the exec, and applies only to the grandchild).
+#   cyrius build --agnos docker/tools/rdtest.cyr <stage>/rdtest
+#   (cd <stage> && mirshi ./rdtest && cat redir.out)
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var fname = "./redir.out";
+    # agnos open#7(name, namelen, flags): AO_WRONLY|AO_CREAT|AO_TRUNC = 0x1|0x100|0x200 = 0x301
+    var fd = syscall(7, fname, strlen(fname), 0x301);
+    if (fd < 0) { var e = "rdtest: open FAILED\n"; sys_write(1, e, strlen(e)); return 1; }
+    var s = "rdtest: armed redirect stdout->file; execwait ./hello (its output should go to the file)\n";
+    sys_write(1, s, strlen(s));
+    syscall(62, 1, fd);                 # exec_redirect#62: stdout(1) -> fd, one-shot (next exec consumes)
+    var cmd = "./hello";
+    var rc = syscall(37, cmd, strlen(cmd));     # execwait#37 ./hello — its stdout is redirected
+    syscall(6, fd);                     # close#6
+    var b = "rdtest: back on the real terminal (hello's line did NOT appear here) — check redir.out\n";
+    sys_write(1, b, strlen(b));
+    return rc;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

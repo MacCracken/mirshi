@@ -68,6 +68,7 @@ fn _bound_allowlist(buf): i64 {
     n = _allow(buf, n, 83);     # mkdir
     n = _allow(buf, n, 84);     # rmdir
     n = _allow(buf, n, 86);     # link
+    n = _allow(buf, n, 88);     # symlink     (symlink#63)
     n = _allow(buf, n, 87);     # unlink
     n = _allow(buf, n, 162);    # sync
     n = _allow(buf, n, 201);    # time

@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.2] — 2026-07-07
+
+Completes the exec-band re-sync (execwait#37 in 1.10.0, spawn_path#43 in 1.10.1).
+
+### Added
+- **`exec_redirect#62` — EMULATE at the loop level** (`_do_exec_redirect` + `_spawn_from_path`,
+  `src/intercept.cyr`). agnos's one-shot fd redirect: the next from-path exec (execwait#37 / spawn_path#43)
+  routes the child's `src_fd` (e.g. stdout=1) to the CALLER's `dst_fd` — agnsh's `>` and `|`. agnos copies a
+  shared-VFS-table entry; mirshi can't (the grandchild forks from the supervisor, not agnsh), so it **steals
+  the caller's `dst_fd` via `pidfd_getfd`** (works for files AND pipes, unlike `/proc`) before the fork and
+  `dup3`'s it onto `src_fd` in the grandchild. No restore needed — mirshi's child is a separate process, so
+  agnsh's own fds stay untouched. Smoke `docker/tools/rdtest.cyr` (arm stdout→file, execwait `./hello` →
+  hello's line lands in the file; rdtest's own stdout stays on the terminal).
+- **`symlink#63` — EXECUTE-in-child** (`src/dispatch.cyr` → Linux `symlink(88)`). Two paths staged; the
+  target is a **literal string**, the linkpath a real path (same `(path,len,path,len)` shape as `link#32`).
+  The child seccomp allowlist gained syscall **88** — a new Linux syscall mirshi now emits; the behavioral
+  smoke caught the SIGSYS. Smoke `docker/tools/sltest.cyr` (`./slink → hello`, verified on disk). Under
+  `--root` it's deferred (a raw symlink target isn't a confinable path; non-root — the default — works).
+
+The exec-band re-sync to agnos's grown ABI is now **complete**: `execwait#37` + `spawn_path#43` +
+`exec_redirect#62` + `symlink#63`. Freeze suite green (295/0).
+
 ## [1.10.1] — 2026-07-07
 
 Continues the exec-band re-sync opened in 1.10.0, on the latest toolchain.
