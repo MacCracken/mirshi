@@ -4,6 +4,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Toolchain pin → cyrius 6.4.19** (from 6.3.27). The committed `lib/` snapshot was re-vendored to match
+  (`cyrius lib sync --full` → 98 files) so the pin is real, not shadowed by a stale vendored stdlib. Build
+  + full freeze suite (295/0) + the `execwait#37` behavioral smoke all green on 6.4.19.
+
 ## [1.10.0] — 2026-07-07
 
 Ships two things together — the argv-forwarding fix that was staged but never released (1.9.0 is the last

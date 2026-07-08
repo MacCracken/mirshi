@@ -177,7 +177,12 @@ fn WTERMSIG(status): i64 { return 0; }
 fn sys_chmod(path, mode): i64 { return 0; }
 # Best-effort dup2 stub: returns the requested newfd (handle dup is rerouted).
 fn sys_dup2(oldfd, newfd): i64 { return newfd; }
-# mkdir stub (Windows dir creation is rerouted via Win32); no-op success.
-fn sys_mkdir(path, mode): i64 { return 0; }
-# unlink stub (Windows file deletion is rerouted via Win32); no-op success.
-fn sys_unlink(path): i64 { return 0; }
+# mkdir — routed to kernel32!CreateDirectoryW by the PE backend's syscall(83)
+# reroute (src/backend/pe/emit.cyr _pe_ensure_createdir, v5.11.22). Returns 0 on
+# success, -1 on failure. (Was a no-op `return 0` stub through v6.3.42 — VR-01
+# surfaced that it never actually created the directory on Windows.)
+fn sys_mkdir(path, mode): i64 { return syscall(83, path, mode); }
+# unlink — routed to kernel32!DeleteFileW by the PE backend's syscall(87) reroute
+# (_pe_ensure_deletef, v5.11.22). Returns 0 on success, -1 on failure. (Was a
+# no-op `return 0` stub through v6.3.42 — VR-01 surfaced the file was never deleted.)
+fn sys_unlink(path): i64 { return syscall(87, path); }

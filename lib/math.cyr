@@ -20,6 +20,7 @@ var F64_TWO_HALF      = 0x4004_0000_0000_0000;   # 2.5
 var F64_PI            = 0x4009_21FB_5444_2D18;   # π
 var F64_PI_2          = 0x3FF9_21FB_5444_2D18;   # π/2
 var F64_PI_4          = 0x3FE9_21FB_5444_2D18;   # π/4
+var F64_2_PI          = 0x3FE4_5F30_6DC9_C883;   # 2/π ≈ 0.6366197723675814
 var F64_TAU           = 0x4019_21FB_5444_2D18;   # 2π
 var F64_E             = 0x4005_BF0A_8B14_5769;   # e
 var F64_LN2           = 0x3FE6_2E42_FEFA_39EF;   # ln(2)
@@ -158,6 +159,81 @@ fn _f64_ln_polyfill(x): i64 {
 # blocked aarch64 cross-build via the `f64_log2 is x86-only` hard-reject.
 fn _f64_log2_polyfill(x): i64 {
     return f64_mul(f64_ln(x), F64_LOG2E);
+}
+
+# ============================================================
+# v6.4.16: aarch64 polyfills for f64_sin / f64_cos.
+# ============================================================
+# x86 has native x87 fsin / fcos; aarch64 has no native trig (even
+# hardware sin/cos on ARM is a library affair). Pre-v6.4.16 the
+# aarch64 backend hard-rejected f64_sin / f64_cos; v6.4.16 redirects
+# them to these polyfills (the v5.7.31 exp/ln pattern applied to trig).
+# Consumer-filed by attn11 (hearing lane: Hann-window cos + synth sin +
+# hisab num_fft twiddles) — `issues/2026-07-07-aarch64-no-trig-polyfill.md`.
+#
+# Range-reduce x = k·(π/2) + r with |r| ≤ π/4 and quadrant q = k mod 4;
+# evaluate sin(r) and cos(r) via Horner Taylor (through 1/15! and 1/14!,
+# accurate to ~1e-16 on |r| ≤ π/4) and select/sign per quadrant. Single-
+# constant reduction (like _f64_exp's single ln2) — accurate for typical
+# inputs; extreme-|x| (where the single π/2 subtraction loses precision)
+# is out-of-spec, same posture as the exp/ln polyfills. A Payne-Hanek /
+# Cody-Waite two-part reduction is a future polish slot if a consumer needs it.
+# x86 builds keep emitting native fsin/fcos; these compile on x86 too but
+# are only invoked on aarch64.
+
+# sin(r)/r as a polynomial in r² (Taylor, alternating sign): the coefficients
+# are (-1)^k / (2k+1)! for k = 0..7. dev-computed IEEE-754 bit patterns.
+fn _f64_sin_core(r2): i64 {
+    var p = 0xBD6AE7F3E733B81F;                          # s7 = -1/15!
+    p = f64_add(0x3DE6124613A86D09, f64_mul(r2, p));     # s6 =  1/13!
+    p = f64_add(0xBE5AE64567F544E4, f64_mul(r2, p));     # s5 = -1/11!
+    p = f64_add(0x3EC71DE3A556C734, f64_mul(r2, p));     # s4 =  1/9!
+    p = f64_add(0xBF2A01A01A01A01A, f64_mul(r2, p));     # s3 = -1/7!
+    p = f64_add(0x3F81111111111111, f64_mul(r2, p));     # s2 =  1/5!
+    p = f64_add(0xBFC5555555555555, f64_mul(r2, p));     # s1 = -1/3!
+    p = f64_add(F64_ONE, f64_mul(r2, p));                # s0 =  1
+    return p;
+}
+
+# cos(r) as a polynomial in r² (Taylor, alternating sign): (-1)^k / (2k)!.
+fn _f64_cos_core(r2): i64 {
+    var p = 0xBDA93974A8C07C9D;                          # c7 = -1/14!
+    p = f64_add(0x3E21EED8EFF8D898, f64_mul(r2, p));     # c6 =  1/12!
+    p = f64_add(0xBE927E4FB7789F5C, f64_mul(r2, p));     # c5 = -1/10!
+    p = f64_add(0x3EFA01A01A01A01A, f64_mul(r2, p));     # c4 =  1/8!
+    p = f64_add(0xBF56C16C16C16C17, f64_mul(r2, p));     # c3 = -1/6!
+    p = f64_add(0x3FA5555555555555, f64_mul(r2, p));     # c2 =  1/4!
+    p = f64_add(0xBFE0000000000000, f64_mul(r2, p));     # c1 = -1/2!
+    p = f64_add(F64_ONE, f64_mul(r2, p));                # c0 =  1
+    return p;
+}
+
+fn _f64_sin_polyfill(x): i64 {
+    var k_f = f64_round(f64_mul(x, F64_2_PI));           # nearest multiple of π/2
+    var r   = f64_sub(x, f64_mul(k_f, F64_PI_2));         # r ∈ [−π/4, π/4]
+    var q   = f64_to(k_f) & 3;                            # quadrant (two's-comp mask handles k<0)
+    var r2  = f64_mul(r, r);
+    var sinr = f64_mul(r, _f64_sin_core(r2));
+    var cosr = _f64_cos_core(r2);
+    # sin(x) = [sinr, cosr, -sinr, -cosr][q]
+    if (q == 0) { return sinr; }
+    if (q == 1) { return cosr; }
+    if (q == 2) { return f64_neg(sinr); }
+    return f64_neg(cosr);
+}
+
+fn _f64_cos_polyfill(x): i64 {
+    var k_f = f64_round(f64_mul(x, F64_2_PI));
+    var r   = f64_sub(x, f64_mul(k_f, F64_PI_2));
+    var q   = f64_to(k_f) & 3;
+    var r2  = f64_mul(r, r);
+    var sinr = f64_mul(r, _f64_sin_core(r2));
+    var cosr = _f64_cos_core(r2);
+    # cos(x) = [cosr, -sinr, -cosr, sinr][q]
+    if (q == 0) { return cosr; }
+    if (q == 1) { return f64_neg(sinr); }
+    if (q == 2) { return f64_neg(cosr); }
+    return sinr;
 }
 
 # clamp(x, lo, hi) — clamp x to [lo, hi]

@@ -254,3 +254,47 @@ fn cancel_token_check(tok): i64 {
     if (tok == 0) { return 0; }
     return atomic_load(tok);
 }
+
+# ================================================================
+# Futures (v6.3.11, G) — SHARED across all targets (pure fncallN dispatch, no
+# epoll/fork/syscalls). Backing for the `async fn` / `await` sugar:
+#
+#   async fn fetch(url): i64 { ... }      # compiles to a constructor that builds
+#   var f = fetch(addr);                  # a Future [ &fetch$impl, 1, addr ] (lazy)
+#   var result = await f;                 # → future_force(f): runs the body, returns its value
+#
+# A Future is a heap object `[ impl_fn_ptr, argc, arg0, …, arg{argc-1} ]` produced
+# by the async-fn constructor (synthesized in PARSE_FN_DEF). Forcing it calls the
+# impl with the bundled args. The lazy shape means an `async fn` only runs when
+# awaited (or spawned + run) — matching the cooperative runtime above, where a
+# Future is exactly a task with its arguments bundled in. v1 re-runs the body on
+# each force; force-once memoization (cache the result + a done flag) is a follow-on
+# (CHANGELOG [6.3.11]). Requires lib/fnptr.cyr (already a hard requirement of this
+# file — async_run dispatches tasks via fncall1).
+fn future_force(fut): i64 {
+    if (fut == 0) { return 0; }
+    var fp = load64(fut);
+    var argc = load64(fut + 8);
+    if (argc == 0) { return fncall0(fp); }
+    if (argc == 1) { return fncall1(fp, load64(fut + 16)); }
+    if (argc == 2) { return fncall2(fp, load64(fut + 16), load64(fut + 24)); }
+    if (argc == 3) { return fncall3(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32)); }
+    if (argc == 4) {
+        return fncall4(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+        load64(fut + 40));
+    }
+    if (argc == 5) {
+        return fncall5(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+        load64(fut + 40), load64(fut + 48));
+    }
+    return fncall6(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+    load64(fut + 40), load64(fut + 48), load64(fut + 56));
+}
+
+# Spawn a Future onto an async runtime so async_run forces it cooperatively. The
+# Future bundles its own args, so it schedules as a task whose fn = future_force and
+# whose arg = the Future object. Works on every target (async_spawn is defined by
+# the per-target runtime above / async_agnos.cyr).
+fn async_spawn_future(rt, fut): i64 {
+    return async_spawn(rt, &future_force, fut);
+}

@@ -86,13 +86,30 @@ fn _fl_map_flags(): i64 {
     return MAP_PRIVATE | MAP_ANONYMOUS;
 }
 
+# v6.3.31: agnos `mmap#27` is SINGLE-ARG — the kernel reads the length from arg1
+# (rdi) and always returns an anonymous R/W mapping (addr/prot/flags/fd/off ignored:
+# `kernel/core/syscall.cyr` does `if (num == 27) return sys_mmap(arg1)`). The
+# Linux/BSD 6-arg form passes length in arg2 (rsi) with addr=0 in arg1, so on agnos
+# the length lands as arg1=0 → the kernel sees length 0 → mmap returns 0 → the
+# caller's first `store64` derefs NULL → SIGSEGV on EVERY agnos `fl_alloc` consumer
+# (libro's audit chain `chain_new→fl_alloc`, sigil's sha256/x25519/hex_decode). The
+# freelist is ONE shared file across targets, so — exactly like `_fl_map_flags`
+# handles the macOS MAP_ANON divergence — it must dispatch the mmap ABI itself.
+# See issue 2026-07-02-freelist-agnos-mmap-abi.
+fn _fl_mmap(length): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_MMAP, length);          # agnos mmap#27: length in arg1, anon R/W
+    #endif
+    var prot = PROT_READ | PROT_WRITE;
+    var flags = _fl_map_flags();
+    return syscall(SYS_MMAP, 0, length, prot, flags, 0 - 1, 0);
+}
+
 # Allocate from arena (bump within mmap'd chunk)
 fn _fl_arena_alloc(bsize): i64 {
     if (_fl_arena_pos + bsize > _fl_arena_end) {
         # Need new arena chunk
-        var prot = PROT_READ | PROT_WRITE;
-        var flags = _fl_map_flags();
-        _fl_arena = syscall(SYS_MMAP, 0, FL_ARENA_SIZE, prot, flags, 0 - 1, 0);
+        _fl_arena = _fl_mmap(FL_ARENA_SIZE);
         _fl_arena_pos = _fl_arena;
         _fl_arena_end = _fl_arena + FL_ARENA_SIZE;
     }
@@ -108,9 +125,7 @@ fn fl_alloc(size): i64 {
     if (cls < 0) {
         # Large allocation: mmap directly
         var total = size + 16;
-        var prot = PROT_READ | PROT_WRITE;
-        var flags = _fl_map_flags();
-        var blk = syscall(SYS_MMAP, 0, total, prot, flags, 0 - 1, 0);
+        var blk = _fl_mmap(total);
         store64(blk, 0);
         store64(blk + 8, total);
         return blk + 16;

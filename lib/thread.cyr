@@ -12,6 +12,19 @@
 # >>> include "lib/thread_win.cyr"
 # >>> include "lib/thread.cyr"
 
+# v6.3.44: mutex_new/lock/unlock + MUTEX_SIZE live in ONE place — lib/sync.cyr,
+# the purpose-built "lock alone" module (issue 2026-07-03-duplicate-mutex-fns-
+# thread-vs-sync-stdlib). thread.cyr / thread_win.cyr / thread_agnos.cyr each used
+# to carry their own per-platform copy, so any consumer linking BOTH thread and
+# sync (sync arrives transitively via alloc/atomic/patra) got 3 `duplicate fn`
+# warnings — and if the two impls ever drifted, link order silently picked the
+# winner. Delegating here makes sync the single owner: sync's own #ifdef routing
+# selects the backend (Linux futex / Windows SRWLOCK / macOS spinlock / agnos
+# no-op) and include-once dedup collapses the both-included case to one definition.
+# The channel code below (and in thread_win/thread_agnos) uses these symbols;
+# sync.cyr needs alloc + atomic, which thread.cyr's Requires line already mandates.
+include "lib/sync.cyr"
+
 # v6.0.53: Win32 has no clone/futex — the Linux thread body below (SYS_CLONE +
 # CLONE_* + futex + hand-assembled trampolines) can't even parse under
 # CYRIUS_TARGET_WIN. Route to a serial-fallback variant, mirroring
@@ -46,8 +59,15 @@ include "lib/mmap.cyr"
 # double-include if callers already pulled it in).
 include "lib/atomic.cyr"
 
-# Stack size per thread (64KB default)
-var THREAD_STACK_SIZE = 65536;
+# Stack size per thread. v6.3.13: bumped 64KB → 2MB so that `var arr[N]` LOCALS —
+# now per-thread STACK-allocated (thread-safe; previously a shared global/BSS buffer,
+# the str_builder concurrency root cause) — fit on a spawned thread's stack even for
+# large arrays (the largest array local in the toolchain is 256KB). Virtual reservation
+# only; physical pages are touched on demand, and the PROT_NONE guard page below the
+# stack (CVE-29) turns any overflow into a loud SIGSEGV rather than corruption. A
+# per-call heap path for large arrays was rejected: the global bump allocator has no
+# free(), so it would leak every call.
+var THREAD_STACK_SIZE = 2097152;
 
 # Per-thread TLS block size (serves thread_local_get/set slots via
 # %fs on x86_64 or TPIDR_EL0 on aarch64; installed by kernel via
@@ -193,6 +213,7 @@ fn _thread_spawn(flags, child_stack, t, tls): i64 {
 # The function pointer must be obtained via &fn_name.
 fn thread_create(fp, arg): i64 {
     alloc_init();
+    _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock BEFORE the clone below
     var t = alloc(THREAD_SIZE);
     var ssize = THREAD_STACK_SIZE;
     var sbase = mmap_stack(ssize);
@@ -281,57 +302,11 @@ fn gettid(): i64 {
     return syscall(SYS_GETTID);
 }
 
-# Mutex: futex-based lock. 0=unlocked, 1=locked.
-# Layout: { state: i64 } = 8 bytes
-#
-# Pre-v5.5.31 used a 3-state (0/1/2) scheme with a plain load +
-# store fast path — racy: two threads could both observe state 0
-# and both "acquire" the lock. v5.5.31 replaces the load+store
-# with `atomic_cas` (lock cmpxchg / ldxr-stxr) for correctness,
-# and collapses to 2-state. Trade-off: unconditional FUTEX_WAKE
-# on every unlock (one syscall even when nobody's waiting) in
-# exchange for drop-dead-simple correctness. Works-in-practice
-# mutex fast-path is now correct-by-construction.
-var MUTEX_SIZE = 8;
-
-# Create a new mutex (unlocked)
-fn mutex_new(): i64 {
-    alloc_init();
-    var m = alloc(MUTEX_SIZE);
-    store64(m, 0);
-    return m;
-}
-
-# Lock mutex. Blocks via futex when contended.
-fn mutex_lock(m): i64 {
-    while (atomic_cas(m, 0, 1) == 0) {
-        # Someone else holds the lock. FUTEX_WAIT atomically
-        # checks `*m == 1` against the kernel — if the holder
-        # just released (m == 0), the syscall returns EAGAIN
-        # and we retry CAS. No lost wakeup window.
-        syscall(SYS_FUTEX, m, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-    }
-    # Acquire barrier: prevent critical-section loads/stores from
-    # being reordered BEFORE the CAS. aarch64's weak memory model
-    # allows this without an explicit fence; x86 TSO implies it
-    # via `lock cmpxchg` but atomic_fence is a cheap no-op there.
-    atomic_fence();
-    return 0;
-}
-
-# Unlock mutex. Always wakes exactly one waiter (if any);
-# kernel no-ops the wake when the futex has no waiters.
-fn mutex_unlock(m): i64 {
-    # Release barrier: flush critical-section writes before the
-    # lock-release store. Without this on aarch64, a holder's
-    # writes inside the critical section can be reordered after
-    # `atomic_store(m, 0)` — a subsequent acquirer then reads
-    # stale state and silently loses updates.
-    atomic_fence();
-    atomic_store(m, 0);
-    syscall(SYS_FUTEX, m, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-    return 0;
-}
+# Mutex: MUTEX_SIZE + mutex_new/lock/unlock now come from lib/sync.cyr (included
+# at the top of this file — see the v6.3.44 note there). The Linux futex mutex
+# that used to live here is byte-for-byte the same as sync.cyr's Linux backend;
+# it was moved to sync so there is exactly one owner per platform. The channel
+# code below uses mutex_* and MUTEX_SIZE unchanged.
 
 # Channel: bounded MPSC channel using mutex + futex
 # Layout: { buf, cap, head, tail, count, mutex, closed } = 56 bytes

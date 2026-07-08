@@ -17,6 +17,24 @@
 # Slot range: 0 .. TLOCAL_MAX_SLOTS-1 (16 slots × 8B). No bounds
 # check in the hot path — caller is trusted.
 #
+# === SLOT NAMESPACE REGISTRY (v6.3.25) ===
+# This is a SHARED integer slot space with NO allocator: every lib that
+# uses thread_local_get/set hardcodes its slot index, so two libs linked
+# into one program MUST NOT pick the same slot. A collision silently
+# clobbers one lib's per-thread state. That was the v6.3.25 bug: sigil's
+# crypto bank (slot 0) collided with patra's SQL-parse scratch (slots
+# 0-4) -> a patra query corrupted sigil's crypto lane index -> TLS
+# RECORD_LAYER_FAILURE in any server linking both (SecureYeoman/
+# yeo-cy-test). Reserved slots:
+#   0-4   patra   (SQL parse: TLS_PR/TLS_TOKS/TLS_NTOKS; slab 3-4)
+#   8     sigil   (crypto bank lane, _SIGIL_CBANK_SLOT -- moved 3.9.9)
+#   15    convention: consumer app scratch (yeo-cy-test's TLS_DB)
+# FREE: 5-7, 9-14. Claim from FREE + add a row here. A proper slot
+# allocator (thread_local_alloc) is the real fix -- see the filed
+# 2026-07-01-thread-local-slot-namespace issue. NOTE: any slot >= 16
+# overflows _tlocal_macos/_tlocal_agnos[128] on macOS/agnos -- sandhi's
+# _SANDHI_RPC_POLICY_SLOT=16 is a latent OOB (also filed).
+#
 # NOT named tls.cyr to avoid collision with lib/tls.cyr (libssl TLS
 # protocol client; retired by the v5.9.x pure-cyrius TLS arc).
 #
@@ -59,6 +77,43 @@ var _tlocal_macos[128];     # TLOCAL_MAX_SLOTS (16) * 8 bytes, zero-init .bss
 var _tlocal_agnos[128];     # TLOCAL_MAX_SLOTS (16) * 8 bytes, zero-init
 #endif
 
+# Foreign-host coexistence (v6.3.26). When cyrius code runs INSIDE a
+# glibc-hosted process — mabda's wgpu C-launcher (ADR-004): C `main` gets
+# full libc init, then calls into cyrius — glibc owns the thread-pointer
+# register (`%fs` on x86, TPIDR_EL0 on aarch64). Its TCB holds the thread
+# self-pointer at offset 0 and the **stack-protector canary at %fs:0x28**.
+# The default Linux path below would (a) `arch_prctl(ARCH_SET_FS)` a fresh
+# cyrius block over glibc's %fs and (b) write cyrius slots into %fs:[0..0x78],
+# BOTH of which corrupt glibc's TCB → every stack-protected C callee (all of
+# wgpu-native) faults or aborts on its canary. That is the real mechanism
+# behind the folklore "fncall6 into extern-C wgpu is unreliable" — it was
+# never an fncall ABI bug (arg-passing + 16B alignment are correct), it was
+# %fs being clobbered.
+#
+# Fix: a glibc-hosted consumer calls `thread_local_use_foreign_tls()` once at
+# startup. cyrius then leaves %fs untouched and keeps its thread-local slots
+# in a process-global fallback array (identical to the macOS/agnos path).
+#
+# EXPLICIT, not auto-detected: a native worker thread installed via
+# CLONE_SETTLS (lib/thread.cyr) also has a NON-ZERO %fs, so a "fs != 0 =>
+# foreign" heuristic would misclassify native workers and collapse their
+# per-thread lanes into one shared array (the v6.3.25 crypto-bank collision
+# class). The host knows it is glibc-hosted; it declares so. Foreign mode is
+# process-global like macOS/agnos — race-free as long as cyrius thread-local
+# code runs on a single thread inside the host (the C-launcher runs mabda on
+# `main`); a foreign multi-thread consumer would need a pthread-key backing,
+# tracked as a follow-up.
+var _tlocal_foreign = 0;    # set by thread_local_use_foreign_tls()
+var _tlocal_fallback[128];  # 16 slots * 8B, process-global (foreign mode only)
+
+# Declare that cyrius is running inside a foreign (glibc) host that owns the
+# thread-pointer register. Idempotent. Must be called before any
+# thread_local_init / _get / _set (the C-launcher calls it at startup).
+fn thread_local_use_foreign_tls(): i64 {
+    _tlocal_foreign = 1;
+    return 0;
+}
+
 #ifndef CYRIUS_TARGET_WIN
 # Install `tls` as the current thread's thread-pointer register base.
 # x86_64: syscall(158, ARCH_SET_FS=0x1002, tls)
@@ -90,6 +145,9 @@ fn thread_local_init(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 1;     # process-global _tlocal_agnos is zero-init; nothing to install
     #endif
+    # Foreign host (glibc) owns %fs — do NOT arch_prctl-clobber it; the
+    # fallback array is zero-init and ready. See thread_local_use_foreign_tls.
+    if (_tlocal_foreign == 1) { return 1; }
     alloc_init();
     var tls = alloc(TLOCAL_BLOCK_SIZE);
     if (tls == 0) { return 0; }
@@ -112,6 +170,8 @@ fn thread_local_get(slot): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return load64(&_tlocal_agnos + slot * 8);
     #endif
+    # Foreign host: %fs belongs to glibc — read from the process-global fallback.
+    if (_tlocal_foreign == 1) { return load64(&_tlocal_fallback + slot * 8); }
     #ifdef CYRIUS_ARCH_X86
     asm {
         # Frame: [rbp-8]=slot, [rbp-16]=ret
@@ -143,6 +203,8 @@ fn thread_local_set(slot, val): i64 {
     store64(&_tlocal_agnos + slot * 8, val);
     return 0;
     #endif
+    # Foreign host: %fs belongs to glibc — write to the process-global fallback.
+    if (_tlocal_foreign == 1) { store64(&_tlocal_fallback + slot * 8, val); return 0; }
     #ifdef CYRIUS_ARCH_X86
     asm {
         # Frame: [rbp-8]=slot, [rbp-16]=val

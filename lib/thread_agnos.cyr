@@ -40,6 +40,7 @@ include "lib/thread_local.cyr"
 # wrong-scratch-lane bug for any crypto run on main after a batch fans out.
 # Returns a fake non-zero handle so callers' null-checks pass + join is valid.
 fn thread_create(fp, arg): i64 {
+    _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before the spawn
     var save: i64[16];    # TLOCAL_MAX_SLOTS slots
     var i = 0;
     while (i < 16) {
@@ -66,19 +67,12 @@ fn thread_join(t): i64 {
 # Current thread id — the (single) process id on agnos.
 fn gettid(): i64 { return sys_getpid(); }
 
-# Mutex = an 8-byte cell (callers null-check the returned ptr). Single-threaded,
-# so lock/unlock are no-ops — there is never a contender.
-fn mutex_new(): i64 {
-    alloc_init();
-    var m = alloc(8);
-    if (m == 0) { return 0; }
-    store64(m, 0);
-    return m;
-}
-# Acquire — no-op on the single-threaded agnos path (no contender exists).
-fn mutex_lock(m): i64 { return 0; }
-# Release — pairs with mutex_lock; no-op (single-threaded).
-fn mutex_unlock(m): i64 { return 0; }
+# Mutex (MUTEX_SIZE + mutex_new/lock/unlock) now comes from lib/sync.cyr, whose
+# agnos branch is this same single-threaded no-op lock (8-byte cell, null-checked;
+# lock/unlock no-ops — there is never a contender). Moved to the single owner in
+# v6.3.44 (issue 2026-07-03-duplicate-mutex-fns-thread-vs-sync-stdlib); thread.cyr
+# includes sync.cyr at its top before routing here. The channel below uses it
+# unchanged (single-threaded → no lock needed anyway).
 
 # Channel — a plain FIFO ring (single-threaded → no lock needed). Same 56-byte
 # layout as thread.cyr / thread_win.cyr ({buf@0, cap@8, head@16, tail@24,

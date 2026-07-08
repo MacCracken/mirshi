@@ -63,6 +63,22 @@ enum SysNrAgnos {
     SYS_WINSIZE = 60;             # winsize() → (cols<<16)|rows / -1; no args, live FB char grid (agnos 1.45.13).
     #   NOTE: #60 == the Linux exit number, so `_agnos_emit_gate` was reworked to verify
     #   the actual program-exit syscall (#0) rather than scan for any `mov eax,60`.
+    SYS_SYMLINK = 63;             # symlink(target, targetlen, linkpath, linkpathlen) → 0 / -1 (a4=r10).
+    #   target/targetlen = the link's TEXT contents (1..4096 B; NOT a path the kernel resolves);
+    #   linkpath/linkpathlen = where the link is created (ext2 only). agnos #63 — the next free
+    #   number after WINSIZE (#0–62 taken), kernel `symlink`#63 landed at agnos 1.51.0. Mirrors
+    #   SYS_LINK=32's 4-arg ABI exactly. (issue 2026-06-29-agnos-sys-symlink-peer.)
+    # ---- agnos HDA audio band #64-69 (agnos 1.52.x Gate 2) ----
+    #   Frozen output stream: 48000 Hz / 16-bit / stereo (S16 interleaved, 4 B/frame).
+    #   Kernel does NO format conversion (dumb byte-mover) — the producer resamples.
+    #   All calls take an snd_id slot 0..3; #65-69 reject a slot not allocated-and-owned
+    #   by the caller (-1), like flock. (issue 2026-07-04-agnos-snd-audio-syscall-band-64-69.)
+    SYS_SND_OPEN   = 64;          # snd_open() → slot 0..3 / -1; auto-released on proc-exit
+    SYS_SND_CONFIG = 65;          # snd_config(slot, rate, fmt) → 0/-1; rate=48000, fmt=(bits<<8)|ch=0x1002
+    SYS_SND_WRITE  = 66;          # snd_write(slot, buf, frames) → frames / -1; a4=r10 bit0 = O_NONBLOCK
+    SYS_SND_CLOSE  = 67;          # snd_close(slot) → 0 / -1
+    SYS_SND_DRAIN  = 68;          # snd_drain(slot) → 0; blocks until play-out (~1s cap)
+    SYS_SND_AVAIL  = 69;          # snd_avail(slot) → free frames / -1; non-blocking
 }
 
 # ================================================================
@@ -145,6 +161,29 @@ enum SysNrAgnosNet {
     SYS_SOCK_LISTEN = 56;  # sock_listen(port) → listen_id 0..7 / -1; merges bind+listen, non-blocking (1.45.5)
     SYS_SOCK_ACCEPT = 57;  # sock_accept(listen_id) → conn_id / -1 (WOULD_BLOCK / bad id); non-blocking (1.45.5)
     SYS_NET_CONFIG = 61;   # net_config(field) → packed IPv4 / 0 unset / -1 bad field (agnos 1.45.16)
+}
+
+# ================================================================
+# Process-exec / framebuffer / input / sched band — the AGNOS base-system
+# enabler. As kavach, bote, t-ron, thoth, phylax, aegis port to --agnos they
+# land on the process/exec syscalls (spawn + capture tool subprocesses) and the
+# klug ring (read the audit/log). Filed proactively so the named wrappers exist
+# before each consumer hits a one-at-a-time link error. ABI: rax=num,
+# rdi/rsi/rdx/r10 = a1..a4 (#39 blit rides a4=r10). Numbers verified from agnos
+# kernel/core/syscall.cyr + syscall_hw.cyr (the kernel dispatches 0–63
+# contiguous; these are the 8 the peer previously omitted: 36–39, 42–44, 62).
+# It is `klug`, NOT `klog` (the subsystem is core/klug.cyr; klog is dead).
+# See issue 2026-06-30-agnos-syscall-peer-incomplete-8-wrappers.md.
+# ================================================================
+enum SysNrAgnosProc {
+    SYS_KLUG = 36;          # klug(buf, len) → bytes/-1; copy the klug log ring (dmesg tail)
+    SYS_EXECWAIT = 37;      # execwait(path, pathlen) → child exit code/-1; load+run a static ELF64 (ring 3)
+    SYS_FBINFO = 38;        # fbinfo(buf, len) → bytes/-1; write the 24-byte framebuffer geometry struct
+    SYS_BLIT = 39;          # blit(src, w, h, dstxy) → 0/-1; copy a w×h 32bpp block to the framebuffer (a4=r10)
+    SYS_KBSCAN = 42;        # kbscan(buf, max) → count/-1; NON-blocking raw-scancode drain for ring-3
+    SYS_SPAWN_PATH = 43;    # spawn_path(path, len) → pid/-1; NON-blocking from-disk spawn (returns now)
+    SYS_SCHED_YIELD = 44;   # sched_yield() → 0; cooperative yield (in the SYSCALL entry stub)
+    SYS_EXEC_REDIRECT = 62; # exec_redirect(src_fd, dst_fd) → 0/-1; arm a one-shot fd redirect before exec
 }
 
 # ================================================================
@@ -395,6 +434,19 @@ fn sys_getdents(dir_fd, buf, bufsize): i64 { return syscall(SYS_GETDENTS, dir_fd
 # Returns 0, or -1.
 fn sys_stat(path, pathlen, statbuf): i64 { return syscall(SYS_STAT, path, pathlen, statbuf); }
 
+# agnos has NO fstat-by-fd syscall — the kernel exposes only path-based
+# `sys_stat`#33 (there is no fstat number in the 0–63 table). fd→stat in
+# ring 3 cannot be synthesized portably, so this peer fails closed (-1),
+# mirroring `sys_access` below. A --agnos consumer linking `sys_fstat`
+# then gets a defined "unsupported" answer instead of a `ud2`/SIGILL.
+#   TOCTOU note: aegis's O_NOFOLLOW-then-fstat path returns -1 here; on
+#   --agnos it must gate that path (#ifndef CYRIUS_TARGET_AGNOS) or fall
+#   back to path-based `sys_stat` with the race documented.
+#   UPGRADE PATH: if agnos ever dispatches an fstat-by-fd syscall, replace
+#   the body with `syscall(SYS_FSTAT, fd, statbuf)` + a SYS_FSTAT const.
+# (issue 2026-06-30-agnos-sys-fstat-peer.md.)
+fn sys_fstat(fd, statbuf): i64 { return 0 - 1; }
+
 # agnos has no access(2). sigil's ~20 call sites all probe TPM / IMA /
 # secureboot / cert paths with mode=0 (F_OK), none of which exist on
 # agnos, and treat !=0 as absent — so report absent for every probe.
@@ -412,6 +464,63 @@ fn sys_rename(old, oldlen, new, newlen): i64 { return syscall(SYS_RENAME, old, o
 fn sys_link(target, targetlen, linkpath, linkpathlen): i64 {
     return syscall(SYS_LINK, target, targetlen, linkpath, linkpathlen);
 }
+
+# Create a symbolic link at `linkpath` whose TEXT contents are `target` (4-arg, a4 in r10; ext2
+# only). `target` is the link body — it may point at a nonexistent or relative path; the kernel
+# validates it as a 1..4096-byte user buffer and does NOT resolve it. Returns 0 / -1. Unblocks
+# `--agnos` programs (ark `.so → .so.N` install, agnova, kriya `ln -s`). (issue 2026-06-29.)
+fn sys_symlink(target, targetlen, linkpath, linkpathlen): i64 {
+    return syscall(SYS_SYMLINK, target, targetlen, linkpath, linkpathlen);
+}
+
+# ---- agnos HDA audio band (#64-69) — the ring-3 half of the agnos 1.52.x Gate-2
+# freeze (kernel handlers land in parallel). Single frozen format: 48000 Hz / S16 /
+# stereo (4 B/frame), no kernel resample. snd_id slot 0..3; #65-69 reject a slot not
+# owned by the caller (-1). Consumers: vani agnos backend + cyrius-doom.
+# (issue 2026-07-04-agnos-snd-audio-syscall-band-64-69.)
+# snd_open() — grab the single output stream → slot 0..3 / -1 (auto-released on proc-exit).
+fn sys_snd_open(): i64 { return syscall(SYS_SND_OPEN); }
+# snd_config(slot, rate, fmt) — rate MUST=48000, fmt=(bits<<8)|ch MUST=0x1002 → 0 / -1.
+fn sys_snd_config(slot, rate, fmt): i64 { return syscall(SYS_SND_CONFIG, slot, rate, fmt); }
+# snd_write(slot, buf, frames) — blocking; S16 stereo, frames*4 bytes → frames / -1.
+fn sys_snd_write(slot, buf, frames): i64 { return syscall(SYS_SND_WRITE, slot, buf, frames); }
+# snd_write non-blocking — a4=r10 bit0=O_NONBLOCK (5-arg, like sys_symlink); may return 0=WOULD_BLOCK.
+fn sys_snd_write_nb(slot, buf, frames): i64 { return syscall(SYS_SND_WRITE, slot, buf, frames, 1); }
+# snd_close(slot) — release the slot → 0 / -1.
+fn sys_snd_close(slot): i64 { return syscall(SYS_SND_CLOSE, slot); }
+# snd_drain(slot) — block until queued audio plays out (~1s cap) → 0.
+fn sys_snd_drain(slot): i64 { return syscall(SYS_SND_DRAIN, slot); }
+# snd_avail(slot) — non-blocking free-frame count → free frames / -1.
+fn sys_snd_avail(slot): i64 { return syscall(SYS_SND_AVAIL, slot); }
+
+# ---- Process-exec / framebuffer / input / sched band (36–39, 42–44, 62) ----
+# The AGNOS base-system peers — see the SysNrAgnosProc enum + issue
+# 2026-06-30-agnos-syscall-peer-incomplete-8-wrappers.md. ABI rdi/rsi/rdx/r10.
+
+# Copy the unified klug log ring (oldest→newest, dmesg tail) into `buf` (`len` cap).
+fn sys_klug(buf, len): i64 { return syscall(SYS_KLUG, buf, len); }
+
+# Load a static ELF64 at `path` and run it to completion in ring 3; returns its exit code.
+fn sys_execwait(path, pathlen): i64 { return syscall(SYS_EXECWAIT, path, pathlen); }
+
+# Write the 24-byte framebuffer geometry struct into `buf` (`len` cap).
+fn sys_fbinfo(buf, len): i64 { return syscall(SYS_FBINFO, buf, len); }
+
+# Copy a w×h 32bpp block from `src` to the framebuffer at `dstxy` (4-arg, a4=r10).
+fn sys_blit(src, w, h, dstxy): i64 { return syscall(SYS_BLIT, src, w, h, dstxy); }
+
+# Non-blocking drain of raw keyboard scancodes into `buf` (`max` cap); returns the count.
+fn sys_kbscan(buf, max): i64 { return syscall(SYS_KBSCAN, buf, max); }
+
+# Non-blocking from-disk spawn of `path`; scheduled, returns its pid immediately.
+fn sys_spawn_path(path, len): i64 { return syscall(SYS_SPAWN_PATH, path, len); }
+
+# Cooperative yield to the scheduler.
+fn sys_sched_yield(): i64 { return syscall(SYS_SCHED_YIELD); }
+
+# Arm a one-shot fd redirect (`src_fd`→`dst_fd`) consumed by the next execwait/spawn —
+# capture a child's stdout/stderr.
+fn sys_exec_redirect(src_fd, dst_fd): i64 { return syscall(SYS_EXEC_REDIRECT, src_fd, dst_fd); }
 
 # Map `length` bytes (anonymous, zero-filled, 2 MB-granular). Returns
 # the base vaddr, or 0 on failure. lib/alloc.cyr's agnos heap builds on this.

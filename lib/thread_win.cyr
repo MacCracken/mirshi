@@ -35,6 +35,7 @@ include "lib/fnptr.cyr"
 # packed into a struct + passed by address (the 0xF007 reroute reads them).
 fn thread_create(fp, arg): i64 {
     alloc_init();
+    _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before CreateThread
     var a = alloc(48);
     store64(a,      0);    # lpThreadAttributes = NULL
     store64(a + 8,  0);    # dwStackSize = 0 (default)
@@ -57,19 +58,12 @@ fn thread_join(t): i64 {
 # Current thread id — the real Win32 GetCurrentThreadId (0xF00B reroute).
 fn gettid(): i64 { return syscall(61451); }
 
-# Mutex = an 8-byte in-place SRWLOCK cell. mutex_new returns a non-zero pointer
-# (callers null-check); InitializeSRWLock sets it to the SRWLOCK_INIT state.
-fn mutex_new(): i64 {
-    alloc_init();
-    var m = alloc(8);
-    store64(m, 0);
-    syscall(61448, m);   # InitializeSRWLock(&m)
-    return m;
-}
-# Lock — real exclusive SRWLOCK acquire (preemptive-safe, blocks contenders).
-fn mutex_lock(m): i64 { syscall(61449, m); return 0; }    # AcquireSRWLockExclusive
-# Unlock — real exclusive SRWLOCK release (pairs with mutex_lock).
-fn mutex_unlock(m): i64 { syscall(61450, m); return 0; }  # ReleaseSRWLockExclusive
+# Mutex (MUTEX_SIZE + mutex_new/lock/unlock) now comes from lib/sync.cyr →
+# lib/sync_windows.cyr, which is this same in-place SRWLOCK cell (InitializeSRWLock
+# 0xF008 / AcquireSRWLockExclusive 0xF009 / ReleaseSRWLockExclusive 0xF00A). Moved
+# to the single owner in v6.3.44 (issue 2026-07-03-duplicate-mutex-fns-thread-vs-
+# sync-stdlib); thread.cyr includes sync.cyr at its top before routing here. The
+# channel below uses mutex_* unchanged.
 
 # Channel — a thread-safe FIFO ring over the same 56-byte layout as thread.cyr
 # ({buf@0, cap@8, head@16, tail@24, count@32, mutex@40 (inline SRWLOCK), closed@48}).

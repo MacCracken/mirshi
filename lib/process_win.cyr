@@ -291,11 +291,12 @@ fn wait_pid(pid): Result {
     return Ok(ec);
 }
 
-# Windows self-pid (GetCurrentProcessId) is out of this arc's scope —
-# the v6.0.51 arc routes process *creation*. Returns 0 until a consumer
-# needs it; see issue 2026-06-03-windows-pe-syscall-surface.
-fn getpid(): i64 { return 0; }
-# Parent-pid is likewise unavailable on Win32 within this arc's scope.
+# v6.3.44: real Windows self-PID via kernel32!GetCurrentProcessId (syscall 0xF01C
+# PE reroute). Was a 0-returning stub — the v6.0.51 process arc routed process
+# *creation* and left self-PID out of scope (issue 2026-07-03-getpid-cross-platform).
+fn getpid(): i64 { return syscall(0xF01C); }
+# Parent-pid has no cheap Win32 equivalent (would need a CreateToolhelp32Snapshot
+# walk), so getppid stays a documented 0 stub on Windows.
 fn getppid(): i64 { return 0; }
 
 # ================================================================

@@ -39,6 +39,11 @@ fn f64v2_make(lo_bits, hi_bits): f64v2 {
     return v;
 }
 
+# Broadcast one f64 bit-pattern across both lanes: {x, x}.
+fn f64v2_splat(x_bits): f64v2 {
+    return f64v2_make(x_bits, x_bits);
+}
+
 # --- f64v2 pointer-form (universal — all targets) ---
 
 # Extract lo half (pointer form). Parser routes `f64v2_lo(&x)` here.
@@ -124,6 +129,11 @@ fn f64v4_make(b0, b1, b2, b3): f64v4 {
     return v;
 }
 
+# Broadcast one f64 bit-pattern across all four lanes: {x, x, x, x}.
+fn f64v4_splat(x_bits): f64v4 {
+    return f64v4_make(x_bits, x_bits, x_bits, x_bits);
+}
+
 # --- f64v4 pointer-form (universal — all targets) ---
 
 # Lane 0 extractor (pointer form).
@@ -195,6 +205,287 @@ fn f64v4_sqrt_ptr(a_ptr): f64v4 {
     f64v_sqrt(&r, a_ptr, 4);
     return r;
 }
+
+# --- f32v4 (128-bit, 4 f32 lanes) constructor + pointer-form (universal) ---
+# v6.4.3+ (SIMD Phase 1). f32v4 packs 4 f32 in one XMM (16 B), reusing f64v2's
+# 2-slot/pair-return footprint; the packed ops are addps/mulps (x86; aarch64 NEON
+# lands in Phase 5). Consumers pass f32 values as their i32 bit patterns (f32_from).
+
+# Build an f32v4 from four i32 (f32-bit) patterns — 4-byte lanes.
+fn f32v4_make(a, b, c, d): f32v4 {
+    var v: f32v4;
+    store32(&v + 0, a);
+    store32(&v + 4, b);
+    store32(&v + 8, c);
+    store32(&v + 12, d);
+    return v;
+}
+
+# Broadcast one f32 bit-pattern across all four lanes.
+fn f32v4_splat(x_bits): f32v4 {
+    return f32v4_make(x_bits, x_bits, x_bits, x_bits);
+}
+
+# Extract lane 0 (pointer form). Parser routes f32v4_lane0(&v) here.
+fn f32v4_lane0_ptr(p): i64 { return load32(p + 0); }
+# Extract lane 1 (pointer form). Parser routes f32v4_lane1(&v) here.
+fn f32v4_lane1_ptr(p): i64 { return load32(p + 4); }
+# Extract lane 2 (pointer form). Parser routes f32v4_lane2(&v) here.
+fn f32v4_lane2_ptr(p): i64 { return load32(p + 8); }
+# Extract lane 3 (pointer form). Parser routes f32v4_lane3(&v) here.
+fn f32v4_lane3_ptr(p): i64 { return load32(p + 12); }
+
+# Packed f32v4 arithmetic — addps/subps/mulps — is x86-only in SIMD Phase 1
+# (v6.4.4); aarch64 NEON + cx land in Phase 5. On aarch64/cx EMIT_F32V_LOOP is a
+# stub, so these wrappers COMPILE (emit no packed op) but a call produces no
+# result — DO NOT use f32v4 arithmetic on aarch64/cx yet. (The simd_f32v4 tcyr
+# is XFAIL'd in the aarch64-native CI corpus so Phase 5 auto-surfaces via XPASS —
+# see docs/development/issues/2026-07-05-aarch64-f32v4-xfail-phase5.md.)
+# Packed add (pointer form) — addps over the 4 lanes. Routes f32v4_add(&x, &y) here.
+fn f32v4_add_ptr(a_ptr, b_ptr): f32v4 {
+    var r: f32v4;
+    f32v_add(&r, a_ptr, b_ptr, 4);
+    return r;
+}
+
+# Packed sub (pointer form) — subps over the 4 lanes.
+fn f32v4_sub_ptr(a_ptr, b_ptr): f32v4 {
+    var r: f32v4;
+    f32v_sub(&r, a_ptr, b_ptr, 4);
+    return r;
+}
+
+# Packed mul (pointer form) — mulps over the 4 lanes.
+fn f32v4_mul_ptr(a_ptr, b_ptr): f32v4 {
+    var r: f32v4;
+    f32v_mul(&r, a_ptr, b_ptr, 4);
+    return r;
+}
+
+# --- AVX2 runtime capability gate (SIMD Phase 4 R1, v6.4.8) ---
+# f32v8 emits 256-bit AVX2 (vaddps ymm), which is NOT x86-64 baseline — it #UDs on
+# pre-AVX2 CPUs. So the f32v8_* wrappers below pick the AVX2 path only when the CPU
+# advertises it, else fall back to a 2×SSE path (the f32v_ 128-bit ops with n=8, which
+# process 8 lanes as two 128-bit iterations). cycc itself never calls these → it stays
+# pure SSE2 and self-hosts everywhere. Probe = a byte-for-byte clone of sigil's
+# _sha_ni_cpuid_probe (CPUID leaf 7 sub-leaf 0 EBX), testing bit 5 (AVX2) not 29 (SHA).
+# 2 = uncached, 0 = no, 1 = yes. The probe is idempotent (deterministic CPUID + a bit
+# test, no shared self-test scratch) so — unlike sha_ni/aes_ni — no CAS latch is needed:
+# a race just runs CPUID twice and writes the same result.
+var _avx2_cache = 2;
+var _avx2_probe_buf[8];   # 8-byte scratch for the probe's *out (BSS, no alloc dep)
+
+# Write CPUID leaf 7 sub-leaf 0 EBX to *out (x86 only; no-op elsewhere → cache stays 0).
+fn _avx2_cpuid_probe(out): i64 {
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        param_load(rdi, 0);            # out
+        0x53;                          # push rbx (callee-saved; CPUID clobbers it)
+        0xB8; 0x07; 0x00; 0x00; 0x00;  # mov eax, 7   (leaf 7)
+        0x31; 0xC9;                    # xor ecx, ecx (sub-leaf 0)
+        0x0F; 0xA2;                    # cpuid
+        0x48; 0x89; 0x1F;              # mov [rdi], rbx  ; *out = ebx
+        0x5B;                          # pop rbx
+    }
+    #endif
+    return 0;
+}
+
+# 1 if the CPU supports AVX2 (CPUID.7.EBX bit 5), else 0. Cached after first probe.
+fn simd_has_avx2(): i64 {
+    if (_avx2_cache != 2) { return _avx2_cache; }
+    store64(&_avx2_probe_buf, 0);
+    _avx2_cpuid_probe(&_avx2_probe_buf);
+    var ebx = load64(&_avx2_probe_buf);
+    if ((ebx & (1 << 5)) == 0) { _avx2_cache = 0; } else { _avx2_cache = 1; }
+    return _avx2_cache;
+}
+
+# --- f32v8 (256-bit, 8 f32 lanes) constructor + pointer-form (x86 AVX2 / SSE fallback) ---
+# v6.4.8 (SIMD Phase 4 R1). f32v8 packs 8 f32 in one YMM (32 B). Consumers pass f32
+# values as their i32 bit patterns (f32_from). Arithmetic uses AVX2 when available
+# (vaddps ymm) and a 2×SSE fallback otherwise, chosen per-call via simd_has_avx2().
+
+# Build an f32v8 from eight i32 (f32-bit) patterns — 4-byte lanes.
+fn f32v8_make(a, b, c, d, e, f, g, h): f32v8 {
+    var v: f32v8;
+    store32(&v + 0, a);
+    store32(&v + 4, b);
+    store32(&v + 8, c);
+    store32(&v + 12, d);
+    store32(&v + 16, e);
+    store32(&v + 20, f);
+    store32(&v + 24, g);
+    store32(&v + 28, h);
+    return v;
+}
+
+# Broadcast one f32 bit-pattern across all eight lanes.
+fn f32v8_splat(x_bits): f32v8 {
+    return f32v8_make(x_bits, x_bits, x_bits, x_bits, x_bits, x_bits, x_bits, x_bits);
+}
+
+# Extract lane 0 (pointer form).
+fn f32v8_lane0_ptr(p): i64 { return load32(p + 0); }
+# Extract lane 1 (pointer form).
+fn f32v8_lane1_ptr(p): i64 { return load32(p + 4); }
+# Extract lane 2 (pointer form).
+fn f32v8_lane2_ptr(p): i64 { return load32(p + 8); }
+# Extract lane 3 (pointer form).
+fn f32v8_lane3_ptr(p): i64 { return load32(p + 12); }
+# Extract lane 4 (pointer form).
+fn f32v8_lane4_ptr(p): i64 { return load32(p + 16); }
+# Extract lane 5 (pointer form).
+fn f32v8_lane5_ptr(p): i64 { return load32(p + 20); }
+# Extract lane 6 (pointer form).
+fn f32v8_lane6_ptr(p): i64 { return load32(p + 24); }
+# Extract lane 7 (pointer form).
+fn f32v8_lane7_ptr(p): i64 { return load32(p + 28); }
+
+# Packed add (pointer form) — vaddps ymm (AVX2) or 2×SSE addps. Routes f32v8_add(&x, &y).
+fn f32v8_add_ptr(a_ptr, b_ptr): f32v8 {
+    var r: f32v8;
+    if (simd_has_avx2() == 1) { f32v8_add(&r, a_ptr, b_ptr, 8); }
+    else { f32v_add(&r, a_ptr, b_ptr, 8); }
+    return r;
+}
+
+# Packed sub (pointer form) — vsubps ymm (AVX2) or 2×SSE subps.
+fn f32v8_sub_ptr(a_ptr, b_ptr): f32v8 {
+    var r: f32v8;
+    if (simd_has_avx2() == 1) { f32v8_sub(&r, a_ptr, b_ptr, 8); }
+    else { f32v_sub(&r, a_ptr, b_ptr, 8); }
+    return r;
+}
+
+# Packed mul (pointer form) — vmulps ymm (AVX2) or 2×SSE mulps.
+fn f32v8_mul_ptr(a_ptr, b_ptr): f32v8 {
+    var r: f32v8;
+    if (simd_has_avx2() == 1) { f32v8_mul(&r, a_ptr, b_ptr, 8); }
+    else { f32v_mul(&r, a_ptr, b_ptr, 8); }
+    return r;
+}
+
+# --- FMA runtime capability gate (SIMD Phase 4 R2, v6.4.9) ---
+# f32v8_fma emits vfmadd231ps (FMA3), which needs a DIFFERENT CPUID bit than AVX2:
+# leaf 1 ECX bit 12 (FMA), not leaf 7 EBX bit 5 (AVX2). Every shipping AVX2 x86 also has
+# FMA3 (both landed in Haswell), but the ISA bits are distinct, so we probe FMA precisely.
+# Probe = a byte-for-byte clone of sigil's _aes_ni_cpuid_probe (leaf 1 ECX), bit 12 not 25.
+var _fma_cache = 2;       # 2 = uncached, 0 = no, 1 = yes
+var _fma_probe_buf[8];    # 8-byte scratch (BSS, no alloc dep)
+
+# Write CPUID leaf 1 ECX to *out (x86 only; no-op elsewhere → cache stays 0).
+fn _fma_cpuid_probe(out): i64 {
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        param_load(rdi, 0);            # out
+        0x53;                          # push rbx (callee-saved; CPUID clobbers it)
+        0xB8; 0x01; 0x00; 0x00; 0x00;  # mov eax, 1   (leaf 1)
+        0x31; 0xC9;                    # xor ecx, ecx (sub-leaf 0)
+        0x0F; 0xA2;                    # cpuid
+        0x48; 0x89; 0x0F;              # mov [rdi], rcx  ; *out = ecx
+        0x5B;                          # pop rbx
+    }
+    #endif
+    return 0;
+}
+
+# 1 if the CPU supports FMA3 (CPUID.1.ECX bit 12), else 0. Cached after first probe.
+fn simd_has_fma(): i64 {
+    if (_fma_cache != 2) { return _fma_cache; }
+    store64(&_fma_probe_buf, 0);
+    _fma_cpuid_probe(&_fma_probe_buf);
+    var ecx = load64(&_fma_probe_buf);
+    if ((ecx & (1 << 12)) == 0) { _fma_cache = 0; } else { _fma_cache = 1; }
+    return _fma_cache;
+}
+
+# --- f32v8 fused multiply-add + horizontal dot (SIMD Phase 4 R2, v6.4.9) ---
+# Fused multiply-add (pointer form): dst[i] = a[i]*b[i] + c[i] over 8 lanes. AVX2+FMA
+# (vfmadd231ps ymm, SINGLE rounding) when available, else the SSE f32v_fmadd (mulps+addps,
+# TWO roundings). The two paths can differ by 1 ULP for non-exact products — callers
+# needing bit-equality across CPUs should use exact-product inputs.
+fn f32v8_fma_ptr(a_ptr, b_ptr, c_ptr): f32v8 {
+    var r: f32v8;
+    if (simd_has_fma() == 1) { f32v8_fma(&r, a_ptr, b_ptr, c_ptr, 8); }
+    else { f32v_fmadd(&r, a_ptr, b_ptr, c_ptr, 8); }
+    return r;
+}
+
+# Horizontal dot (pointer form): sum(a[i]*b[i]) over 8 lanes → f32 bit pattern. AVX2
+# (vmulps/vaddps accumulate + vextractf128 8-lane reduce) when available, else SSE f32v_dot.
+fn f32v8_dot_ptr(a_ptr, b_ptr): i64 {
+    if (simd_has_avx2() == 1) { return f32v8_dot(a_ptr, b_ptr, 8); }
+    return f32v_dot(a_ptr, b_ptr, 8);
+}
+
+# v6.4.5 (SIMD Phase 2) — fused multiply-add (pointer form): dst = a*b + c over
+# the 4 lanes. Routes f32v4_fmadd(&x, &y, &z) here. The matmul inner-loop verb.
+fn f32v4_fmadd_ptr(a_ptr, b_ptr, c_ptr): f32v4 {
+    var r: f32v4;
+    f32v_fmadd(&r, a_ptr, b_ptr, c_ptr, 4);
+    return r;
+}
+
+# v6.4.5 (SIMD Phase 2) — horizontal dot (pointer form): returns the f32 bit
+# pattern of sum(a[i]*b[i]) over the 4 lanes (use f32_to to get the value).
+fn f32v4_dot_ptr(a_ptr, b_ptr): i64 {
+    return f32v_dot(a_ptr, b_ptr, 4);
+}
+
+# --- Integer vector types (128-bit) — SIMD Phase 3a (v6.4.6), pointer form ---
+# i32v4 (4×i32), i16v8 (8×i16), i8v16 (16×i8), i64v2 (2×i64). Construct + packed
+# add/sub/mul via the descriptor-driven iv_* builtins (last arg = lane byte-width).
+# add/sub are two's-complement (signed==unsigned); mul is i16/i32 only. Values are
+# plain i64s truncated to the lane width. x86-only until Phase 5 (aarch64/cx stub).
+
+# Build an i32v4 from four i32 values.
+fn i32v4_make(a, b, c, d): i32v4 {
+    var v: i32v4;
+    store32(&v + 0, a); store32(&v + 4, b); store32(&v + 8, c); store32(&v + 12, d);
+    return v;
+}
+# Broadcast one i32 across all four lanes.
+fn i32v4_splat(x): i32v4 { return i32v4_make(x, x, x, x); }
+# Extract lane 0 (pointer form). Routes i32v4_lane0(&v) here.
+fn i32v4_lane0_ptr(p): i64 { return load32(p + 0); }
+# Extract lane 1 (pointer form).
+fn i32v4_lane1_ptr(p): i64 { return load32(p + 4); }
+# Extract lane 2 (pointer form).
+fn i32v4_lane2_ptr(p): i64 { return load32(p + 8); }
+# Extract lane 3 (pointer form).
+fn i32v4_lane3_ptr(p): i64 { return load32(p + 12); }
+# Packed add (pointer form) — paddd over the 4 lanes.
+fn i32v4_add_ptr(a_ptr, b_ptr): i32v4 { var r: i32v4; iv_add(&r, a_ptr, b_ptr, 4, 4); return r; }
+# Packed sub (pointer form) — psubd.
+fn i32v4_sub_ptr(a_ptr, b_ptr): i32v4 { var r: i32v4; iv_sub(&r, a_ptr, b_ptr, 4, 4); return r; }
+# Packed mul (pointer form) — pmulld (low 32 bits).
+fn i32v4_mul_ptr(a_ptr, b_ptr): i32v4 { var r: i32v4; iv_mul(&r, a_ptr, b_ptr, 4, 4); return r; }
+
+# Broadcast one i16 across all eight lanes.
+fn i16v8_splat(x): i16v8 { var v: i16v8; var i = 0; while (i < 8) { store16(&v + i * 2, x); i = i + 1; } return v; }
+# Packed add (pointer form) — paddw over the 8 lanes.
+fn i16v8_add_ptr(a_ptr, b_ptr): i16v8 { var r: i16v8; iv_add(&r, a_ptr, b_ptr, 8, 2); return r; }
+# Packed sub (pointer form) — psubw.
+fn i16v8_sub_ptr(a_ptr, b_ptr): i16v8 { var r: i16v8; iv_sub(&r, a_ptr, b_ptr, 8, 2); return r; }
+# Packed mul (pointer form) — pmullw (low 16 bits).
+fn i16v8_mul_ptr(a_ptr, b_ptr): i16v8 { var r: i16v8; iv_mul(&r, a_ptr, b_ptr, 8, 2); return r; }
+
+# Broadcast one i8 across all sixteen lanes.
+fn i8v16_splat(x): i8v16 { var v: i8v16; var i = 0; while (i < 16) { store8(&v + i, x); i = i + 1; } return v; }
+# Packed add (pointer form) — paddb over the 16 lanes.
+fn i8v16_add_ptr(a_ptr, b_ptr): i8v16 { var r: i8v16; iv_add(&r, a_ptr, b_ptr, 16, 1); return r; }
+# Packed sub (pointer form) — psubb.
+fn i8v16_sub_ptr(a_ptr, b_ptr): i8v16 { var r: i8v16; iv_sub(&r, a_ptr, b_ptr, 16, 1); return r; }
+
+# Build an i64v2 from two i64 values.
+fn i64v2_make(a, b): i64v2 { var v: i64v2; store64(&v + 0, a); store64(&v + 8, b); return v; }
+# Broadcast one i64 across both lanes.
+fn i64v2_splat(x): i64v2 { return i64v2_make(x, x); }
+# Packed add (pointer form) — paddq over the 2 lanes.
+fn i64v2_add_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_add(&r, a_ptr, b_ptr, 2, 8); return r; }
+# Packed sub (pointer form) — psubq.
+fn i64v2_sub_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_sub(&r, a_ptr, b_ptr, 2, 8); return r; }
 
 # --- Value-form typed wrappers (non-PE targets only) ---
 # Gated on CYRIUS_HAS_VAL_SIMD_PARAMS, predefined by every main_*.cyr
@@ -350,4 +641,82 @@ fn f64v4_sqrt(a: f64v4): f64v4 {
     return r;
 }
 
+# --- f32v4 value-form (non-PE) — v6.4.3+ SIMD Phase 1 ---
+
+# Extract lane 0 (value form). Parser routes f32v4_lane0(v) here; &v → _ptr sibling.
+fn f32v4_lane0(v: f32v4): i64 { return load32(&v + 0); }
+
+# Extract lane 1 (value form).
+fn f32v4_lane1(v: f32v4): i64 { return load32(&v + 4); }
+
+# Extract lane 2 (value form).
+fn f32v4_lane2(v: f32v4): i64 { return load32(&v + 8); }
+
+# Extract lane 3 (value form).
+fn f32v4_lane3(v: f32v4): i64 { return load32(&v + 12); }
+
+# Packed add (value form) — addps over the 4 lanes.
+fn f32v4_add(a: f32v4, b: f32v4): f32v4 {
+    var r: f32v4;
+    f32v_add(&r, &a, &b, 4);
+    return r;
+}
+
+# Packed sub (value form) — subps over the 4 lanes.
+fn f32v4_sub(a: f32v4, b: f32v4): f32v4 {
+    var r: f32v4;
+    f32v_sub(&r, &a, &b, 4);
+    return r;
+}
+
+# Packed mul (value form) — mulps over the 4 lanes.
+fn f32v4_mul(a: f32v4, b: f32v4): f32v4 {
+    var r: f32v4;
+    f32v_mul(&r, &a, &b, 4);
+    return r;
+}
+
+# v6.4.5 (SIMD Phase 2) — fused multiply-add (value form): r = a*b + c per lane.
+fn f32v4_fmadd(a: f32v4, b: f32v4, c: f32v4): f32v4 {
+    var r: f32v4;
+    f32v_fmadd(&r, &a, &b, &c, 4);
+    return r;
+}
+
+# v6.4.5 (SIMD Phase 2) — horizontal dot (value form): f32 bits of sum(a[i]*b[i]).
+fn f32v4_dot(a: f32v4, b: f32v4): i64 {
+    return f32v_dot(&a, &b, 4);
+}
+
+# --- Integer vector value-form ops (SIMD Phase 3b, v6.4.7) ---
+# The value-form param-mask redesign (class 1 = any 16-byte vector) lets integer
+# 128-bit types route through XMM as full 16 bytes, so these value-form typed ops work.
+# Extract i32v4 lane 0 (value form). Routes i32v4_lane0(v); &v → _ptr sibling.
+fn i32v4_lane0(v: i32v4): i64 { return load32(&v + 0); }
+# Extract i32v4 lane 1 (value form).
+fn i32v4_lane1(v: i32v4): i64 { return load32(&v + 4); }
+# Extract i32v4 lane 2 (value form).
+fn i32v4_lane2(v: i32v4): i64 { return load32(&v + 8); }
+# Extract i32v4 lane 3 (value form).
+fn i32v4_lane3(v: i32v4): i64 { return load32(&v + 12); }
+# Packed i32 add (value form): r[i] = a[i] + b[i].
+fn i32v4_add(a: i32v4, b: i32v4): i32v4 { var r: i32v4; iv_add(&r, &a, &b, 4, 4); return r; }
+# Packed i32 sub (value form).
+fn i32v4_sub(a: i32v4, b: i32v4): i32v4 { var r: i32v4; iv_sub(&r, &a, &b, 4, 4); return r; }
+# Packed i32 mul (value form, low 32 bits).
+fn i32v4_mul(a: i32v4, b: i32v4): i32v4 { var r: i32v4; iv_mul(&r, &a, &b, 4, 4); return r; }
+# Packed i16 add (value form).
+fn i16v8_add(a: i16v8, b: i16v8): i16v8 { var r: i16v8; iv_add(&r, &a, &b, 8, 2); return r; }
+# Packed i16 sub (value form).
+fn i16v8_sub(a: i16v8, b: i16v8): i16v8 { var r: i16v8; iv_sub(&r, &a, &b, 8, 2); return r; }
+# Packed i16 mul (value form, low 16 bits).
+fn i16v8_mul(a: i16v8, b: i16v8): i16v8 { var r: i16v8; iv_mul(&r, &a, &b, 8, 2); return r; }
+# Packed i8 add (value form).
+fn i8v16_add(a: i8v16, b: i8v16): i8v16 { var r: i8v16; iv_add(&r, &a, &b, 16, 1); return r; }
+# Packed i8 sub (value form).
+fn i8v16_sub(a: i8v16, b: i8v16): i8v16 { var r: i8v16; iv_sub(&r, &a, &b, 16, 1); return r; }
+# Packed i64 add (value form).
+fn i64v2_add(a: i64v2, b: i64v2): i64v2 { var r: i64v2; iv_add(&r, &a, &b, 2, 8); return r; }
+# Packed i64 sub (value form).
+fn i64v2_sub(a: i64v2, b: i64v2): i64v2 { var r: i64v2; iv_sub(&r, &a, &b, 2, 8); return r; }
 #endif

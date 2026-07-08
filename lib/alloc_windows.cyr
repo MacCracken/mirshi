@@ -92,6 +92,13 @@ fn alloc(size) {
 # concurrent alloc() can't observe a half-updated bump pointer.
 fn alloc_reset() {
     _alloc_lock_acquire();
+    # Scrub the reclaimed span before rewinding so a later alloc() can't read
+    # the prior occupant's bytes (memory-reuse info-leak, CVE-2026-34988 class;
+    # v6.4.1). One fixed VirtualAlloc reservation here, so [_heap_base,
+    # _heap_ptr) is the exact written extent. _alloc_zero is the un-gated helper
+    # in lib/alloc.cyr.
+    var span = _heap_ptr - _heap_base;
+    if (span > 0) { _alloc_zero(_heap_base, span); }
     _heap_ptr = _heap_base;
     _alloc_lock_release();
     return 0;

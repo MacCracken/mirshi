@@ -77,15 +77,15 @@ fn ws_server_state(ws): i64 { return load64(ws + 8); }
 # Protocols + Sec-WebSocket-Accept, return upgraded ws handle. On failure
 # (not a valid WS upgrade): return 0 — caller should respond 400.
 fn ws_server_handshake(cfd, req_buf, req_len): i64 {
-    var upgrade = http_find_header(req_buf, req_len, "Upgrade");
-    var conn    = http_find_header(req_buf, req_len, "Connection");
-    var version = http_find_header(req_buf, req_len, "Sec-WebSocket-Version");
-    var key     = http_find_header(req_buf, req_len, "Sec-WebSocket-Key");
+    var upgrade = sandhi_server_find_header(req_buf, req_len, "Upgrade");
+    var conn    = sandhi_server_find_header(req_buf, req_len, "Connection");
+    var version = sandhi_server_find_header(req_buf, req_len, "Sec-WebSocket-Version");
+    var key     = sandhi_server_find_header(req_buf, req_len, "Sec-WebSocket-Key");
 
     if (upgrade == 0 || conn == 0 || version == 0 || key == 0) { return 0; }
     if (streq(version, "13") == 0) { return 0; }
     # Upgrade header may be "websocket" (case-insensitive); accept the common form.
-    # http_find_header preserves case. Tolerate "websocket" / "WebSocket".
+    # sandhi_server_find_header preserves case. Tolerate "websocket" / "WebSocket".
     if (streq(upgrade, "websocket") == 0 && streq(upgrade, "WebSocket") == 0) {
         return 0;
     }

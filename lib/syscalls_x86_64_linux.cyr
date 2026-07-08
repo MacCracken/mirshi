@@ -10,7 +10,7 @@
 # `arch/x86/include/uapi/asm/stat.h` values.
 #
 # Cyrius re-implementation of agnosys syscall bindings.
-# Constants use enums to avoid gvar_toks overflow (64 slot limit).
+# Constants use enums to avoid gvar_toks overflow (4096 slot limit).
 
 # ================================================================
 # Syscall numbers (x86_64)
@@ -488,7 +488,7 @@ fn timerspec_new(interval_sec, initial_sec): i64 {
 
 # timerfd_drain syscall wrapper.
 fn timerfd_drain(fd): i64 {
-    var buf[1];
+    var buf[8];
     var n = sys_read(fd, &buf, 8);
     if (n == 8) { return load64(&buf); }
     return 0;
