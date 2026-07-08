@@ -72,7 +72,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
 | 42 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
-| 43 | spawn_path | EMULATE | — | **exec band:** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) |
+| 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) |
 | 44 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |

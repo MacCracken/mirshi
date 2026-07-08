@@ -20,7 +20,7 @@ each agnos syscall either (a) **executes** in the child (renumber + arg-translat
 are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
 studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
 
-## Shipped (v0.1.0 → v1.10.0)
+## Shipped (v0.1.0 → v1.10.1)
 
 The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
 multi-process, signals, I/O multiplexing, the info-getter long-tail, and tty sizing are **done** —

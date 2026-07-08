@@ -4,6 +4,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.1] — 2026-07-07
+
+Continues the exec-band re-sync opened in 1.10.0, on the latest toolchain.
+
 ### Added
 - **`spawn_path#43` — EMULATE at the loop level** (`_do_spawn_path`, `src/intercept.cyr`). agnos's
   NON-blocking from-disk spawn — the cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`,
