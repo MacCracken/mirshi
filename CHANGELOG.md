@@ -4,6 +4,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-07-07
+
+Ships two things together — the argv-forwarding fix that was staged but never released (1.9.0 is the last
+tag), and the first **exec-band re-sync** to agnos's grown userland ABI.
+
 **exec band — `execwait#37` (agnsh's `run`).** agnos grew a ring-3 blocking-exec primitive past mirshi's
 frozen 0–61 surface: `execwait#37` loads a static ELF from a **path** and runs it **to completion**,
 returning its exit code — the syscall agnsh binds for `run /bin/x`. It sat in mirshi's `#36–39` gap and
@@ -29,7 +34,7 @@ the current agnos userland ABI.
 _Next in the exec-band re-sync: `spawn_path#43` (the stdlib `exec_*` path — `_agnos_spawn_path` +
 `waitpid`), `exec_redirect#62` (agnsh `>` / pipes), `symlink#63`._
 
-## [1.10.0] — 2026-07-02
+---
 
 **argv forwarding — the root child gets its command line.** Before this, mirshi ran the target agnos ELF
 with a hard-coded `argv = [path, NULL]` — **every argument past the ELF path was silently dropped**. Any
