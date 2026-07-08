@@ -56,10 +56,10 @@ fn decode_arg(regs, i): i64 {
 }
 
 # ----------------------------------------------------------------------------
-# agnos syscall number -> short name. Covers every number defined in
-# lib/syscalls_x86_64_agnos.cyr (0-35, 40-41, 45-61); every other number
-# (incl. the agnos-but-unmirrored 36-39/42-44 and anything > 61) decodes to
-# "unknown" — the M0 contract for an out-of-surface number.
+# agnos syscall number -> short name. Covers every number the M1/M2 surface
+# handles (0-35, 40-41, 45-61, 70); every other number (incl. the
+# agnos-but-unmirrored 36-39/42-44 and anything else) decodes to "unknown" —
+# the M0 contract for an out-of-surface number.
 # ----------------------------------------------------------------------------
 fn agnos_nr_name(nr): cstring {
     if (nr == 0) { return "exit"; }
@@ -117,6 +117,7 @@ fn agnos_nr_name(nr): cstring {
     if (nr == 59) { return "flock"; }
     if (nr == 60) { return "winsize"; }
     if (nr == 61) { return "net_config"; }
+    if (nr == 70) { return "readlink"; }
     return "unknown";
 }
 
@@ -178,6 +179,7 @@ fn agnos_argc(nr): i64 {
     if (nr == 59) { return 2; }   # flock(fd, op)
     if (nr == 60) { return 0; }   # winsize()
     if (nr == 61) { return 1; }   # net_config(field)
+    if (nr == 70) { return 4; }   # readlink(path, pathlen, buf, buflen)  -- a4=r10
     return 0;
 }
 
@@ -210,6 +212,7 @@ fn agnos_ptrmask(nr): i64 {
     if (nr == 49) { return 2; }   # sock_recv: buf (arg1)
     if (nr == 52) { return 4; }   # udp_send: buf (arg2)
     if (nr == 53) { return 10; }  # udp_recv: buf (arg1) + addr_out (arg3)
+    if (nr == 70) { return 5; }   # readlink: path (arg0) + buf (arg2)
     return 0;
 }
 

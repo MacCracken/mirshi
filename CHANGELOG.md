@@ -4,6 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-07-08
+
+### Added
+- **`kbscan#42` — full-screen keyboard input for agnos TUIs** (`src/dispatch.cyr`).
+  The real agnos kernel's `kbscan#42` is a non-blocking drain of the raw Set-1
+  scancode ring (make + break, `0xE0` extended prefixes) — the per-key channel a
+  full-screen editor (cyim ≥ 1.8.0) polls instead of the line-cooked `read#5`. A
+  headless mirshi has no keyboard, so it SYNTHESIZES that scancode stream from its
+  own stdin: on the first `kbscan`, arm the controlling terminal raw + non-blocking
+  (lazily — a pure line program like agnsh, which never calls `kbscan`, keeps
+  cooked `read#5`; restored at exit), read whatever bytes are available, and
+  reverse-map each to the Set-1 sequence a real keyboard emits — make+break,
+  wrapped in Shift make/break for shifted glyphs, `0xE0`-prefixed for the arrows
+  (`ESC[A/B/C/D`). This is the exact inverse of the consumer's scancode→byte
+  decode, so the round-trip is the identity (the typed byte reaches the editor).
+  On a non-tty stdin (`printf keys | mirshi ./cyim`) `TCGETS` fails; mirshi just
+  sets `O_NONBLOCK` and maps the piped bytes, so automated tests need no terminal.
+  Scancodes are written straight into the child buffer via `pvm_write`; the count
+  is the return (0 = no keys). Proven end-to-end: cyim full-screen under mirshi —
+  `i`/insert/`ESC`/`:wq` inserts text (incl. Shift-uppercase) and saves; `read#5`
+  line programs (cyim `--line`) unaffected.
+- **`readlink#70` — EXECUTE-in-child** (`src/dispatch.cyr` → Linux `readlink(89)`, or
+  `readlinkat(267)` under `--root`). The symlink-INTROSPECTION peer of `symlink#63`: agnos
+  `readlink(path, pathlen, buf, buflen)` stages the path (NUL-terminated, red zone), drops the
+  pathlen, and points the Linux call at the child's `buf` — the kernel writes the target text
+  straight into child memory, so there is NO exit repack (the exit stop's `linux_ret_to_agnos`
+  maps the byte count / `-errno` → `-1`, incl. EINVAL "not a symlink" → agnos's `-1`-on-any-error).
+  readlink is inherently no-follow on the final component, matching agnos #70. Under `--root`,
+  `_cf_readlink` sanitizes the path to a root-relative form and anchors `readlinkat` at `ROOTFD`
+  (same shape as `_cf_stat` → `newfstatat`), so no path string reaches the kernel unconfined. The
+  child seccomp allowlist gained **89** (readlink) + **267** (readlinkat) — new Linux syscalls
+  mirshi now emits. Decode tables (`agnos_nr_name`/`agnos_argc`/`agnos_ptrmask` for #70) + the
+  agnos→Linux map (`agnos_to_linux_nr` 70→89) updated. Behavioral smoke `docker/tools/rltest.cyr`
+  (create `./rl_link` via #63, read its target back via #70, byte-check `hello/world.txt`; the
+  confined `--root` variant proven against a pre-seeded rootfs link — reads the link text without
+  escaping). Freeze suite green (295/0).
+
 ## [1.10.2] — 2026-07-07
 
 Completes the exec-band re-sync (execwait#37 in 1.10.0, spawn_path#43 in 1.10.1).

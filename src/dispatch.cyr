@@ -63,6 +63,8 @@ enum MirshiConfine {
     SYS_UNLINKAT = 263;         # unlink#30/rmdir#10 -> unlinkat(ROOTFD, rel, flag)
     SYS_RENAMEAT2 = 316;        # rename#31 -> renameat2(ROOTFD, oldrel, ROOTFD, newrel, 0)
     SYS_LINKAT = 265;           # link#32   -> linkat(ROOTFD, oldrel, ROOTFD, newrel, 0)
+    SYS_READLINK = 89;          # readlink#70 (unconfined) -> readlink(path, buf, bufsize)
+    SYS_READLINKAT = 267;       # readlink#70 (--root)     -> readlinkat(ROOTFD, rel, buf, bufsize)
     AT_REMOVEDIR = 0x200;       # unlinkat flag for rmdir (remove a directory, not a file)
     SYS_PIPE2 = 293;            # v1.7.0 pipe#25 -> pipe2(int fds[2], flags) run IN the child
     O_CLOEXEC = 0x80000;        # pipe2 flag: the fds don't survive a later execveat (spawn#3 hygiene)
@@ -205,6 +207,25 @@ fn _cf_stat(pid, regs): i64 {
     store64(regs + REG_RDX, _m2_scratch);     # statbuf
     store64(regs + REG_R10, 0);               # flags (0: follow symlinks, like stat)
     store64(regs + REG_ORIG_RAX, SYS_NEWFSTATAT);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# Confined readlink#70 -> readlinkat(ROOTFD, rel, buf, bufsize). Like _cf_stat, the path
+# is sanitized to a root-relative form + anchored at ROOTFD; unlike it there is NO exit
+# repack — the kernel writes the link target straight into the child's buf (arg2), and the
+# exit stop's linux_ret_to_agnos maps the byte count / -errno -> -1. readlinkat does NOT
+# follow the final component (that is the point), matching agnos readlink#70. buflen (arg3
+# = agnos a4=r10) rides r10 as readlinkat's 4th arg.
+fn _cf_readlink(pid, regs): i64 {
+    var sc = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                               load64(regs + REG_RSP) - RED_ZONE);
+    if (sc < 0) { return _m2_fail(pid, regs); }
+    store64(regs + REG_RDI, ROOTFD);
+    store64(regs + REG_RSI, sc);                    # sanitized relative path
+    store64(regs + REG_RDX, decode_arg(regs, 2));   # buf (child ptr — kernel writes here)
+    store64(regs + REG_R10, decode_arg(regs, 3));   # bufsize (agnos a4)
+    store64(regs + REG_ORIG_RAX, SYS_READLINKAT);
     pt(PTRACE_SETREGS, pid, 0, regs);
     return STRAT_EXECUTE;
 }
@@ -1404,11 +1425,195 @@ fn _do_winsize(pid, regs): i64 {
     return _net_emu(pid, regs, ((cols & 0xFFFF) << 16) | (rows & 0xFFFF));
 }
 
+# ============================================================================
+# kbscan#42 emulation — full-screen keyboard input for agnos TUIs (e.g. cyim).
+#
+# The real agnos kernel's kbscan#42 is a non-blocking drain of the raw Set-1
+# scancode ring (make + break, 0xE0 extended prefixes). A headless mirshi has no
+# keyboard hardware, so it synthesizes that scancode stream from its OWN stdin:
+# put the controlling terminal in raw + non-blocking mode (lazily, on first
+# kbscan), read whatever bytes are available, and reverse-map each byte to the
+# Set-1 scancode sequence a real keyboard would emit — make+break, wrapped in
+# shift make/break for shifted glyphs, 0xE0-prefixed for the arrows. cyim's own
+# scancode->byte translation (src/agnos_kbd.cyr) is the exact inverse, so the
+# round-trip is the identity: the byte the user typed reaches the editor.
+#
+# read#5 stays line-cooked because raw mode is armed ONLY once a program calls
+# kbscan — a pure line program (agnsh) never trips it. On a non-tty stdin (a
+# pipe: `printf keys | mirshi ./cyim`) TCGETS fails; mirshi just sets O_NONBLOCK
+# and maps the piped bytes, so automated tests work without a terminal.
+enum MirshiKbscan {
+    SYS_READ0 = 0;              # Linux read(2) (agnos read#5 also maps here)
+    SYS_FCNTL_KB = 72;          # Linux fcntl(2) — O_NONBLOCK on stdin
+    TCGETS_KB = 0x5401;         # ioctl: get termios
+    TCSETS_KB = 0x5402;         # ioctl: set termios
+    KB_F_GETFL = 3;
+    KB_F_SETFL = 4;
+    KB_O_NONBLOCK = 0x800;
+}
+var _kb_raw_state = 0;         # 0 = uninit, 1 = raw armed on a tty, 2 = non-tty (pipe)
+var _kb_saved_tio = 0;         # heap: original termios, restored at mirshi exit
+var _kb_rev = 0;               # heap[128]: ASCII byte -> Set-1 scancode (0 = none)
+var _kb_rev_shift = 0;         # heap[128]: 1 if the byte needs a Shift wrap
+var _kb_in = 0;                # heap[256]: host stdin read scratch
+var _kb_scb = 0;               # heap[1024]: synthesized scancode scratch
+
+# Arm raw + non-blocking on stdin the first time a TUI polls kbscan. Idempotent.
+fn _kbscan_setup() {
+    if (_kb_raw_state != 0) { return 0; }
+    _kb_saved_tio = alloc(64);
+    if (syscall(SYS_IOCTL, 0, TCGETS_KB, _kb_saved_tio) == 0) {
+        var raw = alloc(64);
+        var j = 0;
+        while (j < 60) { store8(raw + j, load8(_kb_saved_tio + j)); j = j + 1; }
+        store32(raw + 12, load32(raw + 12) & ~11);     # c_lflag: clear ICANON(2)|ECHO(8)|ISIG(1)
+        store32(raw + 0,  load32(raw + 0)  & ~1330);   # c_iflag: clear IXON|ICRNL|BRKINT|INPCK|ISTRIP
+        store8(raw + 23, 0);   # c_cc[VMIN]  = 0 (non-blocking)
+        store8(raw + 22, 0);   # c_cc[VTIME] = 0
+        syscall(SYS_IOCTL, 0, TCSETS_KB, raw);
+        _kb_raw_state = 1;
+    } else {
+        _kb_raw_state = 2;     # not a tty (pipe/redirect) — no termios to set
+    }
+    var fl = syscall(SYS_FCNTL_KB, 0, KB_F_GETFL, 0);
+    if (fl < 0) { fl = 0; }
+    syscall(SYS_FCNTL_KB, 0, KB_F_SETFL, fl | KB_O_NONBLOCK);
+    return 0;
+}
+
+# Restore the terminal on mirshi exit (called from main). No-op if never armed.
+fn _kbscan_restore_termios(): i64 {
+    if (_kb_raw_state == 1) {
+        if (_kb_saved_tio != 0) { syscall(SYS_IOCTL, 0, TCSETS_KB, _kb_saved_tio); }
+        _kb_raw_state = 0;
+    }
+    return 0;
+}
+
+# One reverse-map row: unshifted glyph `nch` and shifted glyph `sch` both map to
+# Set-1 scancode `sc`; `sch` additionally needs a Shift wrap.
+fn _kbr(sc, nch, sch) {
+    store8(_kb_rev + nch, sc);
+    store8(_kb_rev + sch, sc);
+    store8(_kb_rev_shift + sch, 1);
+    return 0;
+}
+
+# Build the ASCII->scancode reverse tables once (inverse of cyim's forward map).
+fn _kb_rev_init() {
+    if (_kb_rev != 0) { return 0; }
+    _kb_rev = alloc(128);
+    _kb_rev_shift = alloc(128);
+    var i = 0;
+    while (i < 128) { store8(_kb_rev + i, 0); store8(_kb_rev_shift + i, 0); i = i + 1; }
+    _kbr(0x02, 49, 33);  _kbr(0x03, 50, 64);  _kbr(0x04, 51, 35);
+    _kbr(0x05, 52, 36);  _kbr(0x06, 53, 37);  _kbr(0x07, 54, 94);
+    _kbr(0x08, 55, 38);  _kbr(0x09, 56, 42);  _kbr(0x0A, 57, 40);
+    _kbr(0x0B, 48, 41);  _kbr(0x0C, 45, 95);  _kbr(0x0D, 61, 43);
+    _kbr(0x10, 113, 81); _kbr(0x11, 119, 87); _kbr(0x12, 101, 69);
+    _kbr(0x13, 114, 82); _kbr(0x14, 116, 84); _kbr(0x15, 121, 89);
+    _kbr(0x16, 117, 85); _kbr(0x17, 105, 73); _kbr(0x18, 111, 79);
+    _kbr(0x19, 112, 80); _kbr(0x1A, 91, 123); _kbr(0x1B, 93, 125);
+    _kbr(0x1E, 97, 65);  _kbr(0x1F, 115, 83); _kbr(0x20, 100, 68);
+    _kbr(0x21, 102, 70); _kbr(0x22, 103, 71); _kbr(0x23, 104, 72);
+    _kbr(0x24, 106, 74); _kbr(0x25, 107, 75); _kbr(0x26, 108, 76);
+    _kbr(0x27, 59, 58);  _kbr(0x28, 39, 34);  _kbr(0x29, 96, 126);
+    _kbr(0x2B, 92, 124);
+    _kbr(0x2C, 122, 90); _kbr(0x2D, 120, 88); _kbr(0x2E, 99, 67);
+    _kbr(0x2F, 118, 86); _kbr(0x30, 98, 66);  _kbr(0x31, 110, 78);
+    _kbr(0x32, 109, 77); _kbr(0x33, 44, 60);  _kbr(0x34, 46, 62);
+    _kbr(0x35, 47, 63);
+    store8(_kb_rev + 32, 0x39);   # space (no shift)
+    return 0;
+}
+
+# Append scancode byte `b` if it fits; returns the new position.
+fn _kb_push(scb, pos, max, b) {
+    if (pos < max) { store8(scb + pos, b); return pos + 1; }
+    return pos;
+}
+
+# Emit the make+break scancode sequence for one ASCII byte into `scb`. Whole
+# sequences only (so a truncation never strands a Shift down); returns new pos.
+fn _kb_emit_char(ch, scb, pos, max) {
+    if (ch == 10 || ch == 13) { pos = _kb_push(scb, pos, max, 0x1C); return _kb_push(scb, pos, max, 0x9C); }
+    if (ch == 127 || ch == 8) { pos = _kb_push(scb, pos, max, 0x0E); return _kb_push(scb, pos, max, 0x8E); }
+    if (ch == 9)              { pos = _kb_push(scb, pos, max, 0x0F); return _kb_push(scb, pos, max, 0x8F); }
+    if (ch >= 128) { return pos; }
+    var sc = load8(_kb_rev + ch) & 0xFF;
+    if (sc == 0) { return pos; }
+    if ((load8(_kb_rev_shift + ch) & 0xFF) == 1) {
+        if (pos + 4 > max) { return pos; }
+        pos = _kb_push(scb, pos, max, 0x2A);          # left Shift make
+        pos = _kb_push(scb, pos, max, sc);
+        pos = _kb_push(scb, pos, max, sc | 0x80);
+        return _kb_push(scb, pos, max, 0xAA);         # left Shift break
+    }
+    if (pos + 2 > max) { return pos; }
+    pos = _kb_push(scb, pos, max, sc);
+    return _kb_push(scb, pos, max, sc | 0x80);
+}
+
+# kbscan#42(buf, max) -> count. Read host stdin (non-blocking), synthesize Set-1
+# scancodes, write them into the child buffer, return the count (0 = no keys).
+fn _do_kbscan(pid, regs): i64 {
+    var buf = decode_arg(regs, 0);
+    var max = decode_arg(regs, 1);
+    if (max <= 0) { return _net_emu(pid, regs, 0); }
+    if (max > 1024) { max = 1024; }
+    _kbscan_setup();
+    _kb_rev_init();
+    if (_kb_in == 0)  { _kb_in = alloc(256); }
+    if (_kb_scb == 0) { _kb_scb = alloc(1024); }
+    var got = syscall(SYS_READ0, 0, _kb_in, 256);      # non-blocking; -EAGAIN -> <=0
+    if (got <= 0) { return _net_emu(pid, regs, 0); }
+    var outn = 0;
+    var ci = 0;
+    while (ci < got) {
+        var ch = load8(_kb_in + ci) & 0xFF;
+        var consumed = 1;
+        if (ch == 0x1B) {
+            # ESC — arrow CSI (ESC [ A/B/C/D) or a lone Escape key.
+            var asc = 0;
+            if (ci + 2 < got) {
+                if ((load8(_kb_in + ci + 1) & 0xFF) == 0x5B) {
+                    var fin = load8(_kb_in + ci + 2) & 0xFF;
+                    if (fin == 65) { asc = 0x48; }    # up
+                    if (fin == 66) { asc = 0x50; }    # down
+                    if (fin == 67) { asc = 0x4D; }    # right
+                    if (fin == 68) { asc = 0x4B; }    # left
+                }
+            }
+            if (asc != 0) {
+                if (outn + 4 <= max) {
+                    outn = _kb_push(_kb_scb, outn, max, 0xE0);
+                    outn = _kb_push(_kb_scb, outn, max, asc);
+                    outn = _kb_push(_kb_scb, outn, max, 0xE0);
+                    outn = _kb_push(_kb_scb, outn, max, asc | 0x80);
+                }
+                consumed = 3;
+            } else {
+                outn = _kb_push(_kb_scb, outn, max, 0x01);
+                outn = _kb_push(_kb_scb, outn, max, 0x81);
+            }
+        } else {
+            outn = _kb_emit_char(ch, _kb_scb, outn, max);
+        }
+        ci = ci + consumed;
+    }
+    if (outn <= 0) { return _net_emu(pid, regs, 0); }
+    if (pvm_write(pid, buf, _kb_scb, outn) != outn) { return _net_emu(pid, regs, 0); }
+    return _net_emu(pid, regs, outn);
+}
+
 # Classify + prepare the trapped syscall (already GETREGS'd into `regs`) at a
 # syscall-ENTER stop. Rewrites the registers via PTRACE_SETREGS and returns a
 # STRAT_* code for the loop's exit-stop handling. `nr` is the agnos number.
 fn translate_dispatch(pid, regs): i64 {
     var nr = decode_nr(regs);
+
+    # kbscan#42 -> synthesize Set-1 scancodes from mirshi's stdin (agnos TUIs).
+    if (nr == 42) { return _do_kbscan(pid, regs); }
 
     # agnos exit#0 -> real Linux exit_group(code). The code is already in rdi
     # (agnos a1); resuming executes it, the child terminates, and waitpid/
@@ -1542,6 +1747,7 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 32) { return _cf_two(pid, regs, SYS_LINKAT); }                   # link
         if (nr == 63) { return _m2_fail(pid, regs); }                             # symlink: --root deferred (raw target isn't a confinable path; needs a custom symlinkat)
         if (nr == 33) { return _cf_stat(pid, regs); }                             # stat
+        if (nr == 70) { return _cf_readlink(pid, regs); }                         # readlink (readlinkat, no-follow)
     }
 
     if (nr == 9) {
@@ -1571,6 +1777,24 @@ fn translate_dispatch(pid, regs): i64 {
         store64(regs + REG_RDI, sps);
         store64(regs + REG_RSI, _m2_scratch);
         store64(regs + REG_ORIG_RAX, 4);
+        pt(PTRACE_SETREGS, pid, 0, regs);
+        return STRAT_EXECUTE;
+    }
+    if (nr == 70) {
+        # readlink(path,pathlen,buf,buflen) -> Linux readlink(path, buf, bufsize)#89.
+        # The kernel writes the link target straight into the child's buf (arg2), so —
+        # unlike stat#33 — there is NO exit repack: the exit stop's linux_ret_to_agnos
+        # maps the byte count (>=0) / -errno -> -1 (incl. EINVAL "not a symlink"),
+        # matching agnos readlink#70's -1-on-any-error contract. readlink is inherently
+        # no-follow on the final component, so it mirrors agnos #70 with no extra flag.
+        # (The --root confined variant, _cf_readlink -> readlinkat#267, is handled above.)
+        var srl = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+                           load64(regs + REG_RSP) - RED_ZONE);
+        if (srl < 0) { return _m2_fail(pid, regs); }
+        store64(regs + REG_RDI, srl);                   # path (NUL-terminated scratch)
+        store64(regs + REG_RSI, decode_arg(regs, 2));   # buf (child ptr — kernel writes here)
+        store64(regs + REG_RDX, decode_arg(regs, 3));   # bufsize (agnos a4=r10)
+        store64(regs + REG_ORIG_RAX, SYS_READLINK);
         pt(PTRACE_SETREGS, pid, 0, regs);
         return STRAT_EXECUTE;
     }

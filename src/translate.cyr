@@ -47,6 +47,7 @@ fn agnos_to_linux_nr(agnos_nr): i64 {
     if (agnos_nr == 30) { return 87; }    # unlink      -> unlink(87)  [+ path stage]
     if (agnos_nr == 29) { return 217; }   # getdents    -> getdents64(217) [+ dirent repack]
     if (agnos_nr == 59) { return 73; }    # flock       -> flock(73)     [op codes identical: SH/EX/UN/NB]
+    if (agnos_nr == 70) { return 89; }    # readlink    -> readlink(89)  [handled explicitly: path stage, drop pathlen, direct buf write; --root -> readlinkat(267)]
     return 0 - 1;                         # no direct peer
 }
 

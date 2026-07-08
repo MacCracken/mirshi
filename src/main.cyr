@@ -144,7 +144,10 @@ fn main(): i64 {
     }
     store64(child_argv + nfwd * 8, 0);           # NULL-terminate the argv vector
 
-    return intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any, child_argv);
+    var rc = intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any, child_argv);
+    # Restore the terminal if a TUI child armed raw mode via kbscan#42 (no-op otherwise).
+    _kbscan_restore_termios();
+    return rc;
 }
 
 var r = main();

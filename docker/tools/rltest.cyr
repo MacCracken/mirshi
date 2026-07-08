@@ -1,0 +1,48 @@
+# rltest.cyr — behavioral smoke for mirshi readlink#70.
+# Raw syscall(70, path, pathlen, buf, buflen) reads a symlink's TEXT target under
+# mirshi (EXECUTE-in-child -> Linux readlink(89), or readlinkat(267) under --root).
+# The NO-FOLLOW introspection peer of symlink#63: create a link with #63, then read
+# its raw target back with #70 and byte-check it (the target is a literal string, so
+# readlink returns exactly those bytes — no path resolution).
+#   cyrius build --agnos docker/tools/rltest.cyr <stage>/rltest
+#   (cd <stage> && mirshi ./rltest)
+include "lib/syscalls.cyr"
+
+fn streqn(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main(): i64 {
+    var tgt = "hello/world.txt";   # symlink target TEXT (a literal, 15 bytes, not resolved)
+    var lnk = "./rl_link";
+    # 1. create the link (symlink#63 -> Linux symlink(88)).
+    if (syscall(63, tgt, strlen(tgt), lnk, strlen(lnk)) != 0) {
+        var es = "rltest: symlink#63 setup FAILED\n";
+        sys_write(1, es, strlen(es));
+        return 11;
+    }
+    # 2. read it back (readlink#70 -> Linux readlink(89)); NO-FOLLOW => the raw target text.
+    var buf[128];
+    var n = syscall(70, lnk, strlen(lnk), &buf, 128);
+    if (n != 15) {                 # strlen("hello/world.txt")
+        var el = "rltest: readlink#70 wrong length\n";
+        sys_write(1, el, strlen(el));
+        return 12;
+    }
+    if (streqn(&buf, tgt, 15) == 0) {
+        var em = "rltest: readlink#70 target MISMATCH\n";
+        sys_write(1, em, strlen(em));
+        return 13;
+    }
+    var ok = "rltest: readlink#70 PASS (./rl_link -> hello/world.txt)\n";
+    sys_write(1, ok, strlen(ok));
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
