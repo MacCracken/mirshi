@@ -174,7 +174,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(38), 0 - 1, "undefined#38 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(39), 0 - 1, "undefined#39 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(42), 0 - 1, "undefined#42 -> ENOSYS (ABI gap)");
-    assert_eq(agnos_to_linux_nr(43), 0 - 1, "undefined#43 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(43), 0 - 1, "spawn_path#43 -> no peer (EMULATE at the loop level: spawn-from-path, async)");
     assert_eq(agnos_to_linux_nr(44), 0 - 1, "undefined#44 -> ENOSYS (ABI gap)");
     assert_eq(agnos_to_linux_nr(47), 0 - 1, "sock_connect#47 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(48), 0 - 1, "sock_send#48 -> ENOSYS (net band)");

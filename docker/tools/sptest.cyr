@@ -1,0 +1,29 @@
+# sptest.cyr — behavioral smoke for mirshi spawn_path#43 (the async sibling of execwait#37).
+# Raw syscall(43,"./hello",len) spawns the agnos ./hello ELF NON-blocking (returns a pid), then
+# syscall(4,pid) (waitpid) reaps it — the cyrius stdlib exec_* path (_agnos_spawn_path + waitpid).
+#   cyrius build --agnos docker/tools/sptest.cyr <stage>/sptest
+#   (cd <stage> && mirshi ./sptest)   # ./hello must be staged alongside
+include "lib/syscalls.cyr"
+
+fn main(): i64 {
+    var a = "sptest: spawn_path#43 -> ./hello (async), then waitpid#4\n";
+    sys_write(1, a, strlen(a));
+    var cmd = "./hello";
+    var pid = syscall(43, cmd, strlen(cmd));        # spawn_path#43: non-blocking, returns the coined pid
+    if (pid < 0) {
+        var e = "sptest: spawn_path FAILED\n";
+        sys_write(1, e, strlen(e));
+        return 1;
+    }
+    var rc = syscall(4, pid);                        # waitpid#4: block until it exits, get the code
+    var b = "sptest: child reaped; ";
+    sys_write(1, b, strlen(b));
+    if (rc == 0) {
+        var ok = "PASS (child exit 0)\n";
+        sys_write(1, ok, strlen(ok));
+    }
+    return rc;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

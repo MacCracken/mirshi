@@ -343,24 +343,23 @@ var _ew_argv = 0;
 fn _ew_cl_buf(): i64 { if (_ew_cl == 0) { _ew_cl = alloc(129); } return _ew_cl; }
 fn _ew_argv_buf(): i64 { if (_ew_argv == 0) { _ew_argv = alloc(65 * 8); } return _ew_argv; }
 
-# execwait#37(cmdline_addr, cmdline_len) -> child exit code / -1. agnos's ring-3 BLOCKING-exec: load a
-# static ELF from a PATH and RUN IT TO COMPLETION, returning its exit code (agnsh's `run /bin/x`). In
-# mirshi this is spawn-from-PATH + park-on-that-pid — the fusion of _do_spawn (fork a traced grandchild)
-# and _do_waitpid (leave the caller stopped until the child exits). Unlike spawn#3 (in-memory ELF ->
-# memfd), execwait's ELF is a real FILE, so the grandchild execve's the path directly via _child_exec
-# (the exact path the top-level program takes — _child_setup re-establishes ROOTFD + the bound). The
-# cmdline is "PATH arg1 arg2 .." (agnos tokenizes on spaces, argv[0]=path); we stage it NUL-split + build
-# the argv vector on the supervisor heap (inherited across the fork). SUPERVISOR-CONTROL op — dispatched
-# at the loop level (enr==37) like spawn#3/waitpid#4. Fail-closed to agnos -1. `rec` = the CALLER's record.
-fn _do_execwait(pid, regs, rec): i64 {
-    if (_child_count() >= MAX_CHILDREN) { return _net_emu(pid, regs, 0 - 1); }
+# _spawn_from_path(pid, regs, rec) -> new child record / 0. The shared core of the from-PATH exec band:
+# read the cmdline "PATH arg1 arg2 .." (a1=ptr, a2=len) from the child, stage it NUL-split on the
+# supervisor heap (inherited across the fork) + build the NULL-terminated argv vector [path, args…]
+# (agnos tokenizes on spaces, argv[0]=path), fork a traced grandchild that execve's the path token via
+# _child_exec (the exact path the top-level program takes — a real FILE, no memfd; _child_setup
+# re-establishes ROOTFD + the bound), and register it (CALLER = parent, needs_attach — the demux loop
+# attaches on its first stop). Returns the new child's record, or **0** (caller injects agnos -1) on any
+# error: table full, empty / oversized cmdline (agnos caps at 127), bad read, empty path, fork failure.
+# Consumed by execwait#37 (which then parks) + spawn_path#43 (which returns the pid).
+fn _spawn_from_path(pid, regs, rec): i64 {
+    if (_child_count() >= MAX_CHILDREN) { return 0; }
     var cl_addr = decode_arg(regs, 0);
     var cl_len = decode_arg(regs, 1);
-    if (cl_len < 1) { return _net_emu(pid, regs, 0 - 1); }
-    if (cl_len > 127) { return _net_emu(pid, regs, 0 - 1); }        # agnos caps the cmdline at 127
-    # Stage the command line into the supervisor heap (inherited across the fork), NUL-terminate it.
+    if (cl_len < 1) { return 0; }
+    if (cl_len > 127) { return 0; }                                # agnos caps the cmdline at 127
     var cl = _ew_cl_buf();
-    if (_spawn_read_elf(pid, cl_addr, cl_len, cl) < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (_spawn_read_elf(pid, cl_addr, cl_len, cl) < 0) { return 0; }
     store8(cl + cl_len, 0);
     # Tokenize on spaces IN PLACE (space -> NUL), building the NULL-terminated argv vector: [path, args…].
     var av = _ew_argv_buf();
@@ -376,26 +375,43 @@ fn _do_execwait(pid, regs, rec): i64 {
         if (i < cl_len) { store8(cl + i, 0); i = i + 1; }                       # terminate the token
     }
     store64(av + nfwd * 8, 0);                                                  # NULL-terminate argv
-    if (nfwd < 1) { return _net_emu(pid, regs, 0 - 1); }                        # empty / all-spaces
+    if (nfwd < 1) { return 0; }                                                 # empty / all-spaces
     var path = load64(av + 0);                                                  # argv[0] = the ELF path token
-    # Fork a traced grandchild that execve's the path with the argv (never returns on success).
     var cpid = sys_fork();
-    if (cpid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (cpid < 0) { return 0; }
     if (cpid == 0) {
         _child_exec(path, _spawn_bound, _spawn_rootpath, av);
         syscall(SYS_EXIT, EXECVE_FAILED);
         return EXECVE_FAILED;
     }
-    # Register the grandchild (CALLER = parent, needs_attach — the demux loop attaches on its first stop),
-    # then PARK the caller on the coined pid until it exits — exactly _do_waitpid's park. _wake_waiters
-    # injects the child's exit code into rax at the caller's resume, so execwait returns that code.
     var crec = _child_alloc(cpid, load64(rec + C_AGNOS_PID));
     store64(crec + C_NEEDS_ATTACH, 1);
+    return crec;
+}
+
+# execwait#37(cmdline_addr, cmdline_len) -> child exit code / -1. agnos's ring-3 BLOCKING-exec: load a
+# static ELF from a PATH and RUN IT TO COMPLETION, returning its exit code (agnsh's `run /bin/x`).
+# = `_spawn_from_path` + **park** on the coined pid (the `_do_spawn` fork + `_do_waitpid` park fusion):
+# `_wake_waiters` injects the child's exit code into rax at the caller's resume. Loop-level op (enr==37).
+fn _do_execwait(pid, regs, rec): i64 {
+    var crec = _spawn_from_path(pid, regs, rec);
+    if (crec == 0) { return _net_emu(pid, regs, 0 - 1); }
+    # PARK the caller on the coined pid until the child exits — exactly _do_waitpid's park.
     store64(regs + REG_ORIG_RAX, 0 - 1);
     pt(PTRACE_SETREGS, pid, 0, regs);
     store64(rec + C_STATE, CS_BLOCKED);
     store64(rec + C_WAIT_TARGET, load64(crec + C_AGNOS_PID));
     return STRAT_EMULATE;
+}
+
+# spawn_path#43(path, len) -> agnos pid / -1. agnos's NON-BLOCKING from-disk spawn — the cyrius stdlib
+# exec_* path (`_agnos_spawn_path` + `sys_waitpid`, distinct from agnsh's execwait#37). = `_spawn_from_path`
+# WITHOUT the park: inject the coined pid NOW; the caller reaps it via waitpid#4 later. Loop-level op
+# (enr==43), the async sibling of execwait#37.
+fn _do_spawn_path(pid, regs, rec): i64 {
+    var crec = _spawn_from_path(pid, regs, rec);
+    if (crec == 0) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, load64(crec + C_AGNOS_PID));
 }
 
 # When agnos pid `target` exits, release any waiters parked in waitpid#4 on it: for EACH BLOCKED
@@ -677,6 +693,7 @@ fn _trace_run(root_pid): i64 {
                         if (enr == 3) { verdict = _do_spawn(wpid, regs, rec); handled = 1; }
                         if (enr == 4) { verdict = _do_waitpid(wpid, regs, rec); handled = 1; }
                         if (enr == 37) { verdict = _do_execwait(wpid, regs, rec); handled = 1; }
+                        if (enr == 43) { verdict = _do_spawn_path(wpid, regs, rec); handled = 1; }
                         if (enr == 14) { verdict = _do_pause(wpid, regs, rec); handled = 1; }
                         if (enr == 16) { verdict = _do_kill(wpid, regs, rec); handled = 1; }
                         if (handled == 0) { verdict = translate_dispatch(wpid, regs); }

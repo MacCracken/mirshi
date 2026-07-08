@@ -71,7 +71,9 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 38–39 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
-| 42–44 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
+| 42 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
+| 43 | spawn_path | EMULATE | — | **exec band:** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) |
+| 44 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
 | 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress |
@@ -204,7 +206,7 @@ extensions, as were the **info-getters + advisory-locks band** (`getuid#15`/`una
 v1.8.0 — footnote ⁶) and **tty sizing** (`winsize#60`, v1.9.0 — footnote ⁷). **Direction 1 is now
 feature-complete**: every *defined, non-kernel-only* agnos syscall is handled. The only remaining ENOSYS rows
 are the agnos-**kernel**-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26` — permanent by
-design) and the undefined ABI gaps (#36–39, #42–44). What remains on the [roadmap](../development/roadmap.md) is
+design) and the undefined ABI gaps (#36, #38–39, #42, #44 — the exec-band #37 execwait + #43 spawn_path are now handled). What remains on the [roadmap](../development/roadmap.md) is
 the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 
 ## Known gaps (carried forward, documented not fixed)

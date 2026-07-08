@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`spawn_path#43` — EMULATE at the loop level** (`_do_spawn_path`, `src/intercept.cyr`). agnos's
+  NON-blocking from-disk spawn — the cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`,
+  distinct from agnsh's `execwait#37`). The from-path exec was refactored into a shared `_spawn_from_path`
+  core (read cmdline → tokenize argv → fork a traced grandchild that execve's the path → register):
+  `execwait#37` = core + **park** (blocking, returns exit code); `spawn_path#43` = core + **inject the
+  coined pid** (async, the caller reaps via `waitpid#4`). Behavioral smoke `docker/tools/sptest.cyr`
+  (spawn `./hello` async + waitpid → exit 0). Freeze suite green (295/0); execwait#37 regression-verified
+  after the refactor.
+
 ### Changed
 - **Toolchain pin → cyrius 6.4.19** (from 6.3.27). The committed `lib/` snapshot was re-vendored to match
   (`cyrius lib sync --full` → 98 files) so the pin is real, not shadowed by a stale vendored stdlib. Build
