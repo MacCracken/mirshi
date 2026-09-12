@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.4.32` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests and every bench/fuzz/distlib target re-verified at the new pin.
+
+
 ## [1.11.0] — 2026-07-08
 
 ### Added

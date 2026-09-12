@@ -43,9 +43,9 @@ enum MirshiConfine {
     OPEN_HOW_SIZE = 24;         # sizeof(struct open_how) {u64 flags; u64 mode; u64 resolve}
     RESOLVE_IN_ROOT = 0x10;     # clamp resolution within the anchor dirfd (abs + .. + symlink)
     RESOLVE_NO_MAGICLINKS = 0x2;  # block proc magic-links (/proc/*/root, /proc/*/fd/N, ...) — they
-                                  # can jump OUTSIDE a jail that contains /proc. (NB: this does NOT
-                                  # block /proc/self/mem — /proc/self is a regular symlink, clamped
-                                  # by IN_ROOT; the real /proc defense is a jail with no /proc.)
+    # can jump OUTSIDE a jail that contains /proc. (NB: this does NOT
+    # block /proc/self/mem — /proc/self is a regular symlink, clamped
+    # by IN_ROOT; the real /proc defense is a jail with no /proc.)
     OPEN_RESOLVE = 0x12;        # RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS (the how.resolve we set)
     O_PATH = 0x200000;          # rootfd open: an inert dirfd anchor (read/getdents -> EBADF)
     O_DIRECTORY = 0x10000;      # assert the root is a directory at open time (fail-fast)
@@ -135,7 +135,7 @@ fn _m2_fail(pid, regs): i64 {
 # rdi at it, renumber to `lnr`. The length arg in rsi is ignored by the 1-arg call.
 fn _m2_one_path(pid, regs, lnr): i64 {
     var scratch = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                           load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (scratch < 0) { return _m2_fail(pid, regs); }
     store64(regs + REG_RDI, scratch);
     store64(regs + REG_ORIG_RAX, lnr);
@@ -148,7 +148,7 @@ fn _m2_one_path(pid, regs, lnr): i64 {
 # agnos ABI passed path2 in rdx/r10, so this is a register MOVE, not a rewrite.
 fn _m2_two_path(pid, regs, lnr): i64 {
     var s0 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                      load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (s0 < 0) { return _m2_fail(pid, regs); }
     var s1 = stage_at(pid, decode_arg(regs, 2), decode_arg(regs, 3), s0);   # below s0
     if (s1 < 0) { return _m2_fail(pid, regs); }
@@ -166,7 +166,7 @@ fn _m2_two_path(pid, regs, lnr): i64 {
 # / unlink#30 (unlinkat, a3=0). a3 is the op's 3rd arg (mode or *at flag).
 fn _cf_one(pid, regs, atnr, a3): i64 {
     var sc = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                               load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (sc < 0) { return _m2_fail(pid, regs); }
     store64(regs + REG_RDI, ROOTFD);
     store64(regs + REG_RSI, sc);
@@ -180,7 +180,7 @@ fn _cf_one(pid, regs, atnr, a3): i64 {
 # (olddirfd, old, newdirfd, new, flags=0) shape; both dirfds are ROOTFD.
 fn _cf_two(pid, regs, atnr): i64 {
     var s0 = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                               load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (s0 < 0) { return _m2_fail(pid, regs); }
     var s1 = stage_at_confined(pid, decode_arg(regs, 2), decode_arg(regs, 3), s0);   # below s0
     if (s1 < 0) { return _m2_fail(pid, regs); }
@@ -198,7 +198,7 @@ fn _cf_two(pid, regs, atnr): i64 {
 # as the unconfined stat (fs_exit_return(33) repacks the 144 B Linux struct -> agnos 48 B).
 fn _cf_stat(pid, regs): i64 {
     var sps = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                                load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (sps < 0) { return _m2_fail(pid, regs); }
     _m2_scratch = (sps - 144) & (0 - 8);      # 144 B Linux statbuf, below the path
     _m2_out_ptr = decode_arg(regs, 2);        # the agnos 48 B statbuf (for the exit repack)
@@ -219,7 +219,7 @@ fn _cf_stat(pid, regs): i64 {
 # = agnos a4=r10) rides r10 as readlinkat's 4th arg.
 fn _cf_readlink(pid, regs): i64 {
     var sc = stage_at_confined(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                               load64(regs + REG_RSP) - RED_ZONE);
+      load64(regs + REG_RSP) - RED_ZONE);
     if (sc < 0) { return _m2_fail(pid, regs); }
     store64(regs + REG_RDI, ROOTFD);
     store64(regs + REG_RSI, sc);                    # sanitized relative path
@@ -1153,7 +1153,7 @@ fn _do_epoll_ctl(pid, regs): i64 {
     }
     if (op == 1) {                                                    # ADD (dedup, first-empty, 8-cap)
         if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }            # a negative id is invalid (and -1
-                                                                      # is the empty-entry sentinel)
+        # is the empty-entry sentinel)
         var empty = 0 - 1;
         var k = 0;
         while (k < 8) {
@@ -1705,7 +1705,7 @@ fn translate_dispatch(pid, regs): i64 {
         var aflags = decode_arg(regs, 2);
         var oflags = ao_to_o(aflags);                  # AO_* -> O_*
         var sc7 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                           load64(regs + REG_RSP) - RED_ZONE);
+          load64(regs + REG_RSP) - RED_ZONE);
         if (sc7 < 0) { return _m2_fail(pid, regs); }
         if (_confine_active == 1) {
             # openat2 is STRICTER than open(2): it rejects a nonzero how.mode without
@@ -1753,7 +1753,7 @@ fn translate_dispatch(pid, regs): i64 {
     if (nr == 9) {
         # mkdir(path,pathlen) -> Linux mkdir(path, mode 0777).
         var sc9 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                           load64(regs + REG_RSP) - RED_ZONE);
+          load64(regs + REG_RSP) - RED_ZONE);
         if (sc9 < 0) { return _m2_fail(pid, regs); }
         store64(regs + REG_RDI, sc9);
         store64(regs + REG_RSI, mkdir_create_mode());  # mode 0777 (umask in child trims)
@@ -1770,7 +1770,7 @@ fn translate_dispatch(pid, regs): i64 {
         # stat(path,pathlen,statbuf48) -> Linux stat(path, statbuf144); the exit
         # stop repacks the 144 B Linux struct into the saved agnos 48 B statbuf.
         var sps = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                           load64(regs + REG_RSP) - RED_ZONE);
+          load64(regs + REG_RSP) - RED_ZONE);
         if (sps < 0) { return _m2_fail(pid, regs); }
         _m2_scratch = (sps - 144) & (0 - 8);     # 144 B Linux statbuf, below the path
         _m2_out_ptr = decode_arg(regs, 2);       # the agnos 48 B statbuf (for the exit repack)
@@ -1789,7 +1789,7 @@ fn translate_dispatch(pid, regs): i64 {
         # no-follow on the final component, so it mirrors agnos #70 with no extra flag.
         # (The --root confined variant, _cf_readlink -> readlinkat#267, is handled above.)
         var srl = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-                           load64(regs + REG_RSP) - RED_ZONE);
+          load64(regs + REG_RSP) - RED_ZONE);
         if (srl < 0) { return _m2_fail(pid, regs); }
         store64(regs + REG_RDI, srl);                   # path (NUL-terminated scratch)
         store64(regs + REG_RSI, decode_arg(regs, 2));   # buf (child ptr — kernel writes here)

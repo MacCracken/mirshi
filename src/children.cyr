@@ -17,15 +17,15 @@
 
 enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
-                                # that flipping spawn#3 to EMULATE reopens (deliberately NOT
-                                # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
+    # that flipping spawn#3 to EMULATE reopens (deliberately NOT
+    # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
     CHILD_REC_SIZE = 176;       # 22 x i64 fields (v1.7.0 grew it by 3: epoll / timerfd / pipe tables)
     # --- v1.6.0 signalfd#18 constants ---
     SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
-                                # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
-                                # write/close route bit-30-tagged fds to the net band BEFORE the
-                                # syscall, so a signalfd MUST clear bit 30 to reach mirshi's read#5.
-                                # Still way above any real child fd (rlimit caps them < 1024).
+    # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
+    # write/close route bit-30-tagged fds to the net band BEFORE the
+    # syscall, so a signalfd MUST clear bit 30 to reach mirshi's read#5.
+    # Still way above any real child fd (rlimit caps them < 1024).
     SIGNALFD_SLOTS = 8;         # per-child signalfd table size (a process rarely needs > 1-2)
     SIGFD_SLOT_SIZE = 16;       # per slot {i64 watched_mask; i64 flags} — flags == -1 marks FREE
     SFD_NONBLOCK = 2048;        # signalfd flag (agnos SFD_NONBLOCK); the MVP read is always non-blocking
@@ -37,33 +37,33 @@ enum MirshiChild {
     C_EXIT_CODE = 32;          # agnos exit code, retained until waitpid#4 claims it
     C_WAIT_TARGET = 40;        # the agnos_pid this child is parked in waitpid#4 on
     C_REAPED = 48;             # RESERVED (unused): waitpid#4 reaping frees the slot via _child_free
-                               # (-> CS_FREE) rather than a flag; C_STATE is authoritative, not this
+    # (-> CS_FREE) rather than a flag; C_STATE is authoritative, not this
     C_NEEDS_ATTACH = 56;       # 1 = a freshly-forked grandchild awaiting its first-stop attach
     C_AT_ENTRY = 64;           # enter/exit ptrace toggle (was a _trace_run local)
     C_AGNOS_NR = 72;           # agnos syscall nr captured at enter (was a _trace_run local)
     C_STRAT = 80;              # dispatcher verdict at enter (was a _trace_run local)
     C_PENDING_SIG = 88;        # v1.6.0: the per-child PENDING signal mask (agnos `1<<sig` — bit N =
-                               # signal N, NOT libc's 1<<(sig-1)). kill#16 sets bits; pause#14 /
-                               # signalfd#18 read them. Deliverable = pending & ~C_SIG_BLOCKED.
+    # signal N, NOT libc's 1<<(sig-1)). kill#16 sets bits; pause#14 /
+    # signalfd#18 read them. Deliverable = pending & ~C_SIG_BLOCKED.
     C_XLAT_EMU_RET = 96;       # enter->exit EMULATE/ENOSYS return carry (was _xlat_emu_ret)
     C_M2_OUT_PTR = 104;        # fs exit-stop repack carry (was _m2_out_ptr)
     C_M2_OUT_CAP = 112;        #   "     (was _m2_out_cap)
     C_M2_SCRATCH = 120;        #   "     (was _m2_scratch)
     C_NET_TBL = 128;           # this child's net slot-table ptr (0 = not yet alloc'd)
     C_SIG_BLOCKED = 136;       # v1.6.0: the per-child BLOCKED signal mask (sigprocmask#17, `1<<sig`);
-                               # a signal is deliverable iff (C_PENDING_SIG & ~C_SIG_BLOCKED) has it
+    # a signal is deliverable iff (C_PENDING_SIG & ~C_SIG_BLOCKED) has it
     C_SIGFD_TBL = 144;         # v1.6.0: this child's signalfd slot-table ptr (0 = not yet alloc'd)
     C_EPOLL_TBL = 152;         # v1.7.0: this child's epoll slot-table ptr (0 = not yet alloc'd)
     C_TIMERFD_TBL = 160;       # v1.7.0: this child's timerfd slot-table ptr (0 = not yet alloc'd)
     C_PIPE_TBL = 168;          # v1.7.0: RESERVED (unused in the MVP) — a watchable-pipe promotion would
-                               # store a supervisor-held {readfd,writefd} pair table here (ADR 0015)
+    # store a supervisor-held {readfd,writefd} pair table here (ADR 0015)
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
     CS_BLOCKED = 2;            # parked in waitpid#4 (left stopped at its enter-stop)
     CS_EXITED = 3;             # exited; exit_code retained until reaped
     SPAWN_ELF_MAX = 8388608;   # 8 MB spawn#3 ELF read cap — matches lib/process_agnos.cyr's
-                               # _AGNOS_ELF_MAX (the agnos-side spawn helper's own read buffer)
+    # _AGNOS_ELF_MAX (the agnos-side spawn helper's own read buffer)
     # --- v1.7.0 I/O-multiplexing (epoll #19-21 / timerfd #22-23 / pipe #25) ---
     # epoll + timerfd are supervisor-EMULATED (a server epolls SOCKETS, which are supervisor-held host
     # fds in the per-child net table — a real in-child epoll fd cannot see them), so each returns an
@@ -72,8 +72,8 @@ enum MirshiChild {
     # mirshi, AND stay distinct from SIGFD_BASE (bit 29). A strictly DESCENDING ladder lets
     # _emu_classify tier by a single >= compare; all sit far above real child fds (rlimit caps < 256).
     AGNOS_SOCK_TAG = 0x40000000; # bit 30 — the agnos userland's own socket-fd tag (routed to the net
-                                 # band before any raw syscall mirshi sees). _emu_classify checks it
-                                 # FIRST: 0x40000000 > SIGFD_BASE would otherwise mis-tier a socket id.
+    # band before any raw syscall mirshi sees). _emu_classify checks it
+    # FIRST: 0x40000000 > SIGFD_BASE would otherwise mis-tier a socket id.
     TIMERFD_BASE = 0x10000000;   # bit 28: emulated timerfd id = TIMERFD_BASE + slot
     EPOLL_BASE = 0x08000000;     # bit 27: emulated epoll id = EPOLL_BASE + slot
     PIPE_BASE = 0x04000000;      # bit 26: RESERVED for a watchable-pipe promotion (unused in the MVP)
@@ -83,9 +83,9 @@ enum MirshiChild {
     TIMERFD_SLOTS = 8;           # per-child timerfd instances
     TIMERFD_SLOT_SIZE = 32;      # {i64 flags (-1=FREE); i64 deadline_ms; i64 interval_ms; i64 armed}
     TIMERFD_SEC_CAP = 1000000000;# timerfd_settime seconds ceiling (~31.7 yr) — bounds untrusted child
-                                 # input so sec*1000 + the deadline arithmetic stays well within i64
-                                 # (a hostile initial/interval_sec would else overflow -> a wrong timer;
-                                 # same discipline as sleep_ms#41's SLEEP_MS_CAP). Negatives are rejected.
+    # input so sec*1000 + the deadline arithmetic stays well within i64
+    # (a hostile initial/interval_sec would else overflow -> a wrong timer;
+    # same discipline as sleep_ms#41's SLEEP_MS_CAP). Negatives are rejected.
     # _emu_classify KIND codes — the read#5 / close#6 emulated-fd front-gate tiers:
     KIND_REAL = 0;               # a real child fd (< MIN_EMU_BASE, bit 30 clear) — execute-in-child
     KIND_SOCK = 1;               # AGNOS_SOCK_TAG (bit 30) — a net-band conn / listen id

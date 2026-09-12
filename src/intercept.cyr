@@ -65,9 +65,9 @@ enum MirshiPtrace {
     BOUND_FAILED = 126;               # seccomp bound failed to install — child aborted, not run unbounded
     WAIT_FAILED = 125;                # mirshi's own exit code when a wait fails irrecoverably
     __WALL = 0x40000000;              # wait4: reap children of ANY signal-delivery flavor (v1.5.0
-                                      # multi-tracee demux; robust for supervisor-forked grandchildren)
+    # multi-tracee demux; robust for supervisor-forked grandchildren)
     PAUSE_YIELD_NS = 1000000;         # v1.6.0 pause#14 bounded-yield quantum (1 ms — the "one hlt"
-                                      # idle; short-circuited to 0 when a deliverable signal is pending)
+    # idle; short-circuited to 0 when a deliverable signal is pending)
 }
 
 # wait-status decoders the stdlib lacks. lib/syscalls_linux_common.cyr provides
@@ -622,7 +622,7 @@ fn _trace_log(pid): i64 {
                 pt(PTRACE_GETREGS, pid, 0, regs);
                 var nr = decode_nr(regs);
                 format_event(line, nr, decode_arg(regs, 0), decode_arg(regs, 1),
-                             decode_arg(regs, 2), decode_arg(regs, 3));
+                  decode_arg(regs, 2), decode_arg(regs, 3));
                 _emit(1, line);
                 _emit(1, "\n");
                 if (nr == 0) {

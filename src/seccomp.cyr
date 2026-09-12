@@ -89,7 +89,7 @@ fn _bound_allowlist(buf): i64 {
     # PTRACE_SYSCALL loop / on the execve-failure path):
     n = _allow(buf, n, 59);     # execve  (the initial image load)
     n = _allow(buf, n, 322);    # execveat (v1.5.0 spawn#3 grandchild: memfd image via AT_EMPTY_PATH;
-                                #  the filter persists across it, so the re-exec'd image stays bounded)
+    #  the filter persists across it, so the re-exec'd image stays bounded)
     n = _allow(buf, n, 60);     # exit    (execve-failure fallback in _child_exec / _child_exec_memfd)
     # NOTE: the emulate/ENOSYS skip sentinel (orig_rax = -1 -> nr 0xFFFFFFFF) is NOT in
     # this chain — it is allowed explicitly in apply_child_bound BEFORE the x32 guard,
