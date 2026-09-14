@@ -60,6 +60,12 @@ fn ao_to_o(ao): i64 {
     if ((ao & 0x200) != 0) { o = o | 0x200; }    # AO_TRUNC 0x200   -> O_TRUNC 0x200    (same)
     if ((ao & 0x400) != 0) { o = o | 0x400; }    # AO_APPEND 0x400  -> O_APPEND 0x400   (same)
     if ((ao & 0x800) != 0) { o = o | 0x10000; }  # AO_DIRECTORY 0x800 -> O_DIRECTORY 0x10000 (DIFFERS)
+    # 1.11.2: the two security bits the kernel added at agnos 1.56.53 / 1.56.56 (§3.3). Both
+    # were DROPPED here, so an agnos AO_NOFOLLOW open followed the symlink under mirshi and
+    # an AO_CREAT|AO_EXCL open clobbered an existing file — the opposite of what the same
+    # binary does on the kernel. Both are legal openat2 how.flags bits (whitelist intact).
+    if ((ao & 0x1000) != 0) { o = o | 0x20000; } # AO_NOFOLLOW 0x1000 -> O_NOFOLLOW 0x20000 (DIFFERS)
+    if ((ao & 0x2000) != 0) { o = o | 0x80; }    # AO_EXCL 0x2000     -> O_EXCL 0x80        (DIFFERS)
     return o;
 }
 

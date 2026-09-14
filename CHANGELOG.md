@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-09-14
+
+### Fixed
+
+- **`ao_to_o` dropped `AO_NOFOLLOW` (0x1000) and `AO_EXCL` (0x2000)** — the two security
+  bits the agnos kernel added at 1.56.53 / 1.56.56 (ABI §3.3). Under mirshi an agnos
+  `open(path, AO_RDWR|AO_NOFOLLOW)` FOLLOWED a symlink at `path` and an
+  `AO_CREAT|AO_EXCL` open clobbered an existing file — the opposite of what the same
+  binary does on the kernel, and exactly the check-then-write TOCTOU those bits close.
+  Surfaced by cyrius 6.6.4, whose `lib/io.cyr` `file_open` now bridges `O_NOFOLLOW` /
+  `O_EXCL` to them (patra's WAL open carries `O_NOFOLLOW` on every target). Both map to
+  legal `openat2` `how.flags` bits, so the confined path's whitelist stays exact; pinned
+  by four new `fs-ao-to-o` rows (including "an unknown AO_* bit is NOT passed through").
+
 ## [1.11.1] - 2026-09-11
 
 ### Changed

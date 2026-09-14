@@ -202,6 +202,10 @@ fn main() {
     assert_eq(ao_to_o(0x400), 0x400, "AO_APPEND same 0x400");
     assert_eq(ao_to_o(0x800), 0x10000, "AO_DIRECTORY 0x800->O_DIRECTORY 0x10000");
     assert_eq(ao_to_o(0x301), 0x241, "0x301 (WRONLY|CREAT|TRUNC) -> 0x241 (ground truth)");
+    assert_eq(ao_to_o(0x1000), 0x20000, "AO_NOFOLLOW 0x1000->O_NOFOLLOW 0x20000 (1.11.2; kernel 1.56.53)");
+    assert_eq(ao_to_o(0x2000), 0x80, "AO_EXCL 0x2000->O_EXCL 0x80 (1.11.2; kernel 1.56.56)");
+    assert_eq(ao_to_o(0x3102), 0xC2 | 0x20000, "0x3102 (RDWR|CREAT|NOFOLLOW|EXCL) -> O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW");
+    assert_eq(ao_to_o(0x4000), 0, "an unknown AO_* bit is NOT passed through (openat2 whitelist)");
     assert_eq(open_create_mode(), 384, "open mode = 0600 (0x180, least-privilege)");
     assert_eq(mkdir_create_mode(), 448, "mkdir mode = 0700 (0x1C0, least-privilege)");
 
