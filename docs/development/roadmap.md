@@ -57,3 +57,47 @@ never replaces QEMU+iron.
 `mount#11` / `umount#24` / `reboot#13` / `write_boot_checkpoint#26` are agnos-**kernel** operations with
 no meaningful host-Linux translation (on agnos itself they stub or halt); mirshi returns ENOSYS by
 design. The undefined agnos# gaps (36–39, 42–44) are ABI holes, not syscalls. Neither is a milestone.
+
+## Moving the cyrius pin to 6.6.6
+
+**Current pin: `cyrius = "6.6.2"` (cyrius.cyml:7).** Pure pin bump — nothing in
+mirshi's source needs to change.
+
+**The Windows `O_APPEND`/`O_TRUNC` corruption fix does not apply to mirshi, and
+the grep hits are a false positive worth writing down.** `AO_TRUNC` / `AO_APPEND`
+appear at `src/translate.cyr:60-61` (and the assertions at
+`tests/mirshi.tcyr:201-202`, plus `docker/tools/cp.cyr:14` and
+`docker/tools/rdtest.cyr:12`) — those are **AGNOS** open flags being translated
+to Linux ones, not PE opens. mirshi's product is "run agnos-compiled userland as
+native Linux processes in a plain Docker container, shared host kernel"
+(cyrius.cyml:4); there is no PE target and no `_TARGET_PE` / `CYRIUS_TARGET_WIN`
+guard anywhere in `src/`. 6.6.6's `_pe_open_flags` fix is a non-event here.
+
+**Checked and clear on the rest of the 6.6.6 list:**
+
+- **Global redeclaration** — `var r = main();` appears at `src/main.cyr:153` and
+  `src/test.cyr:10`. Those are two alternative *entry points*, never co-linked,
+  so neither the new "last definition wins from program start" behaviour nor the
+  new different-type/size compile error can fire.
+- **The new compile errors** — zero `struct` declarations, zero `async` fns,
+  zero `operator` fns, zero top-level `{ }` blocks, zero `ret2`/`rethi` pair
+  returns, zero SIMD-typed returns. `src/decode.cyr:64` has the repo's only
+  `: cstring` — it is a *return* type (`fn agnos_nr_name(nr): cstring`), and the
+  6.6.6 tightening is about a literal int passed into a `: cstring` **parameter**,
+  so it does not apply.
+- **assert.cyr now pulls in vec.cyr transitively** — `[deps] stdlib` already
+  names both `assert` and `vec`, and mirshi defines no `vec_*` of its own, so
+  there is nothing to collide.
+- **`lib/regression.cyr` is vendored** (with `lib/regression_agnos.cyr` and
+  `lib/io.cyr`) but mirshi calls no `regression_*` helper from `src/`,
+  `programs/` or `tests/` — the only hits are comments in `lib/net.cyr:489` and
+  `lib/regression_agnos.cyr`. The new per-verb deadline
+  (`CYRIUS_CHECK_TIMEOUT`, 120 s; ssh/scp 900 s, `-2` on timeout) and
+  `PR_SET_PDEATHSIG` change nothing here — though the shell harnesses under
+  `scripts/it/` run their own children and are worth a look if any legitimately
+  runs past two minutes.
+
+**Verify after bumping:** re-run `cyrius deps` so the vendored fold picks up
+6.6.6's rewritten `lib/io.cyr` and `lib/regression.cyr`, then `cyrius build` +
+`cyrius test`. Measured: `cyrius build` under 6.6.2 and under 6.6.6 both exit 0
+with the same single diagnostic.
