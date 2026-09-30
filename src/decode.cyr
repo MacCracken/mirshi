@@ -118,6 +118,7 @@ fn agnos_nr_name(nr): cstring {
     if (nr == 60) { return "winsize"; }
     if (nr == 61) { return "net_config"; }
     if (nr == 70) { return "readlink"; }
+    if (nr == 95) { return "uptime_us"; }
     return "unknown";
 }
 
@@ -180,6 +181,7 @@ fn agnos_argc(nr): i64 {
     if (nr == 60) { return 0; }   # winsize()
     if (nr == 61) { return 1; }   # net_config(field)
     if (nr == 70) { return 4; }   # readlink(path, pathlen, buf, buflen)  -- a4=r10
+    if (nr == 95) { return 0; }   # uptime_us()
     return 0;
 }
 

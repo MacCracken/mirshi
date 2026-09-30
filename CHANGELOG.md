@@ -4,6 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-09-30
+
+### Fixed
+
+- **`uptime_us#95` fell through to ENOSYS** (`src/dispatch.cyr`). agnos 1.57.x added #95 — a
+  microsecond monotonic clock, the only one that works with interrupts disabled — and the cyrius
+  stdlib's `clock_now_ns` / `bench` prefer it, latching to the millisecond `uptime_ms#40` only on
+  -1. mirshi had no arm, so every agnos program under it lost µs timing and printed one stray
+  `mirshi: ENOSYS agnos#95 -> -1` line on stderr per latch. #95 is now supervisor-EMULATE on the
+  #40 shape: `CLOCK_MONOTONIC` → `sec*1000000 + nsec/1000` (`us_from_timespec`), the SAME epoch
+  as #40 so a program that falls back never sees the clock jump, and never -1 (the host clock
+  always works). ⚠ Linux #95 is `umask`; the `orig_rax = -1` skip keeps it from running in the
+  child. Decode tables name it (`uptime_us`, arity 0).
+- **`sysinfo#35` wrote the 40-byte base for ANY length** (`src/dispatch.cyr`). The kernel tiers its
+  write by caller length — 40, then 104 (+ per-core user/kernel ticks at +40, agnos 1.56.59), 200
+  (+ per-BLK-tag sectors at +104, 1.56.59), 208 (+ `sched_kicks` at +200, 1.57.9) — so a caller
+  asking for 104 or more got rc 0 over an untouched tail. `_do_sysinfo` now computes the kernel's
+  tier (`sysinfo_len`) and writes exactly that many bytes: the per-core band from host
+  `/proc/stat` (slot k = the k-th CPU in mirshi's affinity mask, the CPUs `cpus` counts; USER_HZ
+  100 is agnos's tick; USER = user+nice, KERNEL = system+idle+iowait+irq+softirq, because the
+  kernel's field is "system + halted" — `procstat_cpu_ticks`), the BLK-tag band and `sched_kicks`
+  zero (mirshi has no agnos block devices or scheduler). A 40-byte caller is byte-identical to
+  1.11.2. The info scratch grew 256 → 384 B for the 208-byte struct; the `/proc/stat` image is a
+  lazy-once 64 KiB buffer (no per-call allocation).
+
+### Tests
+
+- `tests/mirshi.tcyr` 299 → 329: `xlat-us`, `sysinfo-tiers` (every boundary), `procstat-cpu-ticks`
+  (a synthetic `/proc/stat`, multi-digit ids, absent and short lines), and #95 in the decode and
+  frozen-coverage tables.
+- `scripts/it/info.sh` (the CI "Info" step) now drives the real ptrace path: each tier into a 0xAA
+  sentinel buffer (exactly 40/104/200/208 bytes written, nothing past; a between-tier length takes
+  the lower tier; >208 still 208), host ticks in slot 0 and zeros past `cpus`, #95 positive,
+  monotonic and on #40's epoch, and no `ENOSYS agnos#95` on stderr. It fails against 1.11.2 (rc 20),
+  against a build without the #95 arm (rc 30 + the ENOSYS line) and without the band (rc 21).
+- `docs/reference/syscall-coverage.md`: the #35 row gains the tiers, and #95 is a row.
+
 ## [1.11.2] - 2026-09-14
 
 ### Fixed

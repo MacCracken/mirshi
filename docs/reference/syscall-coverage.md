@@ -65,7 +65,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; **HARDLINK** (agnos has no symlink syscall) |
 | 33 | stat | EXECUTE | `stat` (4) ¹ | path staged; Linux 144 B → agnos 48 B repack at exit |
 | 34 | uname | EMULATE ⁶ | — | info getters (v1.8.0): synthesized agnos-native 64 B struct (4×16 = sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `len<64`→−1 |
-| 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1 |
+| 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1. **v1.11.3:** the kernel's length tiers — writes exactly 40 / 104 (+per-core user/kernel ticks at +40, host `/proc/stat`) / 200 (+BLK-tag sectors at +104, zero) / 208 (+`sched_kicks` at +200, zero) bytes |
 | 36 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
 | 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path |
 | 38–39 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
@@ -94,7 +94,9 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
 | 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
 
-**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x). Any number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
+| 95 | uptime_us | EMULATE | — | **v1.11.3:** `CLOCK_MONOTONIC` in the supervisor → µs, the same epoch as `uptime_ms#40` (never −1: the host clock always works). ⚠ Linux #95 is `umask` — the skip keeps it from running in the child |
+
+**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as is `uptime_us#95` (v1.11.3). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
 ¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) the
 filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLVE_IN_ROOT`),

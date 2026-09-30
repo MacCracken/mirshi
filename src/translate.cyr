@@ -220,6 +220,102 @@ fn ms_from_timespec(sec, nsec): i64 {
     return (sec * 1000) + (nsec / 1000000);
 }
 
+# Monotonic microseconds from a (sec, nsec) timespec — agnos uptime_us#95 units (1.11.3).
+# Sub-microsecond nsec truncates. Same CLOCK_MONOTONIC epoch as ms_from_timespec, so a
+# program that falls back from #95 to #40 never sees the clock jump.
+fn us_from_timespec(sec, nsec): i64 {
+    return (sec * 1000000) + (nsec / 1000);
+}
+
+# The number of bytes agnos sysinfo#35 writes for a caller length `len` (1.11.3). The
+# kernel's FROZEN tiers (agnos kernel/core/syscall.cyr, the #35 arm): 40 = the base
+# counters, 104 = + the per-core user/kernel tick band at +40 (1.56.59), 200 = + the
+# per-BLK-tag sector band at +104 (1.56.59), 208 = + sched_kicks at +200 (1.57.9). A
+# length between two tiers gets the LOWER one; above 208 still gets exactly 208. 0 =
+# reject (len < 40: the ABI's no-partial-fill -1).
+fn sysinfo_len(len): i64 {
+    if (len < 40) { return 0; }
+    if (len >= 208) { return 208; }
+    if (len >= 200) { return 200; }
+    if (len >= 104) { return 104; }
+    return 40;
+}
+
+# Parse the `cpu<cpu>` line of a Linux /proc/stat image (`buf`, `n` bytes) into agnos's
+# per-core tick pair (1.11.3, sysinfo#35's +40 band): out[0] = USER ticks, out[8] = KERNEL
+# ticks. Returns 1 when the line was found, 0 otherwise (out untouched). /proc/stat counts
+# in USER_HZ (100), which is agnos's 100 Hz tick, so no unit conversion.
+# ⚠ agnos's KERNEL field is "system + HALTED" (the kernel has no idle loop to tell them apart —
+# see the #35 arm), so it is user+nice vs system+idle+iowait+irq+softirq here; `steal` is time
+# the vCPU did not run and never reaches a guest tick, so it is excluded. That keeps a
+# consumer's user/(user+kernel) the same utilisation figure it computes on the kernel.
+fn procstat_cpu_ticks(buf, n, cpu, out): i64 {
+    var i = 0;
+    while (i < n) {
+        # at the start of a line: match "cpu" + the decimal id + a space
+        if (i + 4 < n) {
+            if (load8(buf + i) == 99) {                              # 'c'
+                if (load8(buf + i + 1) == 112) {                     # 'p'
+                    if (load8(buf + i + 2) == 117) {                 # 'u'
+                        var j = i + 3;
+                        var id = 0;
+                        var nd = 0;
+                        while (j < n) {
+                            var c = load8(buf + j);
+                            if (c < 48) { break; }
+                            if (c > 57) { break; }
+                            id = id * 10 + (c - 48);
+                            nd = nd + 1;
+                            j = j + 1;
+                        }
+                        if (nd > 0) {
+                            if (id == cpu) { return _procstat_fields(buf, n, j, out); }
+                        }
+                    }
+                }
+            }
+        }
+        # advance to the next line
+        while (i < n) {
+            if (load8(buf + i) == 10) { break; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The fields after `cpuN` at `j`: user nice system idle iowait irq softirq [steal …]. Folds
+# them into out[0]/out[8] as described at procstat_cpu_ticks. A line with fewer than 7
+# fields is not a cpu line mirshi can read — returns 0 and leaves `out` alone.
+fn _procstat_fields(buf, n, j, out): i64 {
+    var f[56];                                                   # 7 × u64 (a local var X[N] is N BYTES)
+    var k = 0;
+    while (k < 7) {
+        while (j < n) {
+            if (load8(buf + j) != 32) { break; }
+            j = j + 1;
+        }
+        var v = 0;
+        var nd = 0;
+        while (j < n) {
+            var c = load8(buf + j);
+            if (c < 48) { break; }
+            if (c > 57) { break; }
+            v = v * 10 + (c - 48);
+            nd = nd + 1;
+            j = j + 1;
+        }
+        if (nd == 0) { return 0; }
+        store64(&f + k * 8, v);
+        k = k + 1;
+    }
+    store64(out, load64(&f) + load64(&f + 8));                   # user + nice
+    var kern = load64(&f + 16) + load64(&f + 24) + load64(&f + 32);   # system + idle + iowait
+    store64(out + 8, kern + load64(&f + 40) + load64(&f + 48));  # + irq + softirq
+    return 1;
+}
+
 # Synthesize the Linux 6-arg mmap registers into a caller-owned regs buffer from
 # agnos's single-arg mmap(length). Linux mmap(addr, len, prot, flags, fd, off)
 # rides the kernel syscall ABI a1..a6 = rdi/rsi/rdx/r10/r8/r9 (a4=r10 NOT rcx).

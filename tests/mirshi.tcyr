@@ -25,6 +25,7 @@ fn main() {
     assert_streq(agnos_nr_name(27), "mmap", "nr 27 = mmap");
     assert_streq(agnos_nr_name(60), "winsize", "nr 60 = winsize (NOT exit)");
     assert_streq(agnos_nr_name(61), "net_config", "nr 61 = net_config");
+    assert_streq(agnos_nr_name(95), "uptime_us", "nr 95 = uptime_us (NOT Linux umask)");
     assert_streq(agnos_nr_name(36), "unknown", "nr 36 = unknown (unmirrored)");
     assert_streq(agnos_nr_name(99), "unknown", "nr 99 = unknown (out of surface)");
 
@@ -50,6 +51,7 @@ fn main() {
     assert_eq(agnos_argc(2), 0, "getpid arity 0");
     assert_eq(agnos_argc(1), 3, "write arity 3");
     assert_eq(agnos_argc(31), 4, "rename arity 4 (a4=r10)");
+    assert_eq(agnos_argc(95), 0, "uptime_us arity 0");
     assert_eq(agnos_ptrmask(1), 2, "write buf is arg1");
     assert_eq(agnos_ptrmask(33), 5, "stat path+statbuf are arg0+arg2");
     assert_eq(agnos_ptrmask(2), 0, "getpid has no pointer args");
@@ -113,6 +115,48 @@ fn main() {
     assert_eq(ms_from_timespec(0, 0), 0, "zero");
     assert_eq(ms_from_timespec(0, 999999), 0, "sub-ms truncates");
     assert_eq(ms_from_timespec(10, 1000000), 10001, "10s + 1ms");
+
+    # us_from_timespec (uptime_us#95 emulation arithmetic, 1.11.3).
+    test_group("xlat-us");
+    assert_eq(us_from_timespec(1, 500000000), 1500000, "1s 500ms -> us");
+    assert_eq(us_from_timespec(0, 0), 0, "zero");
+    assert_eq(us_from_timespec(0, 999), 0, "sub-us truncates");
+    assert_eq(us_from_timespec(10, 1000), 10000001, "10s + 1us");
+    assert_eq(us_from_timespec(3, 7000000) / 1000, ms_from_timespec(3, 7000000), "us/1000 == ms (one epoch)");
+
+    # sysinfo#35 caller-length tiers (agnos kernel 40/104/200/208, 1.11.3).
+    test_group("sysinfo-tiers");
+    assert_eq(sysinfo_len(0), 0, "len 0 -> reject");
+    assert_eq(sysinfo_len(39), 0, "len 39 -> reject (no partial fill)");
+    assert_eq(sysinfo_len(40), 40, "len 40 -> base 40");
+    assert_eq(sysinfo_len(103), 40, "len 103 -> base 40 (below the band)");
+    assert_eq(sysinfo_len(104), 104, "len 104 -> +per-core band");
+    assert_eq(sysinfo_len(199), 104, "len 199 -> 104");
+    assert_eq(sysinfo_len(200), 200, "len 200 -> +BLK-tag band");
+    assert_eq(sysinfo_len(207), 200, "len 207 -> 200");
+    assert_eq(sysinfo_len(208), 208, "len 208 -> +sched_kicks");
+    assert_eq(sysinfo_len(4096), 208, "len 4096 -> exactly 208 (never the caller's len)");
+
+    # /proc/stat cpuN line -> agnos per-core {user, kernel} ticks (1.11.3).
+    test_group("procstat-cpu-ticks");
+    var ps = "cpu  900 10 300 5000 40 5 6 7 0 0\ncpu0 100 1 30 500 4 2 3 9 0 0\ncpu1 200 2 60 1000 8 1 1 0 0 0\ncpu12 7 0 1 2 0 0 0\nintr 1 2 3\n";
+    var pn = strlen(ps);
+    var pt2 = alloc(16);
+    store64(pt2, 0 - 1);
+    store64(pt2 + 8, 0 - 1);
+    assert_eq(procstat_cpu_ticks(ps, pn, 0, pt2), 1, "cpu0 found");
+    assert_eq(load64(pt2), 101, "cpu0 user = user + nice");
+    assert_eq(load64(pt2 + 8), 539, "cpu0 kernel = system + idle + iowait + irq + softirq (no steal)");
+    assert_eq(procstat_cpu_ticks(ps, pn, 1, pt2), 1, "cpu1 found");
+    assert_eq(load64(pt2), 202, "cpu1 user");
+    assert_eq(load64(pt2 + 8), 1070, "cpu1 kernel");
+    assert_eq(procstat_cpu_ticks(ps, pn, 12, pt2), 1, "cpu12 found (multi-digit id)");
+    assert_eq(load64(pt2), 7, "cpu12 user");
+    assert_eq(load64(pt2 + 8), 3, "cpu12 kernel");
+    store64(pt2, 0 - 1);
+    assert_eq(procstat_cpu_ticks(ps, pn, 2, pt2), 0, "cpu2 absent -> 0");
+    assert_eq(load64(pt2), 0 - 1, "absent cpu leaves out untouched");
+    assert_eq(procstat_cpu_ticks("cpu3 1 2\n", 9, 3, pt2), 0, "a short cpu line is not read");
 
     # mmap 6-arg register synthesis into a seeded regs buffer.
     test_group("xlat-mmap-synth");
@@ -191,6 +235,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(60), 0 - 1, "winsize#60 -> no peer (v1.9.0: EMULATE, (cols<<16)|rows)");
     assert_eq(agnos_to_linux_nr(61), 0 - 1, "net_config#61 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(62), 0 - 1, "out-of-range#62 -> ENOSYS");
+    assert_eq(agnos_to_linux_nr(95), 0 - 1, "uptime_us#95 -> no peer (v1.11.3: EMULATE at the dispatcher; Linux #95 is umask)");
     assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
 
     test_group("fs-ao-to-o");
