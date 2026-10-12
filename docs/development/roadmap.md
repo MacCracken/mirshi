@@ -40,6 +40,47 @@ multi-process, signals, I/O multiplexing, the info-getter long-tail, and tty siz
 | **Info getters + locks (post-v1)** | v1.8.0 | `getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the **ENOSYS long-tail**: the info getters **supervisor-emulated** (synthesized agnos-native structs — `getuid`→0, `uname`/`sysinfo` from live host values, never leaking host identity), `flock` **execute-in-child** (real inode-keyed advisory lock) ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) |
 | **tty sizing (post-v1)** | v1.9.0 | `winsize#60` — the **whole direction-1 graphics surface** (no `fbinfo`/`blit` exists): **supervisor-emulated** `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default, always a usable size), consumer-verified against darshana ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)). **Direction 1 feature-complete.** |
 
+## Open defects — the signal band (filed 2026-10-12 from darshana's 1.1.4 audit)
+
+Found while auditing darshana's AGNOS `tty_open_signalfd` / `tty_close_signalfd` peers, which are
+consumer-verified against mirshi the way `winsize#60` is ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)).
+Each was checked against mirshi HEAD `2314569` and, where it says so, the agnos kernel's own code.
+Together they mean an agnos program's signalfd **never receives a signal under mirshi**, although the
+same program works on the agnos kernel.
+
+1. **A blocked signal is never readable through a signalfd.** `_sigfd_read` and the epoll readiness
+   test deliver `pending & watched & ~blocked` (`_sig_deliverable`, `src/children.cyr:163`;
+   `src/dispatch.cyr:959`, `:1199`). The agnos kernel's `vfs_read_signalfd`
+   (`agnos/kernel/core/vfs.cyr:838`) delivers `pending & sigmask` and ignores the blocked mask, as Linux
+   does — and a signalfd consumer *must* block the signals first, or they take their default action
+   instead. So under mirshi the signal a program is waiting for is exactly the one that can never be
+   read. **Confirmed by run**: an agnos program that opens a `TTY_SIGMASK_EXIT` signalfd (block, then
+   `signalfd#18`) and then `kill#16`s itself with SIGTERM gets `kill = 0` (the pending bit is set) and
+   then 6 s of `read#5 = -1`. ADR 0014 §Decision specifies the `~blocked` term, so the ADR needs the
+   correction too.
+2. **The `read#5` record differs from the kernel's.** mirshi writes an 8-byte i64, requires `len >= 8`
+   and returns -1 when nothing is pending; the kernel stores a 4-byte value (`store32`), requires
+   `count >= 4`, returns 4, and returns **0** when nothing is pending. It also scans signals 1..31 where
+   mirshi accepts 1..63. A program written against one fails on the other (a 4-byte buffer is -1 under
+   mirshi; a `n == 8` check never matches on the kernel). Confirmed by reading both.
+3. **Host-originated signals bypass the agnos signal model.** `C_PENDING_SIG` has exactly one writer,
+   `_do_kill` (agnos `kill#16`, `src/intercept.cyr:523`). A signal that arrives from the host — a
+   terminal Ctrl-C, a host `kill`, a SIGHUP, a SIGWINCH on resize — takes the ptrace signal-delivery
+   path (`src/intercept.cyr:636-643`) and is re-injected as a REAL Linux signal, with the real default
+   action, because the child's agnos blocked mask exists only in the supervisor. **Confirmed by run**:
+   the same program, with SIGTERM blocked and watched, killed by a host `kill -TERM <child>` — mirshi
+   exits 143 and the signalfd never sees it. For a screen-owning program that is the worst case: Ctrl-C
+   kills it instead of waking its teardown, so the terminal is left raw. (SIGWINCH is not raised by the
+   agnos kernel either — a kernel item, not mirshi's — but under mirshi a host resize cannot reach the
+   child's signal model at all.)
+4. **Closing a signalfd never frees its slot.** `close#6` frees emulated timerfd and epoll slots, but a
+   signalfd close "stays a real close" (`src/dispatch.cyr:1951-1952`, the documented v1.6.0 limit): the
+   Linux `close` of the emulated id fails with EBADF and the slot stays taken. With `SIGNALFD_SLOTS = 8`
+   (`src/children.cyr:29`), the 9th `signalfd#18(-1, …)` in a process returns -1. Confirmed by reading.
+5. *(Low.)* **`sigprocmask#17` edge cases diverge from the kernel.** For `how >= 3` mirshi leaves the
+   mask unchanged and returns 0, where the kernel stores the new set verbatim; mirshi accepts a NULL
+   `set` (query only), which the kernel rejects (`is_user_range(arg2, 8)`). Confirmed by reading both.
+
 ## Planned — the direction-2 major
 
 **Direction 1 (AGNOS→Linux) is feature-complete** — every defined, non-kernel-only agnos syscall is
