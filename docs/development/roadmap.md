@@ -81,6 +81,45 @@ same program works on the agnos kernel.
    mask unchanged and returns 0, where the kernel stores the new set verbatim; mirshi accepts a NULL
    `set` (query only), which the kernel rejects (`is_user_range(arg2, 8)`). Confirmed by reading both.
 
+## Open defects — kernel fidelity (filed 2026-10-28 from hapi's 1.1.1 P(-1) audit)
+
+Found while running hapi's agnos build both under mirshi and on an agnos 1.57.14 kernel booted in QEMU
+(hapi `docs/audit/2026-10-28-audit.md`, § *Harness gap*). On each of these calls mirshi gives the
+host-Linux answer where the kernel refuses, so a program that passes under mirshi fails on agnos — and
+the failure paths of the program can never be exercised under mirshi. hapi hit two real bugs this way:
+one is a symlink-following hole that only the kernel shows, and the other is `hapi adopt` being
+unusable on agnos. Items 1–4 were **confirmed by run** on mirshi HEAD `b2b6274` (the 1.11.3 tree,
+built with cyrius 6.7.18) and on the kernel, and by reading the kernel at agnos `839e8d54`.
+
+1. **readlink#70 truncates where the kernel refuses.** For a link body longer than the caller's buffer,
+   the kernel returns **-1** (`ext2_readlink`: `if (tlen > cap) return -1`,
+   `agnos/kernel/core/ext2.cyr:3226`; ZFS does the same). mirshi forwards to Linux `readlink`
+   (`src/translate.cyr:50`, `src/dispatch.cyr:66`), which truncates and returns the buffer length.
+   Run: an 84-byte link read into 64 bytes is **64** under mirshi and **-1** on the kernel. hapi
+   probed "is this a symlink?" with a 64-byte buffer, so on the kernel any link body of 65 bytes or more
+   read as "not a symlink" and was followed. mirshi said it was refused.
+2. **open#7 opens a directory without `AO_DIRECTORY`.** The kernel's `ext2_open` refuses any
+   non-regular file (`(mode & 0xF000) != 0x8000` → -1, `ext2.cyr:3417`); a directory opens only through
+   the `AO_DIRECTORY` arm (`syscall.cyr`, `sys_open_ext2_inner`). mirshi forwards `AO_RDONLY` to Linux
+   `open` (`src/translate.cyr:38`), which opens a directory read-only. Run: fd **3** under mirshi,
+   **-1** on the kernel.
+3. **flock#59 locks a directory fd.** The kernel accepts only an ext2 regular-file fd
+   (`ktag(fl_base) != VFS_EXT2_FILE` → -1, `syscall.cyr:12376`), and returns **-2** when its lock
+   table is full. mirshi forwards to Linux `flock` (`src/translate.cyr:49`), which locks anything.
+   Run: **0** under mirshi, **-1** on the kernel. This is hapi's manifest lock, so `hapi adopt` passes
+   under mirshi and fails on agnos.
+4. **rename#31 replaces an existing destination.** The kernel refuses it (`ext2_rename`:
+   "rename-replace is a follow-on bite", `ext2.cyr:3058-3061`). mirshi forwards to Linux `rename`
+   (`src/translate.cyr:43`), which replaces atomically. Run: **0** under mirshi, **-1** on the kernel.
+   ⚠ This one tracks a kernel change that is planned. When the kernel's rename-replace lands, mirshi's
+   current answer becomes the right one. Until then, refusing is what lets a program's no-replace
+   fallback be tested at all.
+5. *(Low.)* **No environment.** The kernel stages `HOME=/` and `PWD=/` into every init envp at exec
+   (`elf.cyr:714-727`); mirshi passes `[NULL]` (`src/intercept.cyr:211-213`, and `:229-231` for the
+   memfd spawn). So `getenv("HOME")` is a valid path on agnos and null under mirshi. hapi's
+   `$HOME`-scoped verbs cannot run under mirshi at all. Its default scope on agnos, `/`, was refusing
+   every row (hapi F-047), and that defect was found only on the real kernel. Confirmed by reading both.
+
 ## Planned — the direction-2 major
 
 **Direction 1 (AGNOS→Linux) is feature-complete** — every defined, non-kernel-only agnos syscall is
