@@ -9,6 +9,11 @@
 #
 # Added v5.7.35 (agnosys luks-surfaced).
 
+# 6.6.9: random_bytes calls sys_getrandom (the syscall peer), and this file included nothing, so
+# a bare include compiled with an undefined function — a ud2 stub at the first draw.
+# CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+
 # Flags accepted by `sys_getrandom(buf, len, flags)`. Bitwise-or
 # combinable. The default (flags = 0) is "block until seeded,
 # read from the kernel CSPRNG" — what callers want 99% of the
@@ -28,9 +33,15 @@ enum GrndFlag {
 # Uses flags = 0 — for non-blocking or /dev/random behavior,
 # call sys_getrandom directly with the GrndFlag constants.
 #
-# Note: getrandom can return short reads if the request is
-# > 256 bytes. random_bytes loops until the full request is
-# satisfied or a real error surfaces.
+# Short reads are part of the contract, so this loops until the
+# full request is satisfied or a real error surfaces: Linux
+# getrandom fills requests of <= 256 bytes whole but may return
+# fewer bytes for a larger one (a signal interrupting it, or the
+# 32 MiB per-call cap), and on macOS sys_getrandom hands at most
+# 256 bytes per call, because Darwin getentropy refuses anything
+# larger outright (-EINVAL) — before 6.6.10 that refusal reached
+# here as an error, so every request above 256 bytes failed on
+# both Macs. CHANGELOG [6.6.10]
 fn random_bytes(buf, len): i64 {
     var off = 0;
     while (off < len) {

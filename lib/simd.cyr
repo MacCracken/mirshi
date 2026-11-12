@@ -20,7 +20,8 @@
 # Pointer-form retained for callsites that have raw f64v2 pointers
 # (e.g. dynamically-allocated f64v2 arrays) AND as the sole shape
 # on Win64 PE — value-form fns are gated on
-# CYRIUS_HAS_VAL_SIMD_PARAMS (defined by every non-PE main_*.cyr).
+# CYRIUS_HAS_VAL_SIMD_PARAMS (defined by EVERY emit path since v6.4.31/.32;
+# main.cyr's PE/Mach-O cross arms were fixed at v6.4.81).
 # On PE the overload dispatch still works: `f64v2_add(&x, &y)`
 # routes to `f64v2_add_ptr` transparently.
 #
@@ -145,6 +146,18 @@ fn f64v4_lane2_ptr(p): i64 { return load64(p + 16); }
 # Lane 3 extractor (pointer form).
 fn f64v4_lane3_ptr(p): i64 { return load64(p + 24); }
 
+# --- f64v4 arithmetic: 256-bit ymm when the CPU has AVX2, else 2×SSE (v6.5.24) ---
+# All four ops (add/sub/mul/div), in BOTH the pointer and value forms below, pick the
+# 256-bit packed-double kernel `f64v256_*` (vaddpd/vsubpd/vmulpd/vdivpd ymm — ONE
+# iteration for all four lanes) when the host advertises AVX2, and otherwise keep the
+# 128-bit `f64v_*` path (two iterations). Measured 15.9 -> ~7.9 ns.
+#
+# ⚠ THE GATE IS NOT OPTIONAL. `f64v256_*` emits unconditional VEX, which #UDs (SIGILL) on
+# any pre-AVX2 x86. `simd_has_avx2()` also returns 0 on every non-x86 target — its CPUID
+# probe is `#ifdef CYRIUS_ARCH_X86` and no-ops elsewhere — so aarch64 / Mach-O-arm64 / cx
+# take the `f64v_*` NEON-or-portable path for free, exactly as the f32v8 wrappers do.
+# ⚠ n is 4 here and MUST stay a multiple of 4: the ymm emitter strides its index by 4.
+# The f64v2 wrappers above pass n=2 and MUST keep calling `f64v_*` — never widen them.
 # Pointer form of f64v4_add.
 fn f64v4_add_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
@@ -176,12 +189,16 @@ fn f64v4_div_ptr(a_ptr, b_ptr): f64v4 {
 # Pointer form of f64v4_fmadd.
 fn f64v4_fmadd_ptr(a_ptr, b_ptr, c_ptr): f64v4 {
     var r: f64v4;
-    f64v_fmadd(&r, a_ptr, b_ptr, c_ptr, 4);
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { f64v256_fmadd(&r, a_ptr, b_ptr, c_ptr, 4); }
+    else { f64v_fmadd(&r, a_ptr, b_ptr, c_ptr, 4); }
     return r;
 }
 
 # Pointer form of f64v4_dot.
 fn f64v4_dot_ptr(a_ptr, b_ptr): i64 {
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f64v256_dot(a_ptr, b_ptr, 4); }
     return f64v_dot(a_ptr, b_ptr, 4);
 }
 
@@ -235,12 +252,11 @@ fn f32v4_lane2_ptr(p): i64 { return load32(p + 8); }
 # Extract lane 3 (pointer form). Parser routes f32v4_lane3(&v) here.
 fn f32v4_lane3_ptr(p): i64 { return load32(p + 12); }
 
-# Packed f32v4 arithmetic — addps/subps/mulps — is x86-only in SIMD Phase 1
-# (v6.4.4); aarch64 NEON + cx land in Phase 5. On aarch64/cx EMIT_F32V_LOOP is a
-# stub, so these wrappers COMPILE (emit no packed op) but a call produces no
-# result — DO NOT use f32v4 arithmetic on aarch64/cx yet. (The simd_f32v4 tcyr
-# is XFAIL'd in the aarch64-native CI corpus so Phase 5 auto-surfaces via XPASS —
-# see docs/development/issues/2026-07-05-aarch64-f32v4-xfail-phase5.md.)
+# Packed f32v4 arithmetic — addps/subps/mulps. **CROSS-ARCH as of SIMD Phase 5
+# (v6.4.28):** x86 emits SSE (Phase 1, v6.4.4); aarch64 emits NEON (.4s fadd/fsub/fmul
+# via EMIT_F32V_LOOP). cx remains a stub (its SIMD pipeline is a separate slot). Gates:
+# simd_f32v4.tcyr (value + pointer forms, x86-Linux + aarch64 corpus) + the Win64-safe
+# flat-array tests/tcyr/crossos/simd_f32v4_neon.tcyr (cross-OS: ecb/ach/cass/pi).
 # Packed add (pointer form) — addps over the 4 lanes. Routes f32v4_add(&x, &y) here.
 fn f32v4_add_ptr(a_ptr, b_ptr): f32v4 {
     var r: f32v4;
@@ -345,24 +361,21 @@ fn f32v8_lane7_ptr(p): i64 { return load32(p + 28); }
 # Packed add (pointer form) — vaddps ymm (AVX2) or 2×SSE addps. Routes f32v8_add(&x, &y).
 fn f32v8_add_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_add(&r, a_ptr, b_ptr, 8); }
-    else { f32v_add(&r, a_ptr, b_ptr, 8); }
+    f32v_add(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
 # Packed sub (pointer form) — vsubps ymm (AVX2) or 2×SSE subps.
 fn f32v8_sub_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_sub(&r, a_ptr, b_ptr, 8); }
-    else { f32v_sub(&r, a_ptr, b_ptr, 8); }
+    f32v_sub(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
 # Packed mul (pointer form) — vmulps ymm (AVX2) or 2×SSE mulps.
 fn f32v8_mul_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_mul(&r, a_ptr, b_ptr, 8); }
-    else { f32v_mul(&r, a_ptr, b_ptr, 8); }
+    f32v_mul(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
@@ -407,7 +420,8 @@ fn simd_has_fma(): i64 {
 # needing bit-equality across CPUs should use exact-product inputs.
 fn f32v8_fma_ptr(a_ptr, b_ptr, c_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_fma() == 1) { f32v8_fma(&r, a_ptr, b_ptr, c_ptr, 8); }
+    if (_fma_cache == 2) { simd_has_fma(); }
+    if (_fma_cache == 1) { f32v8_fma(&r, a_ptr, b_ptr, c_ptr, 8); }
     else { f32v_fmadd(&r, a_ptr, b_ptr, c_ptr, 8); }
     return r;
 }
@@ -415,7 +429,8 @@ fn f32v8_fma_ptr(a_ptr, b_ptr, c_ptr): f32v8 {
 # Horizontal dot (pointer form): sum(a[i]*b[i]) over 8 lanes → f32 bit pattern. AVX2
 # (vmulps/vaddps accumulate + vextractf128 8-lane reduce) when available, else SSE f32v_dot.
 fn f32v8_dot_ptr(a_ptr, b_ptr): i64 {
-    if (simd_has_avx2() == 1) { return f32v8_dot(a_ptr, b_ptr, 8); }
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f32v8_dot(a_ptr, b_ptr, 8); }
     return f32v_dot(a_ptr, b_ptr, 8);
 }
 
@@ -437,7 +452,9 @@ fn f32v4_dot_ptr(a_ptr, b_ptr): i64 {
 # i32v4 (4×i32), i16v8 (8×i16), i8v16 (16×i8), i64v2 (2×i64). Construct + packed
 # add/sub/mul via the descriptor-driven iv_* builtins (last arg = lane byte-width).
 # add/sub are two's-complement (signed==unsigned); mul is i16/i32 only. Values are
-# plain i64s truncated to the lane width. x86-only until Phase 5 (aarch64/cx stub).
+# plain i64s truncated to the lane width. **CROSS-ARCH as of v6.4.30:** x86 SSE
+# (padd/psub/pmull) + aarch64 NEON (add/sub/mul .16b/.8h/.4s/.2d via EMIT_IVEC_BINOP);
+# cx stub. Cross-OS-gated by tests/tcyr/crossos/simd_ints_neon.tcyr (ecb/ach/cass/pi).
 
 # Build an i32v4 from four i32 values.
 fn i32v4_make(a, b, c, d): i32v4 {
@@ -486,12 +503,16 @@ fn i64v2_splat(x): i64v2 { return i64v2_make(x, x); }
 fn i64v2_add_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_add(&r, a_ptr, b_ptr, 2, 8); return r; }
 # Packed sub (pointer form) — psubq.
 fn i64v2_sub_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_sub(&r, a_ptr, b_ptr, 2, 8); return r; }
+# Packed multiply (pointer form) — low 64 bits/lane via the pmuludq sequence (SSE
+# has no pmullq). CHANGELOG [6.4.53]: closes the integer-SIMD arc's last unbuilt op.
+fn i64v2_mul_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_mul(&r, a_ptr, b_ptr, 2, 8); return r; }
 
-# --- Value-form typed wrappers (non-PE targets only) ---
-# Gated on CYRIUS_HAS_VAL_SIMD_PARAMS, predefined by every main_*.cyr
-# except main_win.cyr. On Win64 PE these fns are absent; the parser's
-# `&IDENT → _ptr` overload dispatch keeps `f64v2_add(&x, &y)` working
-# unchanged across all targets (it routes to the pointer-form sibling).
+# --- Value-form typed wrappers (ALL targets since v6.4.31/.32) ---
+# Gated on CYRIUS_HAS_VAL_SIMD_PARAMS, predefined by every emit path:
+# Win64 PE gained it at v6.4.31 and cx at v6.4.32, and v6.4.81 added it to
+# main.cyr's PE/Mach-O CROSS arms, which had been missing it since .31 (so a
+# cross-built binary silently lost these fns). The parser's `&IDENT → _ptr`
+# overload dispatch keeps `f64v2_add(&x, &y)` working unchanged everywhere.
 
 #ifdef CYRIUS_HAS_VAL_SIMD_PARAMS
 
@@ -581,8 +602,18 @@ fn f64v4_lane2(v: f64v4): i64 { return load64(&v + 16); }
 fn f64v4_lane3(v: f64v4): i64 { return load64(&v + 24); }
 
 # 4-lane packed-double add (value form): r[i] = a[i] + b[i].
+# ⚠ These four value forms carry the SAME AVX2 gate as their `_ptr` siblings — see the
+# comment block above `f64v4_add_ptr`. This fn's NAME is also why the builtin is spelled
+# `f64v256_add` rather than `f64v4_add`: the lane-count name was already taken here, and
+# reserving it as a keyword would make this very definition a parse error.
 fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
     f64v_add(&r, &a, &b, 4);
     return r;
 }
@@ -590,6 +621,12 @@ fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
 # 4-lane packed-double subtract (value form).
 fn f64v4_sub(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
     f64v_sub(&r, &a, &b, 4);
     return r;
 }
@@ -597,6 +634,12 @@ fn f64v4_sub(a: f64v4, b: f64v4): f64v4 {
 # 4-lane packed-double multiply (value form).
 fn f64v4_mul(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
     f64v_mul(&r, &a, &b, 4);
     return r;
 }
@@ -604,19 +647,32 @@ fn f64v4_mul(a: f64v4, b: f64v4): f64v4 {
 # 4-lane packed-double divide (value form).
 fn f64v4_div(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
     f64v_div(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane FMA (value form): r[i] = a[i] * b[i] + c[i].
+# v6.5.38: gated onto the 256-bit kernel, matching add/sub/mul/div above. Until now this ran
+# the 128-bit SSE2 loop unconditionally — two iterations for four lanes — because `.24` widened
+# only the four arithmetic ops and left the rest of the family behind.
 fn f64v4_fmadd(a: f64v4, b: f64v4, c: f64v4): f64v4 {
     var r: f64v4;
-    f64v_fmadd(&r, &a, &b, &c, 4);
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { f64v256_fmadd(&r, &a, &b, &c, 4); }
+    else { f64v_fmadd(&r, &a, &b, &c, 4); }
     return r;
 }
 
 # 4-lane dot product (value form). Returns f64 bit pattern in i64.
 fn f64v4_dot(a: f64v4, b: f64v4): i64 {
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f64v256_dot(&a, &b, 4); }
     return f64v_dot(&a, &b, 4);
 }
 
@@ -641,7 +697,7 @@ fn f64v4_sqrt(a: f64v4): f64v4 {
     return r;
 }
 
-# --- f32v4 value-form (non-PE) — v6.4.3+ SIMD Phase 1 ---
+# --- f32v4 value-form (all targets) — v6.4.3+ SIMD Phase 1 ---
 
 # Extract lane 0 (value form). Parser routes f32v4_lane0(v) here; &v → _ptr sibling.
 fn f32v4_lane0(v: f32v4): i64 { return load32(&v + 0); }
@@ -719,4 +775,6 @@ fn i8v16_sub(a: i8v16, b: i8v16): i8v16 { var r: i8v16; iv_sub(&r, &a, &b, 16, 1
 fn i64v2_add(a: i64v2, b: i64v2): i64v2 { var r: i64v2; iv_add(&r, &a, &b, 2, 8); return r; }
 # Packed i64 sub (value form).
 fn i64v2_sub(a: i64v2, b: i64v2): i64v2 { var r: i64v2; iv_sub(&r, &a, &b, 2, 8); return r; }
+# Packed i64 multiply (value form) — low 64 bits/lane via pmuludq sequencing.
+fn i64v2_mul(a: i64v2, b: i64v2): i64v2 { var r: i64v2; iv_mul(&r, &a, &b, 2, 8); return r; }
 #endif

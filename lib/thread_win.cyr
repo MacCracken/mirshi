@@ -9,10 +9,9 @@
 #   thread_join   → WaitForSingleObject(INFINITE) (0xF001) + CloseHandle (syscall 3).
 #   mutex_*       → SRWLOCK: InitializeSRWLock (0xF008) / AcquireSRWLockExclusive
 #     (0xF009) / ReleaseSRWLockExclusive (0xF00A) — an 8-byte in-place lock cell.
-#   chan_*        → a mutex-protected FIFO ring (thread-safe send/recv). recv is
-#     NON-BLOCKING (returns 0 on empty) — a blocking recv needs a condition
-#     variable (SleepConditionVariableSRW), a future upgrade when a consumer
-#     forces it.
+#   chan_*        → a SRWLOCK-protected FIFO ring whose waiters block on an I/O
+#     completion port (6.6.16): recv blocks while empty and send while full, as on
+#     Linux (CHAN_BLOCKING = 1). See the channel section below.
 # Supersedes the v6.0.53 serial fallback. See
 # 2026-06-03-windows-threading-stdlib-gap.md + the Windows nuances issue.
 # NOTE: the bump allocator (alloc.cyr) is not itself thread-safe, so thread
@@ -27,6 +26,17 @@
 # >>> include "lib/fnptr.cyr"
 include "lib/fnptr.cyr"
 
+# v6.5.44 — THREADS_CONCURRENT: does thread_create actually produce a SECOND thread?
+# 1 = the body runs concurrently with the caller; 0 = it runs INLINE at create (serial peer).
+# ⛔ This exists because the concurrency corpus could not tell the two apart. Every test in it
+# passed on macOS while bodies ran inline — a serial backend satisfies "the worker ran", "join
+# returned 0" and "the count is exact". A test that DISCRIMINATES must be guarded by capability
+# (never by target name, never by errno — the v6.5.36 lesson), and this is that capability.
+# Windows is 1: thread_create below is CreateThread, a real preemptive thread (v6.0.61). It
+# read 0 from v6.5.44 to 6.6.15 — a stale serial-peer value, so the discriminator never
+# asserted here (CHANGELOG [6.6.16]).
+var THREADS_CONCURRENT = 1;   # REAL CreateThread threads (v6.0.61)
+
 # Create a real OS thread: CreateThread(NULL, 0, fp, arg, 0, NULL). fp is the
 # cyrius thread-body fn pointer (&body) — a single-i64-param fn returning i64,
 # which compiled for PE is already a valid MS-x64 ThreadProc (lpParameter arrives
@@ -37,6 +47,7 @@ fn thread_create(fp, arg): i64 {
     alloc_init();
     _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before CreateThread
     var a = alloc(48);
+    if (a == 0) { return 0; }
     store64(a,      0);    # lpThreadAttributes = NULL
     store64(a + 8,  0);    # dwStackSize = 0 (default)
     store64(a + 16, fp);   # lpStartAddress = the cyrius body
@@ -55,6 +66,34 @@ fn thread_join(t): i64 {
     return 0;
 }
 
+# v6.5.8: detached spawn. Windows needs no unmap trampoline — the OS owns the thread
+# stack and reclaims it at thread exit — so detaching is just dropping our reference:
+# CreateThread then CloseHandle immediately. The thread keeps running; only the HANDLE
+# is released, which is what would otherwise leak (a never-closed HANDLE is a kernel
+# object leak, the PE-side analogue of thread.cyr's stranded 2 MiB mapping).
+# Returns 1 on success, 0 on failure — boolean, matching thread.cyr, because there is
+# deliberately nothing left to join.
+fn thread_create_detached(fp, arg): i64 {
+    var h = thread_create(fp, arg);
+    if (h == 0) { return 0; }
+    syscall(3, h);          # CloseHandle — the thread runs on
+    return 1;
+}
+
+# v6.5.8: non-blocking completion test. WaitForSingleObject with a 0 timeout returns
+# WAIT_OBJECT_0 (0) if signalled, WAIT_TIMEOUT (0x102 = 258) if still running.
+# ⛔ VALID ONLY BEFORE `thread_join`. Join CONSUMES the handle — on Windows it
+# CloseHandle()s it, so a post-join query inspects a closed handle and reports "not
+# done" (caught on real cass hardware, by a test that asserted the wrong contract).
+# The intended use is the reaper shape: poll while running, then join once this
+# returns 1. After joining, the thread is done by definition and there is nothing
+# left to ask.
+fn thread_is_done(t): i64 {
+    if (t == 0) { return 0 - 1; }
+    if (syscall(61441, t, 0) == 0) { return 1; }
+    return 0;
+}
+
 # Current thread id — the real Win32 GetCurrentThreadId (0xF00B reroute).
 fn gettid(): i64 { return syscall(61451); }
 
@@ -65,60 +104,326 @@ fn gettid(): i64 { return syscall(61451); }
 # sync-stdlib); thread.cyr includes sync.cyr at its top before routing here. The
 # channel below uses mutex_* unchanged.
 
-# Channel — a thread-safe FIFO ring over the same 56-byte layout as thread.cyr
-# ({buf@0, cap@8, head@16, tail@24, count@32, mutex@40 (inline SRWLOCK), closed@48}).
-# send/recv are SRWLOCK-protected; recv is NON-BLOCKING (0 when empty — a blocking
-# recv needs a condvar, future).
+# Channel — the same 56-byte header as lib/thread.cyr:
+#   { buf@0, cap@8, head@16, tail@24, count@32, lock@40 (an inline SRWLOCK), closed@48 }
+# A BLOCKING channel since 6.6.16, because threads here are real CreateThread threads:
+# chan_recv blocks until a value arrives and returns 0 once the channel is closed and empty;
+# chan_send blocks while the ring is full and returns -1 once the channel is closed. That is
+# lib/thread.cyr's contract.
+# ⛔ Through 6.6.15 the ring was locked but nothing ever waited: chan_recv answered 0 when
+# empty and chan_send failed with -1 when full, so a pool of workers looping on chan_recv
+# read the 0 as "closed" and exited at once. Issue
+# 2026-10-04-sandhi-macos-chan-serial-under-real-threads measured that shape on macOS.
+#
+# HOW IT WAITS. No futex-style wait (WaitOnAddress) or condition variable is routed on PE, and
+# this stays lib-only. So a waiter blocks in GetQueuedCompletionStatus on an I/O completion
+# port that only it is waiting on: PostQueuedCompletionStatus leaves one token in the port,
+# and GetQueuedCompletionStatus(INFINITE) takes it, blocking until there is one. These are the
+# reroutes 0xF01F / 0xF020 / 0xF021 that lib/async_win.cyr already uses. `buf` holds the cap
+# slots, then a 32-byte wait block { rhead@0, rtail@8, shead@16, stail@24 }: two FIFO queues of
+# waiting threads, receivers and senders. A queue node lives in the waiting call's own frame,
+# { next@0, port@8 }.
+#   - A waiter finds, UNDER THE LOCK, that it must wait. It appends its node, carrying the port
+#     it holds, unlocks, and takes a token from that port.
+#   - A waker changes the state UNDER THE LOCK. If a waiter of the other kind is queued, it
+#     unlinks the OLDEST one and, after unlocking, posts one token to its port. chan_close
+#     unlinks every waiter of both kinds, one per locked turn, and posts each its token.
+#   - A woken waiter re-tests under the lock. If another thread took the value first, it queues
+#     again.
+# No wake-up is lost, because a token persists: one posted before its waiter blocks is in the
+# port when the waiter gets there. Receivers and senders queue separately, so a wake never
+# reaches the wrong kind. A waiter leaves its wait only with its token, and the token is posted
+# only after its node is unlinked, so no node outlives its frame in a queue and every port goes
+# back holding no token.
+# WHERE THE PORTS COME FROM. A process-wide pool, never the channel. A chan_* call takes a port
+# the first time it has to wait and gives it back when it returns, so the ports in existence
+# scale with the threads waiting at once, not with the channels ever waited on: a server that
+# makes a reply channel per request holds no kernel handle per request. Up to _chan_wp_cap (64)
+# idle ports are kept, in static storage rather than the heap (alloc_reset must not pull the
+# pool out from under a waiter), and any port given back beyond that is closed. Measured on cass:
+# 400 reply channels, each waited on once, took the process from 84 handles to 85, where ports
+# kept per channel took it to 484.
+# The port's concurrency value is 0x7FFFFFFF, not 0. With 0 (one running thread per CPU) the
+# port releases no further waiter while that many threads it released are still running, so a
+# posted token could sit behind busy workers. A wake-up must not be held back.
+# If no port can be had, the waiter sleeps 1 ms and re-tests without queueing: degraded, but it
+# neither spins nor loses a value.
+# CHAN_BLOCKING lives here rather than beside THREADS_CONCURRENT: the line that declares
+# THREADS_CONCURRENT is a separate 6.6.16 change. CHANGELOG [6.6.16]
+var CHAN_BLOCKING = 1;
+
+# The wait block sits after the ring's cap slots.
+fn _chan_wb(ch): i64 { return load64(ch) + load64(ch + 8) * 8; }
+
+# The pool of idle wait ports, under its own SRWLOCK (SRWLOCK_INIT is all zero, so the zeroed
+# global needs no InitializeSRWLock). It is never taken while a channel's lock is held.
+var _chan_wp_cap = 64;          # the slot count of _chan_wp_keep
+var _chan_wp_keep: i64[64];
+var _chan_wp_n = 0;
+var _chan_wp_lock = 0;
+
+# A port for one chan_* call to wait on: an idle one from the pool, else a fresh one
+# (CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, concurrency)). 0 if none can be had.
+fn _chan_wp_get(): i64 {
+    var p = 0;
+    syscall(61449, &_chan_wp_lock);   # AcquireSRWLockExclusive
+    if (_chan_wp_n > 0) {
+        _chan_wp_n = _chan_wp_n - 1;
+        p = load64(&_chan_wp_keep + _chan_wp_n * 8);
+    }
+    syscall(61450, &_chan_wp_lock);   # ReleaseSRWLockExclusive
+    if (p != 0) { return p; }
+    return syscall(0xF01F, 0 - 1, 0, 0, 2147483647);
+}
+
+# Give back a port that holds no token and that no waker will post to: keep it idle, or close
+# it when the pool is full. 0 is "no port" and is ignored.
+fn _chan_wp_put(p): i64 {
+    if (p == 0) { return 0; }
+    var kept = 0;
+    syscall(61449, &_chan_wp_lock);
+    if (_chan_wp_n < _chan_wp_cap) {
+        store64(&_chan_wp_keep + _chan_wp_n * 8, p);
+        _chan_wp_n = _chan_wp_n + 1;
+        kept = 1;
+    }
+    syscall(61450, &_chan_wp_lock);
+    if (kept == 0) { syscall(3, p); }   # CloseHandle
+    return 0;
+}
+
+# Under the lock: append the node at wn, waiting on `port`, to the queue at wb + qoff.
+fn _chan_enq(wb, qoff, wn, port): i64 {
+    store64(wn, 0);
+    store64(wn + 8, port);
+    var tail = load64(wb + qoff + 8);
+    if (tail == 0) {
+        store64(wb + qoff, wn);
+    } else {
+        store64(tail, wn);
+    }
+    store64(wb + qoff + 8, wn);
+    return 0;
+}
+
+# Under the lock: unlink the oldest waiter queued at wb + qoff. Returns the port to post its
+# token to, or 0 when nobody waits there (and no syscall follows).
+fn _chan_claim(wb, qoff): i64 {
+    var n = load64(wb + qoff);
+    if (n == 0) { return 0; }
+    var nx = load64(n);
+    store64(wb + qoff, nx);
+    if (nx == 0) { store64(wb + qoff + 8, 0); }
+    return load64(n + 8);
+}
+
+# Under the lock: unlink the node at wn if it is still queued at wb + qoff. 1 when it was, so
+# no waker claimed it and no token is coming; 0 when a waker already had.
+fn _chan_unlink(wb, qoff, wn): i64 {
+    var prev = 0;
+    var n = load64(wb + qoff);
+    while (n != 0) {
+        if (n == wn) {
+            var nx = load64(n);
+            if (prev == 0) {
+                store64(wb + qoff, nx);
+            } else {
+                store64(prev, nx);
+            }
+            if (load64(wb + qoff + 8) == n) { store64(wb + qoff + 8, prev); }
+            return 1;
+        }
+        prev = n;
+        n = load64(n);
+    }
+    return 0;
+}
+
+# Post one token to `port`: PostQueuedCompletionStatus(port, 0, 0, NULL).
+fn _chan_post(port): i64 {
+    syscall(0xF021, port, 0, 0, 0);
+    return 0;
+}
+
+# Take a token from `port`: GetQueuedCompletionStatus(port, .., INFINITE). 1 when one came;
+# 0 when the call failed without one (its BOOL is in the low 32 bits). A token carries no data.
+fn _chan_await(port): i64 {
+    var bytes[8];
+    var key[8];
+    var ovl[8];
+    store64(&bytes, 0);
+    store64(&key, 0);
+    store64(&ovl, 0);
+    var ok = syscall(0xF020, port, &bytes, &key, &ovl, 0 - 1);
+    if ((ok & 4294967295) != 0) { return 1; }
+    return 0;
+}
+
+# After unlocking, with the node at wn queued at wb + qoff: wait for its token. Returns the
+# port, still held by this call. If GetQueuedCompletionStatus fails instead, the port is
+# unusable: the node is unlinked if no waker had claimed it, the port is closed only when no
+# token can still be on its way to it (a closed handle's value can be reused by a new port,
+# which the stray token would then wake), the caller sleeps 1 ms, and 0 is returned.
+fn _chan_wait(ch, wb, qoff, wn, port): i64 {
+    if (_chan_await(port) == 1) { return port; }
+    syscall(61449, ch + 40);
+    var mine = _chan_unlink(wb, qoff, wn);
+    syscall(61450, ch + 40);
+    if (mine == 1) { syscall(3, port); }   # CloseHandle: nobody will post to it now
+    syscall(0xF00F, 1);                    # Sleep(1), then re-test
+    return 0;
+}
+
+# Under the lock: append val. The caller checked count < cap.
+fn _chan_put(ch, val): i64 {
+    var cap = load64(ch + 8);
+    var tail = load64(ch + 24);
+    store64(load64(ch) + tail * 8, val);
+    store64(ch + 24, (tail + 1) % cap);
+    store64(ch + 32, load64(ch + 32) + 1);
+    return 0;
+}
+
+# Under the lock: remove and return the oldest value. The caller checked count > 0.
+fn _chan_take(ch): i64 {
+    var cap = load64(ch + 8);
+    var head = load64(ch + 16);
+    var v = load64(load64(ch) + head * 8);
+    store64(ch + 16, (head + 1) % cap);
+    store64(ch + 32, load64(ch + 32) - 1);
+    return v;
+}
+
+# Create a channel with capacity `cap` (its waiter queues sit after the ring's `cap` slots);
+# 0 if an allocation fails.
 fn chan_new(cap): i64 {
     alloc_init();
     var ch = alloc(56);
-    var buf = alloc(cap * 8);
+    if (ch == 0) { return 0; }
+    var buf = alloc(cap * 8 + 32);
+    if (buf == 0) { return 0; }
     store64(ch, buf);          # buf
     store64(ch + 8, cap);      # cap
     store64(ch + 16, 0);       # head
     store64(ch + 24, 0);       # tail
     store64(ch + 32, 0);       # count
-    store64(ch + 40, 0);       # mutex (inline SRWLOCK)
-    syscall(61448, ch + 40);   # InitializeSRWLock(&mutex)
+    store64(ch + 40, 0);       # lock (inline SRWLOCK)
+    syscall(61448, ch + 40);   # InitializeSRWLock(&lock)
     store64(ch + 48, 0);       # closed
+    var wb = buf + cap * 8;
+    store64(wb, 0);            # rhead: no receiver waits
+    store64(wb + 8, 0);        # rtail
+    store64(wb + 16, 0);       # shead: no sender waits
+    store64(wb + 24, 0);       # stail
     return ch;
 }
-# Enqueue val (FIFO ring). Returns 0, or -1 if the channel is full.
+# Send val. Blocks while the ring is full. Returns 0, or -1 once the channel is closed:
+# `closed` is tested first and again after every wait.
 fn chan_send(ch, val): i64 {
+    var wb = _chan_wb(ch);
+    var wn: i64[2];            # this call's queue node while it waits
+    var port = 0;              # the wait port this call holds, from the pool
+    while (1 == 1) {
+        syscall(61449, ch + 40);   # AcquireSRWLockExclusive
+        if (load64(ch + 48) != 0) {
+            syscall(61450, ch + 40);
+            _chan_wp_put(port);
+            return 0 - 1;
+        }
+        if (load64(ch + 32) < load64(ch + 8)) {
+            _chan_put(ch, val);
+            var rp = _chan_claim(wb, 0);       # the oldest waiting receiver, if any
+            syscall(61450, ch + 40);           # ReleaseSRWLockExclusive
+            if (rp != 0) { _chan_post(rp); }
+            _chan_wp_put(port);
+            return 0;
+        }
+        if (port == 0) {
+            # Full, and this call holds no port yet: fetch one outside the lock, then re-test.
+            syscall(61450, ch + 40);
+            port = _chan_wp_get();
+            if (port == 0) { syscall(0xF00F, 1); }   # none to be had: Sleep(1)
+        } else {
+            _chan_enq(wb, 16, &wn, port);      # full: queue as a sender
+            syscall(61450, ch + 40);
+            port = _chan_wait(ch, wb, 16, &wn, port);
+        }
+    }
+    return 0;
+}
+# Non-blocking send (v6.4.84). Contract is IDENTICAL on all three backends:
+#    0 → enqueued · -1 → closed · -2 → full
+# Until 6.6.16 this backend's `chan_send` did not block and returned -1 when FULL, which is why
+# this fn was never an alias for it. It still is not one: `chan_send` now waits.
+# See lib/thread.cyr's `chan_try_send` for the rationale.
+fn chan_try_send(ch, val): i64 {
+    var wb = _chan_wb(ch);
     syscall(61449, ch + 40);   # AcquireSRWLockExclusive
-    var cap = load64(ch + 8);
-    var count = load64(ch + 32);
-    if (count >= cap) { syscall(61450, ch + 40); return 0 - 1; }
-    var buf = load64(ch);
-    var tail = load64(ch + 24);
-    store64(buf + tail * 8, val);
-    store64(ch + 24, (tail + 1) % cap);
-    store64(ch + 32, count + 1);
+    if (load64(ch + 48) != 0) { syscall(61450, ch + 40); return 0 - 1; }
+    if (load64(ch + 32) >= load64(ch + 8)) { syscall(61450, ch + 40); return 0 - 2; }
+    _chan_put(ch, val);
+    var rp = _chan_claim(wb, 0);
     syscall(61450, ch + 40);   # ReleaseSRWLockExclusive
+    if (rp != 0) { _chan_post(rp); }
     return 0;
 }
 # Dequeue the oldest value (FIFO), or 0 if empty (never blocks).
 fn chan_try_recv(ch): i64 {
+    var wb = _chan_wb(ch);
     syscall(61449, ch + 40);
-    var count = load64(ch + 32);
-    if (count == 0) { syscall(61450, ch + 40); return 0; }
-    var buf = load64(ch);
-    var cap = load64(ch + 8);
-    var head = load64(ch + 16);
-    var val = load64(buf + head * 8);
-    store64(ch + 16, (head + 1) % cap);
-    store64(ch + 32, count - 1);
+    if (load64(ch + 32) == 0) { syscall(61450, ch + 40); return 0; }
+    var v = _chan_take(ch);
+    var sp = _chan_claim(wb, 16);              # the oldest waiting sender, if any
     syscall(61450, ch + 40);
-    return val;
+    if (sp != 0) { _chan_post(sp); }
+    return v;
 }
-# recv is non-blocking here (no condvar yet); identical to try_recv.
+# Receive. Blocks while the ring is empty and open. Returns the oldest value, or 0 once the
+# channel is closed AND empty: a closed channel still drains what was queued before close.
 fn chan_recv(ch): i64 {
-    return chan_try_recv(ch);
+    var wb = _chan_wb(ch);
+    var wn: i64[2];            # this call's queue node while it waits
+    var port = 0;              # the wait port this call holds, from the pool
+    while (1 == 1) {
+        syscall(61449, ch + 40);
+        if (load64(ch + 32) > 0) {
+            var v = _chan_take(ch);
+            var sp = _chan_claim(wb, 16);
+            syscall(61450, ch + 40);
+            if (sp != 0) { _chan_post(sp); }
+            _chan_wp_put(port);
+            return v;
+        }
+        if (load64(ch + 48) != 0) {
+            syscall(61450, ch + 40);
+            _chan_wp_put(port);
+            return 0;
+        }
+        if (port == 0) {
+            # Empty and open, and this call holds no port yet: fetch one outside the lock.
+            syscall(61450, ch + 40);
+            port = _chan_wp_get();
+            if (port == 0) { syscall(0xF00F, 1); }   # none to be had: Sleep(1)
+        } else {
+            _chan_enq(wb, 0, &wn, port);       # empty and open: queue as a receiver
+            syscall(61450, ch + 40);
+            port = _chan_wait(ch, wb, 0, &wn, port);
+        }
+    }
+    return 0;
 }
-# Mark the channel closed.
+# Close the channel, and wake every waiting sender and receiver: each is unlinked and gets a
+# token, re-tests, and sees `closed`. Once `closed` is set nothing queues, so this ends.
 fn chan_close(ch): i64 {
-    syscall(61449, ch + 40);
-    store64(ch + 48, 1);
-    syscall(61450, ch + 40);
+    var wb = _chan_wb(ch);
+    var p = 1;
+    while (p != 0) {
+        syscall(61449, ch + 40);
+        store64(ch + 48, 1);
+        p = _chan_claim(wb, 0);
+        if (p == 0) { p = _chan_claim(wb, 16); }
+        syscall(61450, ch + 40);
+        if (p != 0) { _chan_post(p); }
+    }
     return 0;
 }

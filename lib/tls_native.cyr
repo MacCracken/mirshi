@@ -1,38 +1,34 @@
 # tls_native.cyr — Sovereign, pure-Cyrius TLS protocol-layer stack
 # Usage: include "lib/tls_native.cyr"
-# Requires: lib/syscalls.cyr (sockets), lib/alloc.cyr, lib/sigil.cyr
+# Includes its own definers: lib/syscalls.cyr (sockets), lib/alloc.cyr, lib/sigil.cyr
 #           (crypto primitives: ChaCha20-Poly1305, AES-GCM, HKDF, SHA-2,
-#            X25519, ECDSA, X.509)
+#            X25519, ECDSA, X.509) and the folded sigil's sidecar leaves (below).
 #
-# **Status (corrected 2026-06-04 — the prior "v6.0.10 SCAFFOLD / every fn
-# returns NOT_IMPLEMENTED" header was stale and false; the stack works):**
-#   IMPLEMENTED — TLS 1.3 client + server: record layer, handshake framing,
-#     1.3 key schedule (HKDF tree), ciphersuite negotiation (slots .11–.28).
-#     Interops with OpenSSL 3.x (client↔server CONNECTED). A working 1.3 stack.
-#   KNOWN HOLES — three PUBLIC fns still `return TLS_ERR_NOT_IMPLEMENTED`:
-#     `tls_native_set_alpn`, `tls_native_set_version_range`, `tls_native_close`
-#     (no clean close_notify). A consumer hits these silently. Tracked:
-#     issues/2026-06-04-shipped-broken-functionality-found-by-consumers.md.
-#   IN PROGRESS — TLS 1.2 backport (Mini-arc D). .72 landed the 1.2 AEAD
-#     record layer (record_seal_12 / _open_12: 13-byte AAD, GCM explicit
-#     nonce per RFC 5288, ChaCha20-Poly1305 implicit nonce per RFC 7905;
-#     legacy CBC intentionally skipped). Still ahead: 1.2 handshake +
-#     PRF key derivation + cert/Finished + ciphersuites + e2e.
-#   NOT YET DONE — consumer wiring/closeout (Mini-arc E); pinned in
-#     roadmap.md (v6.0.x). Per-slot landing history in CHANGELOG.
+# **Status (6.6.15).** A complete TLS 1.3 + 1.2 stack, client and server, and the default backend of
+# lib/tls.cyr since v6.1.21: AEAD suites only (AES-GCM, ChaCha20-Poly1305 — legacy CBC deliberately
+# absent), ECDHE on x25519, secp256r1 and secp384r1 in both versions and both roles
+# (`tls_native_set_groups`) with the HelloRetryRequest round trip both ways (6.6.15), ALPN, client
+# certificates in TLS 1.3 and 1.2 on both sides — a server that asks verifies the client's chain to
+# its own trust roots, its keyUsage / extendedKeyUsage (clientAuth) and its CertificateVerify
+# (6.6.14, CVE-64) — the OS trust store with chain building and hostname binding (CVE-17 /
+# CVE-18), post-handshake NewSessionTicket / KeyUpdate, sticky close_notify and one error table
+# for every read (6.6.13), one ChangeCipherSpec policy per read site, a per-connection deadline
+# and per-connection allocators (`tls_native_new_client_in` / `tls_native_new_server_in`).
+# Interops with OpenSSL 3.x and public servers. Every public fn is implemented. Not provided:
+# secp521r1 and X448 (sigil has no ECDH on either), RSA server keys and RSA client certificates
+# (a server offers ECDSA and Ed25519 only), a client certificate CHAIN from the native client (it
+# presents its leaf), and lib/tls.cyr's session-resumption / 0-RTT verbs, which are libssl-only. The surface and its
+# guarantees: docs/development/lib-tls-contract.md; landing history: CHANGELOG.
 #
-# **Why a sovereign stack** (vs the existing `lib/tls.cyr` libssl
-# wrapper):
-#   1. The wrapper is client-only.
-#   2. The wrapper dlopens libssl.so.3 via fdlopen, which needs ld.so
-#      to bootstrap glibc's TCB. A bare-metal AGNOS kernel has neither
-#      libssl nor ld.so — structurally cannot use the wrapper.
-#   3. Sovereignty: no external governance over the crypto stack.
+# **Why a sovereign stack** (vs libssl through `lib/tls.cyr`):
+#   1. libssl is dlopened via fdlopen, which needs ld.so to bootstrap
+#      glibc's TCB. A bare-metal AGNOS kernel has neither libssl nor
+#      ld.so — structurally cannot use it.
+#   2. Sovereignty: no external governance over the crypto stack.
 #
-# **Naming**: `tls_native_*` to keep the namespace distinct from the
-# existing `tls_*` wrapper. The wrapper's disposition (retire /
-# deprecate-with-shim / keep-both) lands at the consumer-wiring slot
-# (.35); namespace collapse to `tls_*` only happens then if at all.
+# **Naming**: `tls_native_*` keeps this stack's namespace distinct from
+# the `tls_*` dispatch layer in lib/tls.cyr, which routes to it by
+# default and to libssl on request (`tls_set_backend`).
 #
 # **Threading model**: single-threaded per-context. Multi-context
 # scenarios (a server accepting concurrent clients) need one ctx per
@@ -40,30 +36,18 @@
 # inside the stack would invite the same TCB-init issues that gated
 # the libssl wrapper.
 
+# The definers this stack's OWN code calls (sys_* / fd_* / the agnos socket peers, alloc / alloc_via,
+# memcpy / memeq / strlen, atomic_*, clock_now_ns, file_open, fncall*), then the sigil fold. Since
+# 6.6.19 R3 sigil's bundle carries its own compile-verified requires block (bayan, thread,
+# thread_local, sys, chrono, random, ...), so the hand mirror of its sidecar leaves that stood here
+# (CHANGELOG [6.1.25], [6.5.29], [6.0.53], [6.6.7]) is gone: nothing below exists only for sigil.
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
-include "lib/freelist.cyr"
 include "lib/string.cyr"
-include "lib/vec.cyr"
-include "lib/hashmap.cyr"
+include "lib/atomic.cyr"
+include "lib/chrono.cyr"
 include "lib/io.cyr"
-include "lib/fs.cyr"
-# v6.1.25 bayan carve: bigint (u256_*) moved into lib/bayan.cyr. sigil's
-# ECDSA/crypto path calls u256_* — satisfied by bayan's back-compat aliases.
-# bayan's bundled json portion references result/fnptr (io is above);
-# include-once dedupes. See CHANGELOG [6.1.25].
-include "lib/result.cyr"
 include "lib/fnptr.cyr"
-include "lib/bayan.cyr"
-include "lib/ct.cyr"
-include "lib/keccak.cyr"
-# v6.0.53: sigil 3.6.0 added a thread-local constant-bank (reachable
-# thread_local_init at init) + worker-batch thread_create/join, and declares
-# `# Requires: lib/thread_local.cyr` — so any sigil consumer must pull
-# thread.cyr + thread_local.cyr BEFORE sigil or sigil's thread_* calls emit ud2
-# (the v6.0.53 CI SIGILL in tls_native_scaffold). include-once dedupes.
-include "lib/thread.cyr"
-include "lib/thread_local.cyr"
 include "lib/sigil.cyr"
 
 # ================================================================
@@ -91,6 +75,8 @@ var TLS_ERR_AUTHN = 0 - 16;              # signature verification failed
 var TLS_ERR_ALERT = 0 - 17;              # peer sent a fatal alert
 var TLS_ERR_BUFFER_FULL = 0 - 18;        # output buffer too small
 var TLS_ERR_PROTOCOL = 0 - 19;           # state-machine violation
+var TLS_ERR_TIMEOUT = 0 - 22;            # the caller's deadline passed (tls_native_set_deadline, 6.6.13)
+var TLS_ERR_WRONG_THREAD = 0 - 23;       # libssl backend called off the main thread (lib/tls.cyr, 6.6.14)
 
 # ================================================================
 # Record-layer types (RFC 8446 §5.1, RFC 5246 §6.2)
@@ -211,6 +197,22 @@ enum TlsAlertDescription {
     TLS_AD_NO_APPLICATION_PROTOCOL = 120;
 }
 
+# What a received alert means to the read path (_tn_alert_disposition, lib/tls_native_conn.cyr);
+# a negative disposition is the TLS_ERR_* it fails with. Private. CHANGELOG [6.6.13]
+enum TlsAlertDisposition {
+    _TN_ALERT_EOF = 0;          # warning-level close_notify: the end of the stream
+    _TN_ALERT_IGNORE = 1;       # warning-level user_canceled: dropped, the read goes on
+}
+
+# What a record read may meet in place of the record it wants: a plaintext ChangeCipherSpec
+# (_tn_read_rec, lib/tls_native_conn.cyr). Each read site names its policy. Private.
+# CHANGELOG [6.6.13] (CVE-61)
+enum TlsCcsPolicy {
+    _TN_CCS_REFUSE = 0;         # no CCS here: before the first ClientHello, or after the peer's Finished
+    _TN_CCS_MAY = 1;            # TLS 1.3 middlebox compatibility: one CCS per connection, dropped
+    _TN_CCS_MUST = 2;           # TLS 1.2: exactly one CCS, directly before the peer's Finished
+}
+
 # ================================================================
 # Connection role + state-machine state
 # ================================================================
@@ -299,4 +301,5 @@ include "lib/tls_native_keysched.cyr"   # TLS 1.3 key schedule + 1.3/1.2 ciphers
 include "lib/tls_native_ctx.cyr"        # ctx layout + new_client/new_server + ctx public API
 include "lib/tls_native_hs13.cyr"       # TLS 1.3 client + server handshake + app-data + 1.3 record protection
 include "lib/tls_native_hs12.cyr"       # TLS 1.2 record + PRF + handshake driver
+include "lib/tls_hostid.cyr"            # host classifier, shared with lib/tls.cyr's libssl binder (6.6.13)
 include "lib/tls_native_conn.cyr"       # hostname verify + transport vtable + connect/accept + I/O + getters

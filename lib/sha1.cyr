@@ -43,7 +43,8 @@ fn _sha1_rotl32(x, n): i64 {
 
 # Compute the FIPS 180-4 SHA-1 message digest of `data[0..len)`.
 # Writes 20 bytes of big-endian digest to `digest_out` (caller-
-# allocated). Returns 0. NOT a collision-resistant primitive —
+# allocated). Returns 0, or -1 (digest_out untouched) when its working buffers cannot be
+# allocated (6.6.10 — it wrote through a failed alloc). NOT a collision-resistant primitive —
 # see module header for the safer alternatives.
 fn sha1(data, len, digest_out): i64 {
     # FIPS 180-4 §5.3.1 — SHA-1 initial hash values H(0).
@@ -61,6 +62,7 @@ fn sha1(data, len, digest_out): i64 {
     if (pad_len == 64) { pad_len = 0; }
     var total = len + 1 + pad_len + 8;
     var buf = alloc(total);
+    if (buf == 0) { return 0 - 1; }
     memset(buf, 0, total);
     memcpy(buf, data, len);
     store8(buf + len, 0x80);
@@ -78,6 +80,7 @@ fn sha1(data, len, digest_out): i64 {
     # cyrius's native u64 load/store (each slot holds a 32-bit
     # value in the low word).
     var w = alloc(80 * 8);
+    if (w == 0) { return 0 - 1; }
 
     var chunk_off = 0;
     while (chunk_off < total) {

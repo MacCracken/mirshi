@@ -1,6 +1,6 @@
 # keccak.cyr — Keccak-f[1600] permutation + SHAKE-128 / SHAKE-256 sponge.
 # Usage: include "lib/keccak.cyr"
-# Requires: include "lib/alloc.cyr", "lib/string.cyr" (for memset/memcpy).
+# Includes its own definers (6.6.9): string.cyr (memset).
 #
 # Pure FIPS 202 reference implementation, 64-bit lanes. No external
 # deps, no per-arch code — runs identically on x86_64 and aarch64.
@@ -13,6 +13,9 @@
 # SHAKE-128: rate  = 168 bytes (1344 bits), capacity = 256 bits
 # SHAKE-256: rate  = 136 bytes (1088 bits), capacity = 512 bits
 # Both use the SHAKE domain separator 0x1F (multi-rate padding).
+
+# 6.6.9: the sponge clears its state with memset. CHANGELOG [6.6.9]
+include "lib/string.cyr"
 
 # 64-bit left-rotate inlined at all 29 sites (was `_keccak_rotl64`);
 # kills ~20k fn-call round-trips per 4 KB SHAKE. Safe without mask

@@ -1,9 +1,14 @@
 # bounds.cyr — opt-in runtime bounds checking
 # Usage: include "lib/bounds.cyr"
-# Requires: string.cyr (for println), fmt.cyr (for fmt_int_buf)
+# Includes its own definers (6.6.9): fmt.cyr (fmt_int_buf), string.cyr (memcpy).
 #
 # Provides checked memory access that aborts on out-of-bounds.
 # Use when safety matters more than speed.
+
+# 6.6.9: _bounds_fail formats the index with fmt_int_buf and the checked copies use memcpy;
+# this file included neither. CHANGELOG [6.6.9]
+include "lib/fmt.cyr"
+include "lib/string.cyr"
 
 # Print "bounds: {msg} index {idx} >= len {len}\n" to stderr and abort.
 fn _bounds_fail(msg, mlen, idx, len): i64 {

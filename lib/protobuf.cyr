@@ -1,6 +1,6 @@
 # protobuf.cyr — minimal proto3 wire-format encode/decode.
 # Usage: include "lib/protobuf.cyr"
-# Requires (include BEFORE this file): string.cyr + str.cyr (str_builder_* + strlen).
+# Includes its own definers (6.6.9): string.cyr (strlen), str.cyr (str_builder_*).
 #
 # Pure Cyrius — no syscalls, no allocation beyond what str_builder already does.
 # Encode appends to a str_builder; decode is load8 + pointer math over a raw buffer.
@@ -23,6 +23,11 @@
 # `f32_to` native-float builtins (6.2.18+) — pb_write_float/pb_read_float take and
 # return a Cyrius f64; the 32-bit narrowing is internal. (No math.cyr include
 # needed — f64_from/f32_from/f32_to are compiler builtins, not lib fns.)
+
+# 6.6.9: this header used to say "include BEFORE this file"; it includes them itself now.
+# CHANGELOG [6.6.9]
+include "lib/string.cyr"
+include "lib/str.cyr"
 
 # Wire types
 var PB_WIRE_VARINT = 0;

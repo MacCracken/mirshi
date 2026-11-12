@@ -86,12 +86,10 @@ fn pt(req, pid, addr, data): i64 {
     return syscall(SYS_PTRACE, req, pid, addr, data);
 }
 
-# v1.5.0 spawn#3: create an anonymous in-memory file to hold the child ELF the supervisor stages,
-# then execveat's in the forked grandchild (AT_EMPTY_PATH). SUPERVISOR-side (pre-fork) — NOT in the
-# child seccomp bound. `name` is a debug-label cstr; flags 0. Returns the memfd, or < 0 = -errno.
-fn sys_memfd_create(name, flags): i64 {
-    return syscall(SYS_MEMFD_CREATE, name, flags);
-}
+# v1.5.0 spawn#3 stages the child ELF in an anonymous memfd (execveat'd in the forked grandchild,
+# AT_EMPTY_PATH) — SUPERVISOR-side (pre-fork), NOT in the child seccomp bound. `sys_memfd_create`
+# itself is the stdlib's (lib/syscalls_linux_common.cyr, cyrius ≥ 6.6.5); mirshi's own copy was
+# dropped at 1.11.4 when the stdlib grew the identical wrapper.
 
 # Write a NUL-terminated cstr to a fd without hand-counting its length.
 fn _emit(fd, s): i64 {

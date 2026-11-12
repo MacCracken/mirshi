@@ -19,12 +19,21 @@
 #
 # >>> include "lib/fnptr.cyr"
 include "lib/fnptr.cyr"
-# thread_local.cyr supplies thread_local_get/set + TLOCAL_MAX_SLOTS (16), used
+# thread_local.cyr supplies thread_local_get/set + TLOCAL_MAX_SLOTS (128), used
 # by thread_create below to emulate per-thread TLS isolation. On a real system
 # thread creation and TLS setup are coupled (thread.cyr's _thread_spawn uses
 # CLONE_SETTLS to give the child a fresh block), so this dependency mirrors the
 # real path. include-once dedupes if the consumer already pulled it.
 include "lib/thread_local.cyr"
+
+# v6.5.44 — THREADS_CONCURRENT: does thread_create actually produce a SECOND thread?
+# 1 = the body runs concurrently with the caller; 0 = it runs INLINE at create (serial peer).
+# ⛔ This exists because the concurrency corpus could not tell the two apart. Every test in it
+# passed on macOS while bodies ran inline — a serial backend satisfies "the worker ran", "join
+# returned 0" and "the count is exact". A test that DISCRIMINATES must be guarded by capability
+# (never by target name, never by errno — the v6.5.36 lesson), and this is that capability.
+var THREADS_CONCURRENT = 0;   # serial fallback (bodies run inline)
+var CHAN_BLOCKING = 0;        # the serial ring: nothing waits (lib/thread.cyr's header; 6.6.16)
 
 # Run the thread body INLINE (serial — there is no second thread). fp is a
 # single-i64-param fn ptr; its result is discarded, matching the spawn-and-join
@@ -41,16 +50,28 @@ include "lib/thread_local.cyr"
 # Returns a fake non-zero handle so callers' null-checks pass + join is valid.
 fn thread_create(fp, arg): i64 {
     _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before the spawn
-    var save: i64[16];    # TLOCAL_MAX_SLOTS slots
+    # ⛔ v6.5.39 — THIS WINDOW WAS 16 WHILE `TLOCAL_MAX_SLOTS` IS 128. Slots 16..127 were
+    # never snapshotted, never zeroed for the body, and never restored — so on this target a
+    # thread body's writes to any slot >= 16 leaked straight back into the caller, which is
+    # precisely the corruption the comment above says this code exists to prevent. The stale
+    # value was documented as correct too ("TLOCAL_MAX_SLOTS (128)"), which is why reading the
+    # comment did not catch it. Present identically in BOTH serial peers (macOS and agnos).
+    # ⚠ The array size must be a LITERAL (`#assert` accepts only numbers/sizeof, not a global),
+    # so 128 here duplicates `thread_local.cyr`'s TLOCAL_MAX_SLOTS — a hand-maintained copy of
+    # a derivable fact, which is the shape this cycle keeps finding wrong. The LOOP bound uses
+    # the real constant so it can never under-copy again, and
+    # `tests/gates/concurrency/tls_window_matches_max_slots.sh` fails the build if the constant
+    # is ever raised above this literal.
+    var save: i64[128];
     var i = 0;
-    while (i < 16) {
+    while (i < TLOCAL_MAX_SLOTS) {
         store64(&save + i * 8, thread_local_get(i));
         thread_local_set(i, 0);
         i = i + 1;
     }
     fncall1(fp, arg);
     i = 0;
-    while (i < 16) {
+    while (i < TLOCAL_MAX_SLOTS) {
         thread_local_set(i, load64(&save + i * 8));
         i = i + 1;
     }
@@ -62,6 +83,31 @@ fn thread_create(fp, arg): i64 {
 fn thread_join(t): i64 {
     if (t == 0) { return 0 - 1; }
     return 0;
+}
+
+# v6.5.8: detached spawn. agnos runs the body INLINE at create (there is no second thread
+# of control yet — see thread_create above), so by the time this returns the work is
+# already finished and there is nothing to reclaim. Returns 1 on success, matching the
+# boolean contract of the other two peers.
+#
+# ⚠ Delegating to thread_create is load-bearing, not laziness: it keeps the TLS
+# save/restore around the inline call, without which a detached body's thread_local_set
+# would persist into the caller's slots.
+fn thread_create_detached(fp, arg): i64 {
+    if (thread_create(fp, arg) == 0) { return 0; }
+    return 1;
+}
+
+# v6.5.8: the body ran inline at create, so any valid handle is by definition finished.
+# ⛔ VALID ONLY BEFORE `thread_join`. Join CONSUMES the handle — on Windows it
+# CloseHandle()s it, so a post-join query inspects a closed handle and reports "not
+# done" (caught on real cass hardware, by a test that asserted the wrong contract).
+# The intended use is the reaper shape: poll while running, then join once this
+# returns 1. After joining, the thread is done by definition and there is nothing
+# left to ask.
+fn thread_is_done(t): i64 {
+    if (t == 0) { return 0 - 1; }
+    return 1;
 }
 
 # Current thread id — the (single) process id on agnos.
@@ -82,6 +128,7 @@ fn chan_new(cap): i64 {
     var ch = alloc(56);
     if (ch == 0) { return 0; }
     var buf = alloc(cap * 8);
+    if (buf == 0) { return 0; }                                      # CHANGELOG [6.6.10]
     store64(ch, buf);          # buf
     store64(ch + 8, cap);      # cap
     store64(ch + 16, 0);       # head
@@ -96,6 +143,28 @@ fn chan_send(ch, val): i64 {
     var cap = load64(ch + 8);
     var count = load64(ch + 32);
     if (count >= cap) { return 0 - 1; }
+    var buf = load64(ch);
+    var tail = load64(ch + 24);
+    store64(buf + tail * 8, val);
+    store64(ch + 24, (tail + 1) % cap);
+    store64(ch + 32, count + 1);
+    return 0;
+}
+# Non-blocking send (v6.4.84). Contract is IDENTICAL on all three backends:
+#    0 → enqueued · -1 → closed · -2 → full
+#
+# ⚠ NOT an alias for this backend's `chan_send` (the issue's proposed fix suggested
+# that, and it would have shipped a divergent contract). `chan_send` here returns
+# **-1 when FULL** while the portable contract reserves -1 for CLOSED, and it never
+# inspects `closed` (+48) at all — so a send on a closed channel silently succeeds.
+# A consumer written against the Linux semantics would then be unable to distinguish
+# "stop producing" from "drop this one", which is the whole purpose of the fn.
+# No lock: agnos is the serial path (see chan_recv below).
+fn chan_try_send(ch, val): i64 {
+    if (load64(ch + 48) != 0) { return 0 - 1; }
+    var cap = load64(ch + 8);
+    var count = load64(ch + 32);
+    if (count >= cap) { return 0 - 2; }
     var buf = load64(ch);
     var tail = load64(ch + 24);
     store64(buf + tail * 8, val);

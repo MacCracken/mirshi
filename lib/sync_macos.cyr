@@ -1,33 +1,81 @@
 # sync_macos.cyr — macOS backend for lib/sync.cyr (do not include directly).
-# A 2-state atomic_cas SPINLOCK. macOS exposes no futex/__ulock/os_unfair_lock
-# primitive through cyrius today (the Mach-O backend doesn't route them — see
-# lib/alloc.cyr:37 and _macho_arm_routes in src/backend/aarch64/emit.cyr), so a
-# blocking lock isn't available without new syscall/__got routing. A spinlock is
-# correct (mutual exclusion + the same acquire/release fence pairing as the
-# futex path) and adequate for short, low-contention critical sections — the
-# portable-internal-lock use case this module targets. It does busy-wait under
-# contention; a blocking macOS lock (os_unfair_lock / __ulock) is a follow-on
-# once the backend routes a Darwin sync syscall. MUTEX_SIZE comes from the
-# parent lib/sync.cyr; atomic_cas/atomic_fence/atomic_store from lib/atomic.cyr.
+#
+# v6.5.44 (band J phase 2): a BLOCKING 3-state lock over Darwin's `__ulock`, replacing the
+# 2-state busy-wait spinlock this file carried since v6.5.11. Same state machine as the Linux
+# futex lock in lib/sync.cyr (0 free · 1 held-no-waiters · 2 held-with-waiters), so the
+# uncontended path is still one CAS and no syscall.
+#
+# ⚠ THE OLD HEADER'S PREMISE EXPIRED AND SAYING SO IS THE POINT. It read "macOS exposes no
+# futex/__ulock/os_unfair_lock primitive through cyrius today (the Mach-O backend doesn't route
+# them) ... a blocking macOS lock is a follow-on once the backend routes a Darwin sync syscall".
+# v6.5.43 routed `__ulock_wait` 1515->515 and `__ulock_wake` 1516->516 on BOTH Mach-O backends,
+# which is exactly the precondition that sentence named. A stale "not possible yet" comment is
+# how a capability stays unbuilt after it became buildable.
+#
+# ⛔ FOUR WAYS __ulock DIFFERS FROM futex. Each was MEASURED on real ecb (arm64, macOS 26.6.2)
+# and ach (Intel, macOS 13.7.8); each would silently break a futex transliteration:
+#
+#   1. ARGUMENT ORDER IS SWAPPED. futex is syscall(n, ADDR, op, val, ...) but __ulock is
+#      (OPERATION, ADDR, value, timeout_us). Keeping futex's order passes the cell pointer as
+#      an operation code and the operation as an address — which does not fault, it just never
+#      parks, silently degrading this back into a spin.
+#   2. SUCCESS RETURNS A POSITIVE NUMBER — the count of OTHER threads still parked on the
+#      address. So the error test is `r < 0`, never `r != 0`.
+#   3. A VALUE MISMATCH RETURNS 0 IMMEDIATELY, not -EAGAIN. Any retry loop written from futex
+#      habit that special-cases EAGAIN handles the common race wrongly. Harmless here because
+#      the CAS in the loop condition is the real predicate.
+#   4. `__ulock_wake` WITH NOBODY PARKED RETURNS -ENOENT (-2). That is the normal, expected
+#      outcome of the unlock race and must be ignored, not treated as failure.
+#
+# ⚠ UL_COMPARE_AND_WAIT (operation 1) compares only the LOW 32 BITS at the address (measured: a
+# cell holding 0xDEADBEEF00000002 parks against value=2). The cell here only ever holds 0/1/2,
+# so this is safe — but a future 64-bit cell would need operation 5 (UL_COMPARE_AND_WAIT64).
+#
+# ⚠ __ulock_wait can return EFAULT/EINTR transiently under memory pressure and libpthread itself
+# retries on it. This loop therefore never treats a negative return as fatal: the CAS in the
+# `while` is the predicate, and a failed wait simply re-tests it.
+#
+# MUTEX_SIZE (8) comes from the parent lib/sync.cyr and is UNCHANGED, so this is not a heap
+# layout change and needs no two-step bootstrap. atomic_cas/atomic_fence/atomic_store come from
+# lib/atomic.cyr; sys_ulock_wait/sys_ulock_wake from the macOS syscall peer (v6.5.43).
 
-# Allocate an unlocked mutex: an 8-byte cell holding the 0/1 spinlock state.
+# Allocate an unlocked mutex: an 8-byte cell holding the 0/1/2 state.
 fn mutex_new(): i64 {
     alloc_init();
     var m = alloc(MUTEX_SIZE);
+    if (m == 0) { return 0; }
     store64(m, 0);
     return m;
 }
 
-# Acquire the lock, busy-spinning the CAS until it transitions 0→1 (acquire barrier).
+# Blocking acquire. Uncontended: one CAS, no syscall.
 fn mutex_lock(m): i64 {
-    while (atomic_cas(m, 0, 1) == 0) { }   # spin until we win the CAS
-    atomic_fence();                        # acquire barrier
+    # Fast path — free -> held-without-waiters.
+    if (atomic_cas(m, 0, 1) == 1) {
+        atomic_fence();   # acquire barrier
+        return 0;
+    }
+    # Contended. Announce ourselves by moving the cell to 2, then park on 2.
+    while (atomic_cas(m, 0, 2) == 0) {
+        sys_ulock_wait(1, m, 2, 0);     # UL_COMPARE_AND_WAIT, block forever (timeout 0)
+        # If the cell is held-WITHOUT-waiters, upgrade it to 2 before parking again —
+        # otherwise the holder's unlock takes the no-syscall path and never wakes us.
+        atomic_cas(m, 1, 2);
+    }
+    atomic_fence();   # acquire barrier
     return 0;
 }
 
-# Release the lock: release barrier then clear the cell so a spinner can take it.
+# Release. Syscalls ONLY when the cell says a waiter may be parked.
 fn mutex_unlock(m): i64 {
-    atomic_fence();        # release barrier
+    atomic_fence();   # release barrier
+    # A successful 1->0 proves the pre-value was 1: held, and nobody announced themselves.
+    # Nothing to wake, so return without entering the kernel.
+    if (atomic_cas(m, 1, 0) == 1) { return 0; }
+    # Otherwise the cell is 2 (a waiter announced itself). Clear it and wake exactly one;
+    # whoever wins re-acquires AS 2, so any remaining waiters stay reachable. A -ENOENT here
+    # is the normal "the waiter gave up in the race window" outcome — see note 4 above.
     atomic_store(m, 0);
+    sys_ulock_wake(1, m, 0);
     return 0;
 }

@@ -1,22 +1,18 @@
-# tls.cyr — TLS client via libssl.so.3 (fdlopen bridge)
+# tls.cyr — the TLS client + server surface: the native stack (default) or libssl.so.3 (fdlopen bridge)
 # Usage: include "lib/tls.cyr"
-# Requires: alloc.cyr, syscalls.cyr, net.cyr, mmap.cyr, fnptr.cyr,
-#           string.cyr, dynlib.cyr, FDLOPEN.CYR (load-bearing as of v5.6.37)
+# Includes its own definers: fdlopen.cyr (the libssl bridge, 6.6.9) and tls_native.cyr.
 #
-# Formal contract: `docs/development/lib-tls-contract.md` (v5.10.42).
+# Formal contract: `docs/development/lib-tls-contract.md` (pinned at 6.6.13).
 # That doc is the invariant layer — verb return semantics, lifecycle
 # ordering, and ABI guarantees. Changes to the per-fn docstrings below
 # MUST preserve those guarantees unless the contract is amended in
 # the same patch.
 #
-# **IMPORTANT (v5.6.37+):** callers MUST `include "lib/fdlopen.cyr"`
-# before `include "lib/tls.cyr"` so this file's references to
-# `fdlopen_init_full` / `fdlopen_dlopen` / `fdlopen_dlsym` resolve.
-# tls.cyr doesn't auto-include fdlopen because the preprocessor
-# output cap (1 MB expanded) is tight for programs that pull
-# in many heavy stdlib modules (e.g. `tests/tcyr/large_input.tcyr`
-# already runs at 98% of cap) — an auto-include would put them
-# over.
+# 6.6.9: this file INCLUDES lib/fdlopen.cyr (below). It used to tell callers to include it first,
+# on the grounds that the preprocessor's 1 MB output cap could not absorb it; that cap is 24 MB
+# (lex_pp.cyr), and a caller that skipped the include got fdlopen_helper_available /
+# fdlopen_init_full / fdlopen_dlopen / fdlopen_dlsym as ud2 stubs — every libssl call a SIGILL.
+# CHANGELOG [6.6.9]
 #
 # Loads libssl.so.3 + libcrypto.so.3 at runtime via `fdlopen`'s
 # ld.so-bootstrapped real glibc `dlopen` + `dlsym`. This is the
@@ -29,19 +25,31 @@
 # (mutex contended-bit; same thread re-enters on a non-recursive
 # mutex because the TCB's `__kind` field reads 0 in the stub).
 # v5.6.37 fixed this by routing libssl through fdlopen.
-# SNI and system-CA peer verification enabled by default.
+# System-CA peer verification enabled by default, and (6.6.13, CVE-59) the
+# leaf is bound to `host` on the libssl backend exactly as on native: a DNS name
+# against dNSName SANs (SNI sent), an IP literal against iPAddress SANs (no SNI),
+# host == 0 refused under SSL_VERIFY_PEER — see _tls_libssl_bind_host.
 #
 # Interface:
-#   tls_available()            → 1 if libssl usable, 0 otherwise
+#   tls_available()            → 1 if the active backend is usable (native: always), 0 otherwise
+#   tls_init_main()            → warm the stack once, on the main thread (6.6.13) — 1 / 0
 #   tls_connect(sock, host)    → ctx on success, 0 on failure
-#   tls_write(ctx, buf, len)   → bytes written or -1
-#   tls_read(ctx, buf, maxlen) → bytes read or -1
+#   tls_write(ctx, buf, len)   → bytes written, or a negative TLS_ERR_* (-1 for ctx 0)
+#   tls_read(ctx, buf, maxlen) → bytes read, 0 at the peer's close_notify, or a negative
+#                                TLS_ERR_* (-1 for ctx 0) — the same codes on both backends
+#   tls_set_deadline(ctx, abs_ns) → bound the handshake and every read/write (6.6.13) — 0 / TLS_ERR_*
 #   tls_close(ctx)             → 0
 #
-# ctx layout (24 bytes):
+# ctx layout (40 bytes on both backends):
 #   +0   SSL_CTX*  (libssl)  /  native ctx (native backend)
-#   +8   SSL*      (libssl)  /  0          (native backend)
+#   +8   SSL*      (libssl, never 0)  /  0  (native backend) — the backend tag every verb reads
+#        (_tls_shim_native, 6.6.17)
 #   +16  socket fd
+#   +24  deadline, clock_now_ns() scale, 0 = none (libssl, 6.6.13)  /  TLS_BACKEND_NATIVE (native)
+#   +32  the sticky error: 0, or the TLS_ERR_* the first failed tls_read / tls_write returned
+#        (libssl, 6.6.14 — _TLS_SHIM_OFF_ERR) or a failed tls_connect_complete /
+#        tls_accept_complete recorded (libssl, 6.6.16 — _tls_libssl_complete_fail)  /  unused,
+#        never written (native: the native ctx keeps its own failure state)
 #
 # Backend (.80, Mini-arc E bite 4): lib/tls.cyr keeps BOTH transports.
 #
@@ -65,8 +73,27 @@
 # libssl-only build the native path isn't compiled and selecting it returns -1.
 # Consumers use the same tls_* API + typed tls_set_*() verbs regardless of
 # backend (the handle stays opaque).
+include "lib/fdlopen.cyr"
+include "lib/tls_hostid.cyr"   # the host classifier both backends share (6.6.13)
+include "lib/chrono.cyr"       # clock_now_ns: the libssl backend's deadline loop (6.6.13)
+include "lib/atomic.cyr"       # the libssl init latches' claim / publish (6.6.14)
 #ifndef CYRIUS_TLS_LIBSSL
 include "lib/tls_native.cyr"
+#endif
+#ifdef CYRIUS_TLS_LIBSSL
+# The TLS_ERR_* codes the libssl backend returns (_tls_ssl_io_ret), defined here only in a
+# libssl-only build: a default build gets them, with the same values, from lib/tls_native.cyr.
+# CHANGELOG [6.6.13]. TLS_ERR_HANDSHAKE_FAILED: what a failed *_complete records when libssl
+# named no terminal error (_tls_libssl_complete_fail). CHANGELOG [6.6.16]
+var TLS_ERR_NOT_IMPLEMENTED = 0 - 1;
+var TLS_ERR_HANDSHAKE_FAILED = 0 - 2;
+var TLS_ERR_WOULD_BLOCK = 0 - 9;
+var TLS_ERR_INVALID_PARAM = 0 - 10;
+var TLS_ERR_IO = 0 - 12;
+var TLS_ERR_ALERT = 0 - 17;
+var TLS_ERR_PROTOCOL = 0 - 19;
+var TLS_ERR_TIMEOUT = 0 - 22;
+var TLS_ERR_WRONG_THREAD = 0 - 23;
 #endif
 
 var TLS_BACKEND_LIBSSL = 0;
@@ -79,7 +106,8 @@ var _tls_backend = 1;
 var _tls_backend = 0;
 #endif
 
-# Select the active TLS backend (TLS_BACKEND_LIBSSL / TLS_BACKEND_NATIVE).
+# Select the active TLS backend (TLS_BACKEND_LIBSSL / TLS_BACKEND_NATIVE): what the NEXT connect /
+# accept builds. A ctx or hook handle keeps the backend that built it (6.6.17, _tls_shim_native).
 # Returns 0 on success, -1 if the requested backend isn't compiled in.
 fn tls_set_backend(b): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
@@ -92,11 +120,60 @@ fn tls_set_backend(b): i64 {
 # Return the active TLS backend (TLS_BACKEND_LIBSSL / TLS_BACKEND_NATIVE).
 fn tls_get_backend(): i64 { return _tls_backend; }
 
+# 1 when the active backend is native: the two process-wide probes (tls_supports_session_resumption,
+# tls_supports_early_data) then read 0. Always 0 in a libssl-only build. (Through 6.6.16 the
+# libssl-only verbs refused on this too; since 6.6.17 each refuses on a NATIVE ctx / handle —
+# _tls_shim_native / _tls_handle_native below — whatever the active backend.)
+# ⛔ 6.6.16 — WHY. Those verbs checked only that their libssl symbol was resolved, and libssl is
+# resolved in-process by anything that loads it — tls_available() or a connect on the libssl
+# backend, tls_dlsym — even while the NATIVE backend is active. They then handed a native ctx's
+# +8 (0) or a native handle (the native ctx, not an SSL_CTX) to libssl, which wrote into native
+# memory: tls_ctx_set_max_early_data changed 4 bytes at offset 1024 of a 616-byte native ctx
+# (measured). CHANGELOG [6.6.16]
+fn _tls_backend_is_native(): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) { return 1; }
+    #endif
+    return 0;
+}
+
+# ⛔ 6.6.17 — EVERY VERB DISPATCHES ON THE CTX IT IS GIVEN, NOT ON THE ACTIVE BACKEND. The global
+# `_tls_backend` says which backend a NEW connection uses (the constructors and the process-wide
+# probes still read it); a ctx or hook handle keeps the backend that built it. Dispatching every verb
+# on the global handed a ctx to the wrong backend after tls_set_backend flipped: a libssl ctx's
+# tls_close ran tls_native_close on its SSL_CTX — which wrote TLS_STATE_CLOSED over the SSL_CTX's
+# second word — and a native ctx's tls_get_session handed libssl its NULL SSL (SIGSEGV, measured).
+#
+# 1 when the 40-byte shim `ctx` (tls_connect_alloc / tls_accept_alloc) is the native backend's.
+# The tag is +8: libssl's SSL*, never 0 on a libssl shim (both constructors return 0 when SSL_new
+# fails), and always 0 on a native one. (+24 is not: libssl keeps its deadline there, any value.)
+fn _tls_shim_native(ctx): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (load64(ctx + 8) == 0) { return 1; }
+    #endif
+    return 0;
+}
+
+# 1 when the hook handle `h` (what tls_connect_with_ctx_hook / tls_accept_alloc's hook receives) is
+# a native ctx — it carries the backend tag _tn_ctx_new_in writes (TLS_CTX_OFF_BACKEND_TAG) — and 0
+# for a libssl SSL_CTX*.
+fn _tls_handle_native(h): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (load64(h + TLS_CTX_OFF_BACKEND_TAG) == _TN_CTX_TAG) { return 1; }
+    #endif
+    return 0;
+}
+
 # OpenSSL constants
 enum TlsConst {
     SSL_VERIFY_PEER = 1;
     SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
     TLSEXT_NAMETYPE_host_name = 0;
+    # 6.6.13 (CVE-59) — X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS (0x4) |
+    # X509_CHECK_FLAG_NEVER_CHECK_SUBJECT (0x20): the hostflags the libssl binder
+    # sets, so libssl refuses what native refuses — a partial wildcard
+    # ("f*.example.com") and a subject-CN fallback. Private: not a consumer knob.
+    _TLS_LIBSSL_HOSTFLAGS = 36;
     # v5.10.21 — TLS 1.3 0-RTT early-data status return codes
     # from SSL_read_early_data. Surfaced by tls_read_early_data
     # as positive bytes-count (SUCCESS), -2 (FINISH — caller
@@ -111,6 +188,10 @@ enum TlsConst {
     SSL_SESS_CACHE_CLIENT = 1;
     SSL_SESS_CACHE_SERVER = 2;
     SSL_SESS_CACHE_BOTH = 3;
+    # 6.6.16 — SSL_CTRL_SET_SESS_CACHE_MODE, OpenSSL's ABI value (ssl.h). The verb
+    # SSL_CTX_set_session_cache_mode is a MACRO over SSL_CTX_ctrl(ctx, 44, mode, NULL), in
+    # OpenSSL 1.1 and 3.x alike: there is no such symbol to dlsym. Private: not a consumer knob.
+    _TLS_SSL_CTRL_SET_SESS_CACHE_MODE = 44;
     # v5.10.34 — TLS 1.3 0-RTT acceptance status surfaced by
     # tls_get_early_data_status (wraps SSL_get_early_data_status).
     # Mirrors libssl's SSL_EARLY_DATA_NOT_SENT/REJECTED/ACCEPTED.
@@ -123,8 +204,36 @@ enum TlsConst {
     TLS_EARLY_DATA_ACCEPTED = 2;
 }
 
-var _tls_inited = 0;
+# The libssl shim's size and its sticky-error slot (6.6.14; the layout is at the top of this file).
+enum TlsLibsslShim {
+    _TLS_SHIM_OFF_ERR = 32;
+    _TLS_LIBSSL_SHIM_LEN = 40;
+}
+
+# _tls_init's latch: 0 not tried / 1 resolving / 2 done (6.6.14). _tls_ok is the verdict.
+var _tls_init_state = 0;
 var _tls_ok = 0;
+
+# 1 when the caller may use the libssl backend: the process's MAIN thread (6.6.14). On Linux a
+# thread's id equals the process id only on its main thread: a cyrius thread_create worker is a
+# CLONE_THREAD clone with a tid of its own, and a forked child's main thread passes (its tid is its
+# new pid). Two syscalls, both read fresh — a cached pid is wrong in a forked child, and a cached tid
+# can be a recycled one. Linux x86_64 is the only libssl target; elsewhere the libssl arms already
+# fail closed on their unresolved symbols, and this answers 1.
+# ⛔ WHY. The glibc that fdlopen bootstraps (and so all of libssl) needs a glibc thread block on
+# the calling thread; a thread_create worker's thread pointer is cyrius's own block. A worker's
+# libssl call SIGSEGVed (tls_available() on main, then one fetch on a worker: signal 11), and a
+# worker's cold first use hung (measured on 6.6.13). Off the main thread every libssl verb now
+# refuses with its own failure value — TLS_ERR_WRONG_THREAD from tls_read / tls_write /
+# tls_set_deadline — without touching libssl. Roadmap backlog (i); CHANGELOG [6.6.14]
+fn _tls_libssl_thread_ok(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    if (syscall(SYS_GETTID) != syscall(SYS_GETPID)) { return 0; }
+    #endif
+    #endif
+    return 1;
+}
 
 # fdlopen state: 256-byte scratch region holding setjmp buf + real
 # glibc fn pointers. Zeroed at first use; populated by
@@ -174,6 +283,22 @@ var _fn_SSL_write = 0;
 var _fn_SSL_read = 0;
 var _fn_SSL_shutdown = 0;
 var _fn_SSL_get_error = 0;
+# 6.6.13 (CVE-60) — libcrypto's error queue, which tells a received alert from a local
+# failure (_tls_ssl_io_ret). Optional: without them a failed read or write is TLS_ERR_PROTOCOL.
+var _fn_ERR_peek_last_error = 0;
+var _fn_ERR_clear_error = 0;
+# 6.6.13 (CVE-59) — the identity binder's symbols. REQUIRED (in the bail list
+# below): a libssl that cannot bind the leaf to `host` reports tls_available() == 0
+# rather than connecting to whoever holds any chain-valid certificate.
+# X509_VERIFY_PARAM_set1_host, not SSL_set1_host: from OpenSSL 3.0 SSL_set1_host
+# first tries the name as an IP address with OpenSSL's own parser, so a host the
+# shared classifier calls a DNS name ("010.0.0.1") could be bound as an address
+# on one libssl version and as a name on another. The classifier decides.
+var _fn_SSL_get0_param = 0;
+var _fn_SSL_get_verify_mode = 0;
+var _fn_X509_VERIFY_PARAM_set1_host = 0;
+var _fn_X509_VERIFY_PARAM_set_hostflags = 0;
+var _fn_X509_VERIFY_PARAM_set1_ip_asc = 0;
 # v5.10.21 — TLS 1.3 session resumption + 0-RTT primitives.
 # Sandhi 1.3.1/1.3.2 explicitly requested. Pre-v5.10.21 these
 # were silently absent — the v5.10.13 TLS slot shipped only
@@ -186,7 +311,10 @@ var _fn_SSL_SESSION_free = 0;
 var _fn_SSL_CTX_sess_set_new_cb = 0;
 var _fn_SSL_CTX_sess_set_remove_cb = 0;
 var _fn_SSL_CTX_sess_set_get_cb = 0;
-var _fn_SSL_CTX_set_session_cache_mode = 0;
+# 6.6.16 — SSL_CTX_ctrl, which tls_ctx_set_session_cache_mode drives (SET_SESS_CACHE_MODE). It
+# replaced a dlsym of "SSL_CTX_set_session_cache_mode", a macro name that never resolved, so the
+# verb was a silent no-op and tls_supports_session_resumption read 0 on every OpenSSL.
+var _fn_SSL_CTX_ctrl = 0;
 var _fn_SSL_CTX_set_max_early_data = 0;
 var _fn_SSL_write_early_data = 0;
 var _fn_SSL_read_early_data = 0;
@@ -207,10 +335,30 @@ var _fn_SSL_SESSION_get_max_early_data = 0;
 # libc makes pthread work correctly (TCB has real __kind fields,
 # DTV, stack_guard, etc.), so SSL_CTX_new no longer deadlocks and
 # SSL_connect completes the handshake.
+#
+# 6.6.14: a 0 -> 1 -> 2 claim and publish (it was a plain attempt flag set before the work, so a
+# second caller could read _tls_ok while the first was still resolving): the caller claims and
+# resolves (_tls_init_resolve; no return between the claim and the publish). Off the main thread it
+# neither claims nor resolves — a worker's first use must not run the fdlopen bootstrap on its own
+# thread — and main can still initialise later.
+# ⚠ Only the main thread gets past the guard, and it resolves synchronously, so it can never find
+# the claim held by someone else in its own process: a 1 here was inherited through fork() from a
+# parent whose main thread was mid-resolve (a worker forked). Nothing in this process will ever
+# publish it, so the caller fails closed (tls_available() 0, as before 6.6.14) instead of spinning
+# for ever on it. CHANGELOG [6.6.14]
 fn _tls_init(): i64 {
-    if (_tls_inited == 1) { return 0; }
-    _tls_inited = 1;
+    if (atomic_load(&_tls_init_state) == 2) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
+    if (atomic_cas(&_tls_init_state, 0, 1) == 1) {
+        _tls_init_resolve();
+        atomic_store(&_tls_init_state, 2);
+    }
+    return 0;
+}
 
+# _tls_init's body: load libssl through fdlopen and resolve its symbols; sets _tls_ok = 1 on
+# success. Runs once, under _tls_init's claim. Returns 0.
+fn _tls_init_resolve(): i64 {
     # fdlopen requires ~/.cyrius/dlopen-helper (built by install.sh
     # at toolchain install time). If the helper isn't present, TLS
     # is unavailable; callers see tls_available()==0 and fall back
@@ -256,6 +404,15 @@ fn _tls_init(): i64 {
     _fn_SSL_read                         = fncall2(fn_dlsym, h, "SSL_read");
     _fn_SSL_shutdown                     = fncall2(fn_dlsym, h, "SSL_shutdown");
     _fn_SSL_get_error                    = fncall2(fn_dlsym, h, "SSL_get_error");
+    _fn_ERR_peek_last_error              = fncall2(fn_dlsym, h, "ERR_peek_last_error");
+    _fn_ERR_clear_error                  = fncall2(fn_dlsym, h, "ERR_clear_error");
+    # 6.6.13 (CVE-59) — host binding; the X509_VERIFY_PARAM_* three live in
+    # libcrypto and resolve through the libssl handle under RTLD_GLOBAL.
+    _fn_SSL_get0_param                   = fncall2(fn_dlsym, h, "SSL_get0_param");
+    _fn_SSL_get_verify_mode              = fncall2(fn_dlsym, h, "SSL_get_verify_mode");
+    _fn_X509_VERIFY_PARAM_set1_host      = fncall2(fn_dlsym, h, "X509_VERIFY_PARAM_set1_host");
+    _fn_X509_VERIFY_PARAM_set_hostflags  = fncall2(fn_dlsym, h, "X509_VERIFY_PARAM_set_hostflags");
+    _fn_X509_VERIFY_PARAM_set1_ip_asc    = fncall2(fn_dlsym, h, "X509_VERIFY_PARAM_set1_ip_asc");
     # v5.10.21 — session resumption + 0-RTT early data symbols.
     # Resolution failure is NOT fatal (older libssl may not have
     # all of these); callers see 0 from `tls_*` wrappers and can
@@ -267,7 +424,7 @@ fn _tls_init(): i64 {
     _fn_SSL_CTX_sess_set_new_cb          = fncall2(fn_dlsym, h, "SSL_CTX_sess_set_new_cb");
     _fn_SSL_CTX_sess_set_remove_cb       = fncall2(fn_dlsym, h, "SSL_CTX_sess_set_remove_cb");
     _fn_SSL_CTX_sess_set_get_cb          = fncall2(fn_dlsym, h, "SSL_CTX_sess_set_get_cb");
-    _fn_SSL_CTX_set_session_cache_mode   = fncall2(fn_dlsym, h, "SSL_CTX_set_session_cache_mode");
+    _fn_SSL_CTX_ctrl                     = fncall2(fn_dlsym, h, "SSL_CTX_ctrl");
     _fn_SSL_CTX_set_max_early_data       = fncall2(fn_dlsym, h, "SSL_CTX_set_max_early_data");
     _fn_SSL_write_early_data             = fncall2(fn_dlsym, h, "SSL_write_early_data");
     _fn_SSL_read_early_data              = fncall2(fn_dlsym, h, "SSL_read_early_data");
@@ -297,7 +454,24 @@ fn _tls_init(): i64 {
     if (_fn_SSL_write == 0) { return 0; }
     if (_fn_SSL_read == 0) { return 0; }
     if (_fn_SSL_ctrl == 0) { return 0; }
+    # 6.6.13 (CVE-59) — no host binding, no TLS: fail closed.
+    if (_fn_SSL_get0_param == 0) { return 0; }
+    if (_fn_SSL_get_verify_mode == 0) { return 0; }
+    if (_fn_X509_VERIFY_PARAM_set1_host == 0) { return 0; }
+    if (_fn_X509_VERIFY_PARAM_set_hostflags == 0) { return 0; }
+    if (_fn_X509_VERIFY_PARAM_set1_ip_asc == 0) { return 0; }
 
+    # v6.5.39 — release fence before the readiness publish, same class as
+    # lib/chrono.cyr's `_chrono_mdays`. `_tls_ok` gates every consumer (:594/:654/:806 and
+    # `tls_available()`), and the ~40 `_fn_*` function pointers resolved above it must be
+    # visible to any thread that observes it set. aarch64 only — see the chrono comment for
+    # why this copies `lib/freelist.cyr` and not `lib/alloc.cyr`.
+    # (6.6.14: the attempt latch the lazy-init proposal named is now `_tls_init_state`, a
+    # 0 -> 1 -> 2 claim; its publish happens after this one, through atomic_store.)
+    # atomic.cyr is included at the top of this file (6.6.14; it used to arrive transitively).
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
     _tls_ok = 1;
     return 0;
 }
@@ -305,12 +479,15 @@ fn _tls_init(): i64 {
 # Returns 1 if TLS support is available on this system
 #ifndef CYRIUS_TLS_LIBSSL
 # ---- Native-backend client path (.80, Mini-arc E bite 4) ----
-# Shim ctx for the native backend: [native_ctx@0, 0@8, sock@16, NATIVE@24].
+# Shim ctx for the native backend: [native_ctx@0, 0@8, sock@16, NATIVE@24] (+32 unused).
 # Mirrors the libssl shim's +0/+8/+16 so the per-ctx ops dispatch uniformly.
-fn _tls_native_alloc(sock, host, hook_fp, hook_ctx): i64 {
+# 6.6.13: `a` (Allocator handle, 0 = the global heap) backs the native ctx, every allocation of the
+# connection and this 40-B shim — see tls_connect_alloc_in. The system roots are the shared
+# process-wide set (0 B per connect after the first); a hook's own trust store comes from `a`.
+fn _tls_native_alloc_in(a, sock, host, hook_fp, hook_ctx): i64 {
     var hl = 0;
     if (host != 0) { hl = strlen(host); }
-    var nctx = tls_native_new_client(host, hl);
+    var nctx = tls_native_new_client_in(a, host, hl);
     if (nctx == 0) { return 0; }
     tls_native_set_verify(nctx, TLS_VERIFY_PEER);     # default: verify the peer
     tls_native_set_ca_system(nctx);                   # against the OS trust store
@@ -319,12 +496,97 @@ fn _tls_native_alloc(sock, host, hook_fp, hook_ctx): i64 {
     if (hook_fp != 0) {
         if (fncall2(hook_fp, hook_ctx, nctx) != 0) { return 0; }
     }
-    var ctx = alloc(40);
+    var ctx = _tn_alloc_a(a, 40);
+    if (ctx == 0) { return 0; }
     store64(ctx, nctx);
     store64(ctx + 8, 0);
     store64(ctx + 16, sock);
     store64(ctx + 24, TLS_BACKEND_NATIVE);
     return ctx;
+}
+
+# Read the whole file at `path` into a buffer of EXACTLY its size, drawn from Allocator `a` (0 = the
+# global heap). Returns the buffer and writes the byte count through `out_len`, or returns 0 (and
+# writes 0) when the file cannot be opened or read, is empty, or is larger than `max` bytes.
+# Two passes over file_open / file_read / file_close, no stat: the first counts the bytes through
+# a stack scratch (and stops at `max + 1`), the second reads at most that many into the buffer —
+# so a file that grows between the passes is cut at the counted size, never overruns it, and one
+# that shrinks returns what is there.
+# ⛔ 6.6.13 — WHY. tls_ctx_load_verify_locations took `alloc(1048576)` on every call and kept it
+# (1,054,864 B retained per call for a one-cert CA, measured); the buffer is now the file's size
+# and comes from the ctx's allocator, so an arena-backed ctx gives it back on reset_via.
+# Issue 2026-09-30-tls-client-memory-and-alert-gaps (a); CHANGELOG [6.6.13].
+fn _tls_read_file_in(a, path, max, out_len): i64 {
+    store64(out_len, 0);
+    if (path == 0) { return 0; }
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    var scratch[4096];
+    var size = 0;
+    var more = 1;
+    while (more == 1) {
+        var r = file_read(fd, &scratch, 4096);
+        if (r < 0) { file_close(fd); return 0; }
+        if (r == 0) { more = 0; }
+        size = size + r;
+        if (size > max) { more = 0; }
+    }
+    file_close(fd);
+    if (size <= 0) { return 0; }
+    if (size > max) { return 0; }
+    var buf = _tn_alloc_a(a, size);
+    if (buf == 0) { return 0; }
+    fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    var total = 0;
+    more = 1;
+    while (more == 1) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n < 0) { file_close(fd); return 0; }
+        if (n == 0) { more = 0; }
+        total = total + n;
+        if (total >= size) { more = 0; }
+    }
+    file_close(fd);
+    if (total <= 0) { return 0; }
+    store64(out_len, total);
+    return buf;
+}
+
+# The largest trust bundle tls_ctx_load_verify_locations reads (an OS store is ~250 KB).
+var TLS_CAFILE_MAX = 16777216;
+
+# tls_init_main's native warm: 0 / 1 warming / 2 warmed.
+var _tls_main_state = 0;
+
+# Build every lazy table a native handshake reaches, then the CA bundle cache. Each step is its
+# own once-guarded init, so a racing caller can only repeat work, never corrupt it. Returns 0.
+fn _tls_native_warm(): i64 {
+    sha256_global_init();
+    sha512_global_init();                       # SHA-384 rides on it
+    aes_gcm_global_init();
+    ed25519_init();
+    ecdsa_p256_warm();                          # P-256 sign + verify tables (ECDHE shares them)
+    ecdsa_p384_warm();
+    # X.509 + PEM through their public entry points; neither input is a certificate. The parse
+    # fails at its first DER walk, AFTER the OID table is built; the PEM decode of an empty
+    # buffer finds no BEGIN marker, AFTER the base64 table is built. That is all a warm wants.
+    var junk[16];
+    memset(&junk, 0, 16);
+    var c = x509_cert_alloc();
+    if (c != 0) { x509_parse(&junk, 2, c); }
+    pem_decode_certs_into(&junk, 0, &junk, 1, &junk, 0);
+    # The validity-date table: a real certificate's parse reaches it (x509_parse_into ->
+    # _x509_parse_time -> _x509_date_to_epoch), the junk parse above stops before it.
+    _x509_init_mdays();
+    _tn_ca_load();
+    # Windows: a server ctx installs the second, client-purpose set (CVE-77); load it here so
+    # an mTLS server's first tls_native_set_ca_system does not pay for it. Elsewhere both roles
+    # share the set above.
+    #ifdef CYRIUS_TARGET_WIN
+    _tn_ca_load_client();
+    #endif
+    return 0;
 }
 
 fn _tls_native_complete(ctx): i64 {
@@ -344,6 +606,42 @@ fn tls_available(): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return 1; }   # native is always available
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # libssl: main thread only (6.6.14)
+    _tls_init();
+    return _tls_ok;
+}
+
+# 6.6.13 — warm the TLS stack once, ideally on the MAIN thread before any thread connects.
+# Returns tls_available()'s verdict: 1 if the active backend is usable, 0 if not.
+#
+# Native backend: installs the main thread's crypto block (`crypto_tls_main_init` — a thread
+# that already has one, i.e. every worker, is left alone), then builds every lazy table a
+# handshake reaches and loads the system CA bundle cache (`_tls_native_warm`).
+# RECOMMENDED, NOT REQUIRED: since sigil 3.13.6 each of those inits is race-free and the CA cache
+# publishes once, so concurrent first use from workers is correct without this. What it buys is
+# the first handshake's latency (the P-256 comb, the bundle read) and an end to the thread-pointer
+# probe every `cbank()` makes until the main thread's block exists (two syscalls per call on an
+# x86 kernel without FSGSBASE). Idempotent and safe from any thread; once warmed a call allocates
+# nothing.
+# libssl backend: `_tls_init()`. That backend is MAIN-THREAD ONLY — see the contract's Thread
+# safety section. Issue 2026-09-30-tls-first-use-thread-race; CHANGELOG [6.6.13].
+fn tls_init_main(): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) {
+        crypto_tls_main_init();
+        if (atomic_load(&_tls_main_state) != 2) {
+            # No fence on either side of this state: it guards no data of its own — every table
+            # the warm builds is published, and read, behind that table's own once-flag.
+            if (atomic_cas(&_tls_main_state, 0, 1) == 1) {
+                _tls_native_warm();             # no return between the claim and the publish
+                atomic_store(&_tls_main_state, 2);
+            }
+            while (atomic_load(&_tls_main_state) != 2) { }
+        }
+        return 1;
+    }
+    #endif
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # libssl: main thread only (6.6.14)
     _tls_init();
     return _tls_ok;
 }
@@ -367,9 +665,10 @@ fn tls_available(): i64 {
 fn tls_set_alpn(handle, protos, protos_len): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return tls_native_set_alpn(handle, protos, protos_len); }
+    if (_tls_handle_native(handle) == 1) { return tls_native_set_alpn(handle, protos, protos_len); }
     #endif
     if (_fn_SSL_CTX_set_alpn_protos == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     return fncall3(_fn_SSL_CTX_set_alpn_protos, handle, protos, protos_len);
 }
 
@@ -385,24 +684,43 @@ fn tls_set_alpn(handle, protos, protos_len): i64 {
 # behind this typed verb so consumers don't bind to libssl's
 # symbol name. Returns 0 on success, -1 on missing handle or
 # unresolved symbol.
+#
+# Native (6.6.14, CVE-64): the OpenSSL bitmask maps to a native mode that is never LESS strict
+# than the caller asked —
+#   0                                         -> TLS_VERIFY_NONE
+#   any mode with SSL_VERIFY_FAIL_IF_NO_PEER_CERT (2) set, SSL_VERIFY_PEER (1) or not
+#                                             -> TLS_VERIFY_FAIL_IF_NO_PEER_CERT
+#   any other non-zero mode (PEER; CLIENT_ONCE 4 and POST_HANDSHAKE 8, alone or with PEER)
+#                                             -> TLS_VERIFY_PEER
+# FAIL without PEER is STRICTER than OpenSSL, which ignores the bit unless PEER is set: a caller
+# that asked to refuse certificate-less clients gets that. On a client ctx FAIL and PEER verify
+# alike (a server always presents a certificate). `callback` is NOT run natively: there is no
+# verify callback, so a callback that would ACCEPT a peer OpenSSL rejects (a self-signed or
+# pinned peer) does not — the native handshake fails closed; install that peer's certificate or
+# CA as a trust root (tls_ctx_load_verify_locations) instead. A callback that would REJECT more
+# (a pin) is not run either; check the peer after the handshake with tls_get_peer_spki_der, which
+# answers on both backends and, natively, on a server ctx too.
 fn tls_set_verify(handle, mode, callback): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
-        # Native has no pluggable verify callback — map the OpenSSL mode
-        # bitmask to native PEER/NONE; the callback arg is ignored.
+    if (_tls_handle_native(handle) == 1) {
+        # ⛔ 6.6.14 (CVE-64) — WHY. Every non-zero mode became TLS_VERIFY_PEER, so OpenSSL's
+        # SSL_VERIFY_FAIL_IF_NO_PEER_CERT never reached native: a server that asked to refuse
+        # clients without a certificate accepted them. CHANGELOG [6.6.14]
         var nm = TLS_VERIFY_NONE;
         if (mode != 0) { nm = TLS_VERIFY_PEER; }
+        if ((mode & 2) != 0) { nm = TLS_VERIFY_FAIL_IF_NO_PEER_CERT; }
         return tls_native_set_verify(handle, nm);
     }
     #endif
     if (_fn_SSL_CTX_set_verify == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     fncall3(_fn_SSL_CTX_set_verify, handle, mode, callback);
     return 0;
 }
 
 # ---- Typed pre-handshake trust-store + mTLS config verbs (v6.2.8) ----
-# The residual of docs/development/issues/2026-05-22-cyrius-native-tls-in-6.0.x.md:
+# The residual of docs/development/issues/archived/2026-05-22-cyrius-native-tls-in-6.0.x.md:
 # backend-agnostic replacements for sandhi's remaining `tls_dlsym("SSL_CTX_*")`
 # trust/mTLS callers (src/tls_policy/apply.cyr). Native ENFORCES via the
 # tls_native trust-store + client-auth machinery; libssl routes to the SSL_CTX_*
@@ -412,21 +730,25 @@ fn tls_set_verify(handle, mode, callback): i64 {
 
 # Load a custom CA trust store from `cafile` (PEM). `capath` (per-directory
 # store) is honoured only under libssl — native has no directory store, so the
-# native path slurps `cafile` and installs it via the CA bundle. Returns 1/0/-1.
+# native path reads `cafile` (at most TLS_CAFILE_MAX bytes) and installs it via the CA bundle.
+# Native: the file buffer and the parsed roots come from the ctx's allocator, so a call retains
+# about twice the file's size plus 272 B per root — not the megabyte it kept per call before 6.6.13
+# — and an arena-backed ctx returns all of it on reset_via. tls_native_ca_skipped(handle) counts
+# the blocks it could not use — a malformed block (6.6.14) among them, skipped while the rest
+# install. Returns 1/0/-1.
 fn tls_ctx_load_verify_locations(handle, cafile, capath): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
-        var cap = 1048576;
-        var buf = alloc(cap);
+    if (_tls_handle_native(handle) == 1) {
+        var n = 0;
+        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), cafile, TLS_CAFILE_MAX, &n);
         if (buf == 0) { return 0; }
-        var n = file_read_all(cafile, buf, cap);
-        if (n <= 0) { return 0; }
         if (tls_native_set_ca_bundle(handle, buf, n, 0) == TLS_OK) { return 1; }
         return 0;
     }
     #endif
     if (_fn_SSL_CTX_load_verify_locations == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     return fncall3(_fn_SSL_CTX_load_verify_locations, handle, cafile, capath);
 }
 
@@ -434,26 +756,37 @@ fn tls_ctx_load_verify_locations(handle, cafile, capath): i64 {
 fn tls_ctx_set_verify_paths(handle): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
+    if (_tls_handle_native(handle) == 1) {
         if (tls_native_set_ca_system(handle) == TLS_OK) { return 1; }
         return 0;
     }
     #endif
     if (_fn_SSL_CTX_set_default_verify_paths == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     return fncall1(_fn_SSL_CTX_set_default_verify_paths, handle);
 }
 
+# The largest client certificate or private-key file the two verbs below read on the native
+# backend. A leaf plus its chain is a few KB; a larger file is refused (0), never cut short.
+var TLS_CREDFILE_MAX = 1048576;
+
 # mTLS: present the client's own certificate. `type` = SSL_FILETYPE_PEM(1) /
 # SSL_FILETYPE_ASN1(2 = DER). Pair with tls_ctx_use_private_key_file. Returns 1/0/-1.
+# Native: client contexts only (0 on a server ctx, before anything is read); the file (at most
+# TLS_CREDFILE_MAX bytes) is read into a buffer of exactly its size from the ctx's allocator.
+# ⛔ 6.6.14 — WHY. Both file verbs took alloc(65536) from the global heap per call and kept it,
+# and file_read_all stopped at 64 KiB: a longer file was parsed CUT SHORT (a certificate past the
+# first 64 KiB was not found; one before it was accepted from a truncated file), and an
+# arena-backed ctx could not reclaim the buffer. The shape 6.6.13 removed from
+# tls_ctx_load_verify_locations. CHANGELOG [6.6.14]
 fn tls_ctx_use_certificate_file(handle, path, type): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
-        var cap = 65536;
-        var buf = alloc(cap);
+    if (_tls_handle_native(handle) == 1) {
+        if (load64(handle + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) { return 0; }
+        var n = 0;
+        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX, &n);
         if (buf == 0) { return 0; }
-        var n = file_read_all(path, buf, cap);
-        if (n <= 0) { return 0; }
         var is_der = 0;
         if (type == 2) { is_der = 1; }
         if (tls_native_set_client_cert(handle, buf, n, is_der) == TLS_OK) { return 1; }
@@ -461,25 +794,28 @@ fn tls_ctx_use_certificate_file(handle, path, type): i64 {
     }
     #endif
     if (_fn_SSL_CTX_use_certificate_file == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     return fncall3(_fn_SSL_CTX_use_certificate_file, handle, path, type);
 }
 
 # mTLS: install the client's own private key. `type` as above (native auto-
-# detects PEM vs DER by content). Returns 1/0/-1.
+# detects PEM vs DER by content). Returns 1/0/-1. Native: as tls_ctx_use_certificate_file — a
+# client ctx only, the file read exactly from the ctx's allocator, at most TLS_CREDFILE_MAX bytes
+# (the key stays referenced from that buffer). CHANGELOG [6.6.14]
 fn tls_ctx_use_private_key_file(handle, path, type): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
-        var cap = 65536;
-        var buf = alloc(cap);
+    if (_tls_handle_native(handle) == 1) {
+        if (load64(handle + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) { return 0; }
+        var n = 0;
+        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX, &n);
         if (buf == 0) { return 0; }
-        var n = file_read_all(path, buf, cap);
-        if (n <= 0) { return 0; }
         if (tls_native_set_client_key(handle, buf, n) == TLS_OK) { return 1; }
         return 0;
     }
     #endif
     if (_fn_SSL_CTX_use_PrivateKey_file == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     return fncall3(_fn_SSL_CTX_use_PrivateKey_file, handle, path, type);
 }
 
@@ -495,10 +831,39 @@ var _fn_X509_get_pubkey_v        = 0;
 var _fn_i2d_PUBKEY_v             = 0;
 var _fn_X509_free_v              = 0;
 var _fn_EVP_PKEY_free_v          = 0;
-var _tls_introspect_resolved     = 0;
+var _tls_introspect_resolved     = 0;   # 1 = the pointers below are published
+var _tls_introspect_state        = 0;   # 0 / 1 resolving / 2 done (6.6.14)
+
+# Resolve the introspection symbols once: a 0 -> 1 -> 2 claim (6.6.14 — it was a check-then-set
+# flag); `_tls_introspect_resolved` stays the published readiness
+# flag (fenced on aarch64) the fast path reads. Callers are the main-thread libssl arms, so — as in
+# _tls_init — a claim held by someone else can only be one inherited through fork(): the caller does
+# not wait for it, and each arm's own null-pointer checks refuse whatever was left unresolved.
+# 1 when the introspection latch is ORPHANED: claimed (state 1) and never published, seen from the
+# main thread — the only thread that ever claims it, so there it can only be a claim inherited
+# through fork() from a parent caught mid-resolve. The introspection verbs then fail closed BEFORE
+# they read anything through their ctx (6.6.17: since l3 they read the ctx's backend tag first, and
+# the 6.6.14 row that pins this inheritance passes a stand-in buffer, not a ctx — reading its +8
+# from the stack sent it down the native arm with a garbage pointer, SIGSEGV in a minimal
+# environment). The state is read first, so a process that never claimed it pays one load; a
+# worker never treats the main thread's in-flight claim as an orphan.
+fn _tls_introspect_orphaned(): i64 {
+    if (atomic_load(&_tls_introspect_state) != 1) { return 0; }
+    if (_tls_introspect_resolved == 1) { return 0; }        # published, just before its state
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
+    return 1;
+}
 
 fn _tls_resolve_introspect(): i64 {
     if (_tls_introspect_resolved == 1) { return 0; }
+    if (atomic_cas(&_tls_introspect_state, 0, 1) == 1) {
+        _tls_resolve_introspect_syms();             # no return between the claim and the publish
+        atomic_store(&_tls_introspect_state, 2);
+    }
+    return 0;
+}
+
+fn _tls_resolve_introspect_syms(): i64 {
     _fn_SSL_get0_alpn_selected_v = tls_dlsym("SSL_get0_alpn_selected");
     _fn_SSL_get1_peer_cert_v     = tls_dlsym("SSL_get1_peer_certificate");
     if (_fn_SSL_get1_peer_cert_v == 0) { _fn_SSL_get1_peer_cert_v = tls_dlsym("SSL_get_peer_certificate"); }
@@ -506,6 +871,12 @@ fn _tls_resolve_introspect(): i64 {
     _fn_i2d_PUBKEY_v             = tls_dlsym("i2d_PUBKEY");
     _fn_X509_free_v              = tls_dlsym("X509_free");
     _fn_EVP_PKEY_free_v          = tls_dlsym("EVP_PKEY_free");
+    # v6.5.39 — same publish shape, and the proposal missed this one entirely: the
+    # `_fn_*_v` introspection pointers resolved above must be visible to any thread that
+    # observes the flag. aarch64 only.
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
     _tls_introspect_resolved = 1;
     return 0;
 }
@@ -514,9 +885,11 @@ fn _tls_resolve_introspect(): i64 {
 # its byte length, or 0 if none was negotiated.
 fn tls_get_alpn_selected(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
+    if (_tls_introspect_orphaned() == 1) { return 0; }     # before the ctx is read (6.6.17)
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return tls_native_get_alpn_selected(load64(ctx), buf, bufmax); }
+    if (_tls_shim_native(ctx) == 1) { return tls_native_get_alpn_selected(load64(ctx), buf, bufmax); }
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     _tls_resolve_introspect();
     if (_fn_SSL_get0_alpn_selected_v == 0) { return 0; }
     var ssl = load64(ctx + 8);
@@ -541,9 +914,11 @@ fn tls_get_alpn_selected(ctx, buf, bufmax): i64 {
 # consumers SHA-256 it.
 fn tls_get_peer_spki_der(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
+    if (_tls_introspect_orphaned() == 1) { return 0; }     # before the ctx is read (6.6.17)
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return tls_native_get_peer_spki_der(load64(ctx), buf, bufmax); }
+    if (_tls_shim_native(ctx) == 1) { return tls_native_get_peer_spki_der(load64(ctx), buf, bufmax); }
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     _tls_resolve_introspect();
     if (_fn_SSL_get1_peer_cert_v == 0) { return 0; }
     if (_fn_X509_get_pubkey_v == 0) { return 0; }
@@ -558,13 +933,18 @@ fn tls_get_peer_spki_der(ctx, buf, bufmax): i64 {
         return 0;
     }
     var ret = 0;
-    var size = fncall2(_fn_i2d_PUBKEY_v, pkey, 0);   # NULL → required size
+    # i2d_PUBKEY returns a C int: -1 arrives zero-extended as 4294967295, which passed `> 0`
+    # and was handed back as the SPKI length. Sign-extend both results (CVE-60's class, the
+    # same mapper's sibling site). CHANGELOG [6.6.13]
+    var size = fncall2(_fn_i2d_PUBKEY_v, pkey, 0) & 0xFFFFFFFF;   # NULL → required size
+    if (size > 0x7FFFFFFF) { size = size - 0x100000000; }
     if (size > 0) {
         if (size <= bufmax) {
             var pc[8];
             store64(&pc, buf);
-            var written = fncall2(_fn_i2d_PUBKEY_v, pkey, &pc);
-            if (written > 0) { ret = written; }
+            var written = fncall2(_fn_i2d_PUBKEY_v, pkey, &pc) & 0xFFFFFFFF;
+            if (written > 0x7FFFFFFF) { written = written - 0x100000000; }
+            if (written > 0) { if (written <= bufmax) { ret = written; } }
         }
     }
     if (_fn_EVP_PKEY_free_v != 0) { fncall1(_fn_EVP_PKEY_free_v, pkey); }
@@ -590,12 +970,59 @@ fn tls_get_peer_spki_der(ctx, buf, bufmax): i64 {
 # won't survive a native-TLS transport swap; typed wrappers
 # do.
 fn tls_dlsym(name): i64 {
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # main thread only (6.6.14)
     _tls_init();
     if (_tls_ok == 0) { return 0; }
     if (_tls_libssl_handle == 0) { return 0; }
     var fn_dlsym = fdlopen_dlsym(&_tls_fdl_state);
     if (fn_dlsym == 0) { return 0; }
     return fncall2(fn_dlsym, _tls_libssl_handle, name);
+}
+
+# 6.6.13 (CVE-59) — bind a libssl client handshake to `host`. SSL_VERIFY_PEER
+# alone checks the CHAIN; with no expected identity in the SSL's X509_VERIFY_PARAM,
+# OpenSSL accepted any chain-valid leaf for any host (the libssl twin of CVE-18).
+# The host is classified by the native backend's own code (lib/tls_hostid.cyr), so
+# both backends agree on what `host` is (RFC 9525 §6.3):
+#   - IP literal (4 / 16): X509_VERIFY_PARAM_set1_ip_asc — iPAddress SANs only — and
+#     NO SNI (RFC 6066 §3: a literal is not a HostName).
+#   - DNS name (0): hostflags NO_PARTIAL_WILDCARDS | NEVER_CHECK_SUBJECT, then
+#     X509_VERIFY_PARAM_set1_host — dNSName SANs only, case-insensitive, a full
+#     leftmost-label "*." wildcard, no subject-CN fallback — and SNI.
+#   - host 0, "", a ':'-bearing non-literal or (6.6.14, CVE-67) a host starting with '.'
+#     (-1): no reference identity — OpenSSL would read ".example.com" as "any subdomain".
+# Under SSL_VERIFY_PEER (the default) a host with no identity is REFUSED, as
+# native's tls_native_client_verify_hostname refuses it. A hook that cleared
+# SSL_VERIFY_PEER (tls_set_verify(h, 0, 0)) opted out of verification: nothing is
+# bound, as under native's TLS_VERIFY_NONE, and a DNS name still goes out as SNI.
+# Runs on the SSL* after SSL_new, i.e. after the hook. Returns 1 to proceed, 0 to
+# refuse (the caller frees). The int returns are masked to 32 bits before `== 1`.
+fn _tls_libssl_bind_host(ssl, host): i64 {
+    var hl = 0;
+    if (host != 0) { hl = strlen(host); }
+    var ipb[16];                                  # 16 BYTES (local-array rule)
+    var kind = 0 - 1;
+    if (hl > 0) { kind = _tn_parse_ip_literal(host, hl, &ipb); }
+    var mode = fncall1(_fn_SSL_get_verify_mode, ssl);
+    if ((mode & SSL_VERIFY_PEER) == 0) {
+        if (kind == 0) {
+            fncall4(_fn_SSL_ctrl, ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host);
+        }
+        return 1;
+    }
+    if (kind < 0) { return 0; }
+    var param = fncall1(_fn_SSL_get0_param, ssl);
+    if (param == 0) { return 0; }
+    if (kind > 0) {
+        var ipr = fncall2(_fn_X509_VERIFY_PARAM_set1_ip_asc, param, host);
+        if ((ipr & 0xFFFFFFFF) != 1) { return 0; }
+        return 1;
+    }
+    fncall2(_fn_X509_VERIFY_PARAM_set_hostflags, param, _TLS_LIBSSL_HOSTFLAGS);
+    var hr = fncall3(_fn_X509_VERIFY_PARAM_set1_host, param, host, hl);
+    if ((hr & 0xFFFFFFFF) != 1) { return 0; }
+    fncall4(_fn_SSL_ctrl, ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host);
+    return 1;
 }
 
 # v5.6.40: wrap an already-connected TCP socket in a TLS session
@@ -622,7 +1049,7 @@ fn tls_dlsym(name): i64 {
 # — direct libssl ABI binding ties consumers to the transport.
 #
 # Filed by sandhi 2026-04-24 in
-# `sandhi/docs/issues/2026-04-24-stdlib-tls-alpn-hook.md`,
+# `sandhi/docs/development/issues/archive/2026-04-24-stdlib-tls-alpn-hook.md`,
 # Option A (function-pointer hook — least invasive, most
 # flexible). v5.10.13 follow-up: typed wrappers added so the
 # hook can stay generic across transports.
@@ -646,10 +1073,57 @@ fn tls_dlsym(name): i64 {
 # tls_connect_complete (success path) or tls_close (cleanup) to
 # release. Returns 0 on any allocation/binding/hook failure (all
 # resources released in the error path before return).
+#
+# 6.6.13 (CVE-59): on libssl the leaf is BOUND TO `host` here,
+# after the hook (_tls_libssl_bind_host) — the handshake used to check
+# the chain only, so any chain-valid certificate verified any host.
+# host == 0 / "" returns 0 unless the hook cleared SSL_VERIFY_PEER;
+# an IP-literal host is matched against iPAddress SANs and sends no
+# SNI. The binding lives in alloc, so the staged path
+# (alloc -> tls_set_session -> complete) is bound too.
+# 6.6.13: the a == 0 wrapper over tls_connect_alloc_in (the global heap).
 fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
+    return tls_connect_alloc_in(0, sock, host, hook_fp, hook_ctx);
+}
+
+# 6.6.13 — allocator-aware client connect, the mirror of tls_accept_alloc_in. `a` is an Allocator
+# handle (lib/alloc.cyr; 0 = the global no-free heap, = tls_connect_alloc). On the native backend
+# the ctx, the shim, the handshake and the connection's record buffers all draw from `a`, so a
+# long-lived client gives each connection back with one reset_via(a):
+#
+#   var a = arena_allocator(262144);            # once, NOT per connection
+#   while (fetching) {
+#       var c = tls_connect_alloc_in(a, sock, host, hook, 0);
+#       if (c != 0) {
+#           if (tls_connect_complete(c) == 1) { ...tls_write / tls_read...; }
+#           tls_close(c);
+#       }
+#       reset_via(a);                            # the whole connection, back
+#   }
+#
+# ⚠ A non-zero `a` MUST be an arena_allocator (sigil's X.509 parse takes the raw arena behind it),
+# created ONCE — not per connection — and reset with reset_via, not alloc_reset, between
+# connections; its capacity must cover one connection — the handshake plus the two per-ctx record
+# buffers: 175,208 B for TLS 1.3 and 153,128 B for 1.2 against a one-certificate P-256 server
+# (measured, 6.6.13), more for a longer chain. Reads and writes after the first allocate nothing.
+# The system root set the default verification uses is parsed once per process on the global heap
+# and shared, never placed in `a`; a hook's own trust store (tls_ctx_load_verify_locations) is
+# drawn from `a`.
+# The libssl backend manages its own memory: `a` does not apply, and the call runs the same libssl
+# body tls_connect_alloc runs. Issue 2026-09-30-tls-client-memory-and-alert-gaps (b);
+# CHANGELOG [6.6.13].
+fn tls_connect_alloc_in(a, sock, host, hook_fp, hook_ctx): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return _tls_native_alloc(sock, host, hook_fp, hook_ctx); }
+    if (_tls_backend == 1) { return _tls_native_alloc_in(a, sock, host, hook_fp, hook_ctx); }
     #endif
+    # ⚠ The libssl BODY, never tls_connect_alloc: that is the a == 0 wrapper over this fn, and the
+    # two would call each other forever (tail calls: a hang, not a stack overflow).
+    return _tls_libssl_connect_alloc(sock, host, hook_fp, hook_ctx);
+}
+
+# tls_connect_alloc's libssl backend (see its comment): SSL_CTX + SSL + hook + host binding + fd.
+fn _tls_libssl_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # main thread only (6.6.14)
     _tls_init();
     if (_tls_ok == 0) { return 0; }
 
@@ -687,22 +1161,36 @@ fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
         return 0;
     }
 
-    fncall2(_fn_SSL_set_fd, ssl, sock);
-
-    # Set SNI hostname via SSL_ctrl (SSL_set_tlsext_host_name is a macro)
-    if (host != 0) {
-        fncall4(_fn_SSL_ctrl, ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host);
+    # 6.6.13 (CVE-59): bind the leaf to `host` and set SNI for a DNS name.
+    # Here, after the hook and SSL_new: the hook's final verify mode is on the SSL,
+    # and the binding goes on the per-SSL param. `host` IS the identity: set1_host /
+    # set1_ip_asc REPLACE a name / IP of the same kind a hook pinned on the SSL_CTX's
+    # param (hostflags too); only a pin of the other kind survives and must also match.
+    if (_tls_libssl_bind_host(ssl, host) != 1) {
+        if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
     }
+
+    fncall2(_fn_SSL_set_fd, ssl, sock);
 
     # Allocate ctx struct in pre-handshake state. Layout matches
     # post-handshake ctx (struct shape preserved across the
     # alloc → complete transition); tls_close handles either
     # state correctly via SSL_free which works on either
-    # connected or unconnected SSL handles.
-    var ctx = alloc(24);
+    # connected or unconnected SSL handles. +24 is the deadline (6.6.13: 0 = none), +32 the
+    # sticky error (6.6.14: 0 = none yet).
+    var ctx = alloc(_TLS_LIBSSL_SHIM_LEN);
+    if (ctx == 0) {
+        if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
     store64(ctx, ssl_ctx);
     store64(ctx + 8, ssl);
     store64(ctx + 16, sock);
+    store64(ctx + 24, 0);
+    store64(ctx + _TLS_SHIM_OFF_ERR, 0);
     return ctx;
 }
 
@@ -712,16 +1200,91 @@ fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
 # get_session), 0 on failure (caller MUST tls_close the ctx
 # to release; this fn does NOT free on failure since the caller
 # may want to inspect SSL_get_error before freeing).
+# 6.6.16: on libssl a 0 is FINAL, as on native — see _tls_libssl_complete.
 fn tls_connect_complete(ctx): i64 {
     if (ctx == 0) { return 0; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return _tls_native_complete(ctx); }
+    if (_tls_shim_native(ctx) == 1) { return _tls_native_complete(ctx); }
     #endif
-    var ssl = load64(ctx + 8);
-    if (ssl == 0) { return 0; }
-    var r = fncall1(_fn_SSL_connect, ssl);
-    if (r != 1) { return 0; }
-    return 1;
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # main thread only (6.6.14)
+    if (load64(ctx + 8) == 0) { return 0; }
+    return _tls_libssl_complete(ctx, _TLS_IO_CONNECT);
+}
+
+# The libssl *_complete body: drive SSL_connect / SSL_accept (`op`) on the shim, under the
+# deadline loop when one is set (_tls_ssl_io). 1 on a completed handshake; else 0, with the
+# failure recorded at +32 (_tls_libssl_complete_fail) — and a shim that already holds one is
+# refused up front, without touching SSL. A failed complete is then FINAL: every later tls_read
+# returns the recorded code, tls_write returns TLS_ERR_PROTOCOL, neither calls SSL, and tls_close
+# skips SSL_shutdown — the rules a failed tls_read / tls_write already set (_tls_libssl_sticky),
+# and native's for a failed ctx.
+# ⛔ 6.6.16 — WHY. A failed complete returned 0 and recorded nothing, and the deadline loop threw
+# its failure code away (it collapsed CONNECT / ACCEPT to 1 / 0). tls_read then called SSL_read,
+# and OpenSSL's implicit handshake (SSL_in_init -> handshake_func) RESUMED the handshake: after a
+# complete that failed on a non-blocking socket, tls_read returned 21 bytes of the server's data
+# on a connection the caller had been told had failed (measured). The no-deadline call now clears
+# libcrypto's error queue first, as tls_read / tls_write do: OpenSSL 3.6.5's handshake clears it on
+# entry (measured), but nothing in the ABI promises that, and a stale entry would decide the
+# mapping. CHANGELOG [6.6.16]
+fn _tls_libssl_complete(ctx, op): i64 {
+    if (load64(ctx + _TLS_SHIM_OFF_ERR) != 0) { return 0; }   # failed before: final
+    if (op == _TLS_IO_ACCEPT) {
+        if (_fn_SSL_accept == 0) { return _tls_libssl_complete_fail(ctx, 0); }   # client-only libssl
+    }
+    var r = 0;
+    if (load64(ctx + 24) != 0) {
+        r = _tls_ssl_io(ctx, op, 0, 0);
+    } else {
+        var ssl = load64(ctx + 8);
+        if (_fn_ERR_clear_error != 0) { fncall0(_fn_ERR_clear_error); }
+        r = _tls_ssl_io_ret(ssl, _tls_ssl_call(op, ssl, 0, 0, 0));
+    }
+    if (r == 1) { return 1; }
+    return _tls_libssl_complete_fail(ctx, r);
+}
+
+# Record a failed libssl handshake on the shim and return 0 (what *_complete answers). `code` is
+# the mapped result: a terminal TLS_ERR_* (_tls_ssl_io_ret's IO / ALERT / PROTOCOL, the deadline
+# loop's TIMEOUT) is kept as is. Anything else — 0, a positive count, TLS_ERR_WOULD_BLOCK (a
+# non-blocking socket with no deadline: the contract already calls that a failure, and a later
+# tls_read answering WOULD_BLOCK would invite an endless retry) — becomes TLS_ERR_HANDSHAKE_FAILED.
+fn _tls_libssl_complete_fail(ctx, code): i64 {
+    var c = code;
+    if (c >= 0) { c = TLS_ERR_HANDSHAKE_FAILED; }
+    if (c == TLS_ERR_WOULD_BLOCK) { c = TLS_ERR_HANDSHAKE_FAILED; }
+    store64(ctx + _TLS_SHIM_OFF_ERR, c);
+    return 0;
+}
+
+# 6.6.13 (CVE-61) — an absolute deadline for the connection: the handshake and every later
+# tls_read / tls_write. `abs_ns` is on lib/chrono's monotonic clock_now_ns() scale; 0 clears it.
+# Set it between the two staged-connect phases so it bounds the handshake too:
+#
+#   var c = tls_connect_alloc(sock, host, 0, 0);
+#   if (c != 0) {
+#       tls_set_deadline(c, clock_now_ns() + 10000000000);   # 10 s for the whole exchange
+#       if (tls_connect_complete(c) == 1) { ...tls_write / tls_read...; }
+#       tls_close(c);
+#   }
+#
+# (tls_accept_alloc / tls_accept_complete the same way). Once it passes, tls_read / tls_write
+# return TLS_ERR_TIMEOUT and the *_complete verbs return 0; treat it as the end of the connection.
+# Native backend: tls_native_set_deadline on the native ctx (which fails with the timeout). libssl
+# backend: the deadline is kept at shim +24 and every SSL_connect / SSL_accept / SSL_read /
+# SSL_write runs non-blocking, driven by SSL_get_error and fd_wait_ready (_tls_ssl_io), with the
+# socket's status flags restored after each call. With no deadline both backends behave exactly
+# as before. Returns 0, TLS_ERR_INVALID_PARAM (ctx 0, abs_ns < 0), or TLS_ERR_NOT_IMPLEMENTED on a
+# libssl without SSL_get_error — a deadline it could not honour is refused, never ignored.
+fn tls_set_deadline(ctx, abs_ns): i64 {
+    if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (abs_ns < 0) { return TLS_ERR_INVALID_PARAM; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_shim_native(ctx) == 1) { return tls_native_set_deadline(load64(ctx), abs_ns); }
+    #endif
+    if (_fn_SSL_get_error == 0) { return TLS_ERR_NOT_IMPLEMENTED; }
+    if (_tls_libssl_thread_ok() == 0) { return TLS_ERR_WRONG_THREAD; }
+    store64(ctx + 24, abs_ns);
+    return 0;
 }
 
 # Wrap an already-connected TCP socket in a TLS session.
@@ -772,11 +1335,15 @@ fn _tls_native_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx): i64 {
     if (tls_native_server_load_creds(nctx) != TLS_OK) { return 0; }
     # Hook fires on the native ctx (opaque handle) post-setup / pre-accept —
     # the home for tls_set_alpn / client-cert-verify config, exactly as the
-    # client hook fires on nctx in _tls_native_alloc.
+    # client hook fires on nctx in _tls_native_alloc_in.
     if (hook_fp != 0) {
         if (fncall2(hook_fp, hook_ctx, nctx) != 0) { return 0; }
     }
+    # 6.6.20: checked, as the client twin's is — a refused shim was stored through (a SIGSEGV in
+    # the stdlib, where the contract promises "ctx-pre-handshake or 0"). Pinned by
+    # tests/tcyr/crypto/tls_shim_alloc_refused.tcyr. CHANGELOG [6.6.20]
     var ctx = _tn_alloc_a(a, 40);
+    if (ctx == 0) { return 0; }
     store64(ctx, nctx);
     store64(ctx + 8, 0);
     store64(ctx + 16, sock);
@@ -795,13 +1362,14 @@ fn _tls_native_accept_complete(ctx): i64 {
 #endif
 
 # Phase 1: build a server ctx from DER cert/key (+ optional config hook), return
-# the standard backend shim (40B native [nctx,0,sock,NATIVE] / 24B libssl
-# [ssl_ctx,ssl,sock]) or 0. Configure ALPN/verify in the hook, then drive the
+# the standard backend shim (40B native [nctx,0,sock,NATIVE] / 40B libssl
+# [ssl_ctx,ssl,sock,deadline,sticky error]) or 0. Configure ALPN/verify in the hook, then drive the
 # handshake with tls_accept_complete.
 fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return _tls_native_accept_alloc(sock, creds, hook_fp, hook_ctx); }
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # main thread only (6.6.14)
     _tls_init();
     if (_tls_ok == 0) { return 0; }
     if (_fn_TLS_server_method == 0) { return 0; }   # client-only libssl: fail closed
@@ -819,6 +1387,7 @@ fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
     # d2i_AutoPrivateKey advances its 2nd arg, so pass the address of a cell
     # holding the DER pointer (not the pointer directly).
     var pcell = alloc(8);
+    if (pcell == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
     store64(pcell, load64(creds + 16));
     var pkey = fncall3(_fn_d2i_AutoPrivateKey, 0, pcell, load64(creds + 24));
     if (pkey == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
@@ -836,25 +1405,31 @@ fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
     var ssl = fncall1(_fn_SSL_new, ssl_ctx);
     if (ssl == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
     fncall2(_fn_SSL_set_fd, ssl, sock);
-    var ctx = alloc(24);
+    var ctx = alloc(_TLS_LIBSSL_SHIM_LEN);
+    if (ctx == 0) {
+        if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
     store64(ctx, ssl_ctx);
     store64(ctx + 8, ssl);
     store64(ctx + 16, sock);
+    store64(ctx + 24, 0);                       # deadline: none (6.6.13)
+    store64(ctx + _TLS_SHIM_OFF_ERR, 0);        # sticky error: none yet (6.6.14)
     return ctx;
 }
 
 # Phase 2: drive the server handshake over the shim's socket. 1 on success, 0 on
-# failure (caller tls_close()s the ctx). Mirrors tls_connect_complete.
+# failure (caller tls_close()s the ctx). Mirrors tls_connect_complete; on libssl a 0 is final
+# (6.6.16, _tls_libssl_complete), a libssl without SSL_accept included (fail closed).
 fn tls_accept_complete(ctx): i64 {
     if (ctx == 0) { return 0; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return _tls_native_accept_complete(ctx); }
+    if (_tls_shim_native(ctx) == 1) { return _tls_native_accept_complete(ctx); }
     #endif
-    var ssl = load64(ctx + 8);
-    if (ssl == 0) { return 0; }
-    if (_fn_SSL_accept == 0) { return 0; }   # client-only libssl: fail closed
-    if (fncall1(_fn_SSL_accept, ssl) != 1) { return 0; }
-    return 1;
+    if (_tls_libssl_thread_ok() == 0) { return 0; }   # main thread only (6.6.14)
+    if (load64(ctx + 8) == 0) { return 0; }
+    return _tls_libssl_complete(ctx, _TLS_IO_ACCEPT);
 }
 
 # Convenience: accept + complete in one call (no config hook). Mirrors
@@ -901,7 +1476,7 @@ fn tls_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx): i64 {
 fn tls_write(ctx, buf, len): i64 {
     if (ctx == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) {
+    if (_tls_shim_native(ctx) == 1) {
         # Native caps a record at TLS_RECORD_MAX_PLAINTEXT; libssl fragments
         # internally, so loop-fragment here to keep the bytes-written contract.
         var nctx = load64(ctx);
@@ -916,29 +1491,272 @@ fn tls_write(ctx, buf, len): i64 {
         return len;
     }
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return TLS_ERR_WRONG_THREAD; }   # main thread only (6.6.14)
+    if (len == 0) { return 0; }                 # nothing to send (the native answer too)
+    # A failed connection stays failed: the write is refused without touching SSL, as native
+    # refuses a write on a failed ctx (6.6.14).
+    if (load64(ctx + _TLS_SHIM_OFF_ERR) != 0) { return TLS_ERR_PROTOCOL; }
     var ssl = load64(ctx + 8);
-    return fncall3(_fn_SSL_write, ssl, buf, len);
+    var sw = 0;
+    if (load64(ctx + 24) != 0) {
+        sw = _tls_ssl_io(ctx, _TLS_IO_WRITE, buf, len);
+    } else {
+        if (_fn_ERR_clear_error != 0) { fncall0(_fn_ERR_clear_error); }
+        sw = _tls_ssl_io_ret(ssl, _tls_ssl_call(_TLS_IO_WRITE, ssl, buf, len, 0));
+    }
+    if (sw == 0) { sw = TLS_ERR_PROTOCOL; }     # a write never succeeds with 0 bytes: shut down
+    return _tls_libssl_sticky(ctx, sw);
 }
 
 # Read from TLS session
 fn tls_read(ctx, buf, maxlen): i64 {
     if (ctx == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return tls_native_read(load64(ctx), buf, maxlen); }
+    if (_tls_shim_native(ctx) == 1) { return tls_native_read(load64(ctx), buf, maxlen); }
     #endif
+    if (_tls_libssl_thread_ok() == 0) { return TLS_ERR_WRONG_THREAD; }   # main thread only (6.6.14)
+    # A failed connection answers every later read with the code that failed it, without
+    # touching SSL (6.6.14) — see _tls_libssl_sticky.
+    var se = load64(ctx + _TLS_SHIM_OFF_ERR);
+    if (se != 0) { return se; }
+    if (load64(ctx + 24) != 0) { return _tls_libssl_sticky(ctx, _tls_ssl_io(ctx, _TLS_IO_READ, buf, maxlen)); }
     var ssl = load64(ctx + 8);
-    return fncall3(_fn_SSL_read, ssl, buf, maxlen);
+    if (_fn_ERR_clear_error != 0) { fncall0(_fn_ERR_clear_error); }
+    return _tls_libssl_sticky(ctx, _tls_ssl_io_ret(ssl, _tls_ssl_call(_TLS_IO_READ, ssl, buf, maxlen, 0)));
 }
 
-# Close TLS session and free resources
+# Record a libssl tls_read / tls_write result `r` on the shim and return it. A negative result
+# other than TLS_ERR_WOULD_BLOCK (a non-blocking socket with nothing ready: call again) ENDS the
+# connection: it is kept at +32, every later tls_read returns it and every later tls_write returns
+# TLS_ERR_PROTOCOL — the native backend's rule for a failed ctx — and neither calls SSL again;
+# tls_close then skips SSL_shutdown (OpenSSL: never after SSL_ERROR_SYSCALL / SSL_ERROR_SSL).
+# ⛔ 6.6.14 — WHY. After a fatal alert a SECOND SSL_read reported SSL_ERROR_ZERO_RETURN (OpenSSL
+# sets RECEIVED_SHUTDOWN and leaves warn_alert at 0 = close_notify), so the libssl backend read
+# an attacked stream as cleanly ended on the re-read, where native kept TLS_ERR_ALERT.
+# CVE-60's "Not covered"; CHANGELOG [6.6.14].
+fn _tls_libssl_sticky(ctx, r): i64 {
+    if (r < 0) {
+        if (r != TLS_ERR_WOULD_BLOCK) { store64(ctx + _TLS_SHIM_OFF_ERR, r); }
+    }
+    return r;
+}
+
+# The libssl backend's answer for one SSL_read / SSL_write, in the native backend's terms: bytes
+# (> 0), 0 for the peer's close_notify, or a negative TLS_ERR_* (the read path's error table,
+# lib/tls_native_conn.cyr). `r` is the call's raw return.
+# ⛔ 6.6.13 (CVE-60) — WHY. SSL_read / SSL_write return a C `int`, and fncall3 hands back
+# the whole register, which holds it ZERO-extended: -1 arrived as +4294967295, so a tampered
+# record (one bit flipped on the path, no key needed) made tls_read report ~4 GiB read, and a
+# caller doing `total = total + n` indexed past its buffer. And SSL_read's 0 is not only
+# close_notify: a received fatal alert and a stream cut mid-record are 0 too, so an attacked
+# stream read as a clean end. Both are decided here, from SSL_get_error and libcrypto's error
+# queue (cleared before every SSL_read / SSL_write, or a stale entry would decide it):
+#   SSL_ERROR_ZERO_RETURN (6), r == 0  -> 0 (close_notify read; libssl keeps returning it)
+#   SSL_ERROR_ZERO_RETURN (6), r < 0   -> TLS_ERR_PROTOCOL (a write after the peer shut down)
+#   SSL_ERROR_WANT_READ / _WRITE (2/3) -> TLS_ERR_WOULD_BLOCK
+#   SSL_ERROR_SYSCALL (5)              -> TLS_ERR_IO
+#   SSL_ERROR_SSL (1), a received alert (lib SSL, reason 1000 + description) -> TLS_ERR_ALERT
+#   SSL_ERROR_SSL, unexpected EOF (reason 294: the stream ended with no close_notify) -> TLS_ERR_IO
+#   SSL_ERROR_SSL, anything else (a bad record MAC, a protocol violation)    -> TLS_ERR_PROTOCOL
+#   anything else, or no SSL_get_error -> TLS_ERR_IO (never 0: fail closed)
+# Issue 2026-09-30-tls-client-memory-and-alert-gaps (c); CHANGELOG [6.6.13].
+fn _tls_ssl_io_ret(ssl, r): i64 {
+    var v = r & 0xFFFFFFFF;                     # the C int; the high half is not part of it
+    if (v > 0x7FFFFFFF) { v = v - 0x100000000; }   # sign-extend (`>>` is logical: no shift)
+    if (v > 0) { return v; }
+    if (_fn_SSL_get_error == 0) { return TLS_ERR_IO; }
+    var e = fncall2(_fn_SSL_get_error, ssl, v) & 0xFFFFFFFF;
+    if (e == 6) {
+        if (v == 0) { return 0; }
+        return TLS_ERR_PROTOCOL;
+    }
+    if (e == 2) { return TLS_ERR_WOULD_BLOCK; }
+    if (e == 3) { return TLS_ERR_WOULD_BLOCK; }
+    if (e == 5) { return TLS_ERR_IO; }
+    if (e != 1) { return TLS_ERR_IO; }
+    if (_fn_ERR_peek_last_error == 0) { return TLS_ERR_PROTOCOL; }
+    # OpenSSL 3 packs an error as lib << 23 | reason (23 bits); bit 31 marks a system errno.
+    var code = fncall0(_fn_ERR_peek_last_error) & 0xFFFFFFFF;
+    if ((code & 0x80000000) != 0) { return TLS_ERR_IO; }
+    if (((code >> 23) & 0xFF) != 20) { return TLS_ERR_PROTOCOL; }     # ERR_LIB_SSL
+    var reason = code & 0x7FFFFF;
+    if (reason >= 1000) {
+        if (reason < 1256) { return TLS_ERR_ALERT; }                   # SSL_AD_REASON_OFFSET + desc
+    }
+    if (reason == 294) { return TLS_ERR_IO; }                          # SSL_R_UNEXPECTED_EOF_WHILE_READING
+    return TLS_ERR_PROTOCOL;
+}
+
+# The libssl calls that can WRITE to the socket — every one goes through _tls_ssl_call. The first
+# four are the ones the deadline loop drives (6.6.13). Private.
+enum TlsSslIoOp {
+    _TLS_IO_CONNECT = 0;
+    _TLS_IO_ACCEPT = 1;
+    _TLS_IO_READ = 2;
+    _TLS_IO_WRITE = 3;
+    _TLS_IO_SHUTDOWN = 4;
+    _TLS_IO_WRITE_EARLY = 5;
+    _TLS_IO_READ_EARLY = 6;
+}
+
+# One libssl call that may write to the socket — SSL_connect / SSL_accept (the handshake),
+# SSL_read (an alert, a KeyUpdate answer), SSL_write, SSL_shutdown (close_notify), the 0-RTT pair —
+# with SIGPIPE held off for this thread around it (_tls_sigpipe_hold / _tls_sigpipe_release). The
+# call's raw return; `out` is the early-data verbs' 4th argument.
+# ⛔ 6.6.14 (CVE-66, the libssl half) — WHY. libssl writes with write(2), not send(MSG_NOSIGNAL), so
+# a write to a peer that had closed raised SIGPIPE, whose default action kills the process: a
+# libssl client or server died on a closed peer (measured: exit 141 on the first tls_write after
+# the peer closed) instead of reading TLS_ERR_IO. CHANGELOG [6.6.14]
+fn _tls_ssl_call(op, ssl, buf, n, out): i64 {
+    var sp[16];                                 # 16 BYTES: the caller's mask + flags
+    _tls_sigpipe_hold(&sp);
+    var r = 0;
+    if (op == _TLS_IO_CONNECT) { r = fncall1(_fn_SSL_connect, ssl); }
+    if (op == _TLS_IO_ACCEPT) { r = fncall1(_fn_SSL_accept, ssl); }
+    if (op == _TLS_IO_READ) { r = fncall3(_fn_SSL_read, ssl, buf, n); }
+    if (op == _TLS_IO_WRITE) { r = fncall3(_fn_SSL_write, ssl, buf, n); }
+    if (op == _TLS_IO_SHUTDOWN) { r = fncall1(_fn_SSL_shutdown, ssl); }
+    if (op == _TLS_IO_WRITE_EARLY) { r = fncall4(_fn_SSL_write_early_data, ssl, buf, n, out); }
+    if (op == _TLS_IO_READ_EARLY) { r = fncall4(_fn_SSL_read_early_data, ssl, buf, n, out); }
+    _tls_sigpipe_release(&sp);
+    return r;
+}
+
+# SIGPIPE is bit 12 of a kernel sigset (signal 13).
+var _TLS_SIGPIPE_BIT = 0x1000;
+
+# Block SIGPIPE in the CALLING THREAD for one libssl call, libpq's pq_block_sigpipe pattern: the
+# process-wide disposition is never touched, so a consumer's own SIGPIPE handling, and every other
+# thread, are exactly as they were. `sp` (16 bytes) receives the caller's signal mask at +0 and, at
+# +8, bit 0 = the mask was changed (restore it), bit 1 = a SIGPIPE was ALREADY pending (it can be,
+# only if the caller had SIGPIPE blocked) — that one is the caller's, and is never consumed.
+# Linux x86_64 only: the libssl backend runs nowhere else; elsewhere both helpers do nothing.
+fn _tls_sigpipe_hold(sp): i64 {
+    store64(sp, 0);
+    store64(sp + 8, 0);
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    var set[8];
+    store64(&set, _TLS_SIGPIPE_BIT);
+    if (syscall(SYS_RT_SIGPROCMASK, 0, &set, sp, 8) != 0) { return 0; }   # SIG_BLOCK
+    var fl = 1;
+    if ((load64(sp) & _TLS_SIGPIPE_BIT) != 0) {
+        var pend[8];
+        store64(&pend, 0);
+        syscall(127, &pend, 8);                                          # rt_sigpending
+        if ((load64(&pend) & _TLS_SIGPIPE_BIT) != 0) { fl = fl | 2; }
+    }
+    store64(sp + 8, fl);
+    #endif
+    #endif
+    return 0;
+}
+
+# Undo _tls_sigpipe_hold: if the call raised a SIGPIPE (pending now, and none was before) take it
+# with a zero-timeout rt_sigtimedwait, so it is never delivered; then restore the caller's mask.
+# The failed write itself has already surfaced as SSL_ERROR_SYSCALL, i.e. TLS_ERR_IO.
+fn _tls_sigpipe_release(sp): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    var fl = load64(sp + 8);
+    if ((fl & 1) == 0) { return 0; }
+    if ((fl & 2) == 0) {
+        var pend[8];
+        store64(&pend, 0);
+        syscall(127, &pend, 8);                                          # rt_sigpending
+        if ((load64(&pend) & _TLS_SIGPIPE_BIT) != 0) {
+            var set[8];
+            store64(&set, _TLS_SIGPIPE_BIT);
+            var ts[16];                                                  # 16 BYTES: {0 s, 0 ns}
+            store64(&ts, 0);
+            store64(&ts + 8, 0);
+            syscall(128, &set, 0, &ts, 8);                               # rt_sigtimedwait
+        }
+    }
+    syscall(SYS_RT_SIGPROCMASK, 2, sp, 0, 8);                            # SIG_SETMASK
+    #endif
+    #endif
+    return 0;
+}
+
+# The libssl backend under a deadline (shim +24, tls_set_deadline): one SSL_connect / SSL_accept /
+# SSL_read / SSL_write (`op`) with the socket non-blocking for the call. libssl then answers
+# WANT_READ / WANT_WRITE where it would have blocked; the loop waits for that readiness with the
+# time left (fd_wait_ready) and calls again, and libssl resumes where it stopped — it keeps a
+# partial record across WANT_READ — so a peer dripping one byte at a time is bounded as on the
+# native backend. The socket's status flags are restored on every exit. Returns the call's
+# result: bytes (READ / WRITE) or 1 (a completed CONNECT / ACCEPT), 0, or a TLS_ERR_* —
+# _tls_ssl_io_ret's mapping, or TLS_ERR_TIMEOUT once the deadline passes, or TLS_ERR_IO if the
+# socket cannot be made non-blocking or waited on. tls_read / tls_write return it as is;
+# _tls_libssl_complete records a CONNECT / ACCEPT failure from it (6.6.16: it used to collapse
+# those two to 1 / 0 here, and the failure's code was lost).
+# ⛔ 6.6.13 (CVE-61) — WHY. The libssl calls ran on the caller's blocking socket: a peer, or
+# anyone on the path, holding back the next byte held the thread for ever, and the shim had no
+# deadline to give. Issue 2026-10-01-tls-native-no-deadline; CHANGELOG [6.6.13].
+fn _tls_ssl_io(ctx, op, buf, n): i64 {
+    var ssl = load64(ctx + 8);
+    var sock = load64(ctx + 16);
+    var dl = load64(ctx + 24);
+    var res = TLS_ERR_IO;
+    var saved = 0 - 1;
+    if (_fn_SSL_get_error != 0) { saved = fd_set_nonblocking(sock); }
+    var more = 1;
+    if (saved < 0) { more = 0; }
+    while (more == 1) {
+        var rem = dl - clock_now_ns();
+        if (rem <= 0) {
+            res = TLS_ERR_TIMEOUT;
+            more = 0;
+        } else {
+            if (_fn_ERR_clear_error != 0) { fncall0(_fn_ERR_clear_error); }
+            var r = _tls_ssl_call(op, ssl, buf, n, 0);
+            var v = r & 0xFFFFFFFF;                     # the C int (see _tls_ssl_io_ret)
+            if (v > 0x7FFFFFFF) { v = v - 0x100000000; }
+            if (v > 0) {
+                res = v;
+                more = 0;
+            } else {
+                var e = fncall2(_fn_SSL_get_error, ssl, v) & 0xFFFFFFFF;
+                if (e == 2 || e == 3) {                 # SSL_ERROR_WANT_READ / _WANT_WRITE
+                    var ww = 0;
+                    if (e == 3) { ww = 1; }
+                    var ms = (rem + 999999) / 1000000;
+                    if (ms > 0x7FFFFFFF) { ms = 0x7FFFFFFF; }
+                    var w = fd_wait_ready(sock, ww, ms);
+                    if (w < 0) {
+                        if (w != 0 - 4) { res = TLS_ERR_IO; more = 0; }
+                    }
+                } else {
+                    res = _tls_ssl_io_ret(ssl, r);
+                    more = 0;
+                }
+            }
+        }
+    }
+    if (saved >= 0) { fd_restore_flags(sock, saved); }
+    return res;
+}
+
+# Close the TLS session. libssl: SSL_shutdown, then frees the SSL and the SSL_CTX. Native: sends
+# close_notify and frees NOTHING — the native ctx and its shim live in the allocator they came
+# from: the Allocator given to tls_connect_alloc_in / tls_accept_alloc_in (reset_via(a) after this
+# reclaims the whole connection) or the no-free global heap (a == 0). Returns 0.
 fn tls_close(ctx): i64 {
     if (ctx == 0) { return 0; }
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { tls_native_close(load64(ctx)); return 0; }
+    if (_tls_shim_native(ctx) == 1) { tls_native_close(load64(ctx)); return 0; }
     #endif
+    # Off the main thread nothing of libssl is touched (6.6.14): the SSL and SSL_CTX are not freed —
+    # a leak, where the call used to be a crash.
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     var ssl_ctx = load64(ctx);
     var ssl = load64(ctx + 8);
-    if (_fn_SSL_shutdown != 0) { fncall1(_fn_SSL_shutdown, ssl); }
+    # No close_notify on a connection that failed (6.6.14; a failed *_complete too, 6.6.16):
+    # OpenSSL forbids SSL_shutdown after a fatal error, and native sends one only while the
+    # connection is up.
+    if (load64(ctx + _TLS_SHIM_OFF_ERR) == 0) {
+        if (_fn_SSL_shutdown != 0) { _tls_ssl_call(_TLS_IO_SHUTDOWN, ssl, 0, 0, 0); }
+    }
     if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
     if (_fn_SSL_CTX_free != 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); }
     return 0;
@@ -966,7 +1784,8 @@ fn tls_close(ctx): i64 {
 #   SSL_CTX_sess_set_remove_cb (cb fires when session is invalidated)
 #   SSL_CTX_sess_set_get_cb  (cb fires during handshake to fetch a
 #                             session from caller's cache by id)
-#   SSL_CTX_set_session_cache_mode (enables session caching at all)
+#   SSL_CTX_ctrl(SET_SESS_CACHE_MODE) (enables session caching at all;
+#                             SSL_CTX_set_session_cache_mode is a macro)
 #   SSL_CTX_set_max_early_data / SSL_set_max_early_data (0-RTT receive
 #                             enable; 0 = disabled, default)
 #   SSL_write_early_data     (write 0-RTT payload before handshake
@@ -975,13 +1794,22 @@ fn tls_close(ctx): i64 {
 #   SSL_read_early_data      (server-side counterpart; client uses
 #                             it after a 0-RTT-accepted handshake to
 #                             confirm early-data acceptance status)
+#
+# 6.6.16: every verb here that reaches libssl through a ctx (its +8 SSL) or a hook handle (an
+# SSL_CTX) refuses on a native ctx / handle with its documented "unsupported" answer, without
+# touching libssl — since 6.6.17 decided by the ctx itself (_tls_shim_native / _tls_handle_native),
+# not the active backend, and a null handle answers the same. tls_session_free / tls_session_get_max_early_data take
+# a SESSION, which only a libssl connection can have produced, so they stay as they are on either
+# backend (a session kept across a backend switch is still freed).
 
 # Get the current session for ctx as an SSL_SESSION* (refcount-bumped).
 # Returns 0 if libssl missing the symbol or no session yet established.
 # Caller MUST free via tls_session_free.
 fn tls_get_session(ctx): i64 {
     if (ctx == 0) { return 0; }
+    if (_tls_shim_native(ctx) == 1) { return 0; }      # a native ctx (6.6.16; per ctx since 6.6.17)
     if (_fn_SSL_get1_session == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     var ssl = load64(ctx + 8);
     return fncall1(_fn_SSL_get1_session, ssl);
 }
@@ -992,7 +1820,9 @@ fn tls_get_session(ctx): i64 {
 fn tls_set_session(ctx, session): i64 {
     if (ctx == 0) { return 0; }
     if (session == 0) { return 0; }
+    if (_tls_shim_native(ctx) == 1) { return 0; }      # a native ctx (6.6.16; per ctx since 6.6.17)
     if (_fn_SSL_set_session == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     var ssl = load64(ctx + 8);
     return fncall2(_fn_SSL_set_session, ssl, session);
 }
@@ -1002,6 +1832,7 @@ fn tls_set_session(ctx, session): i64 {
 fn tls_session_free(session): i64 {
     if (session == 0) { return 0; }
     if (_fn_SSL_SESSION_free == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     fncall1(_fn_SSL_SESSION_free, session);
     return 0;
 }
@@ -1013,7 +1844,10 @@ fn tls_session_free(session): i64 {
 # Returning 1 transfers session ownership to the consumer (consumer
 # now owns the ref); 0 means libssl retains ownership.
 fn tls_ctx_set_session_new_cb(handle, cb_fp): i64 {
+    if (handle == 0) { return 0; }                     # 6.6.17: was a SIGSEGV inside libssl
+    if (_tls_handle_native(handle) == 1) { return 0; } # a native handle (6.6.16; per handle since 6.6.17)
     if (_fn_SSL_CTX_sess_set_new_cb == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     fncall2(_fn_SSL_CTX_sess_set_new_cb, handle, cb_fp);
     return 0;
 }
@@ -1022,7 +1856,10 @@ fn tls_ctx_set_session_new_cb(handle, cb_fp): i64 {
 # a session; consumer's cache should evict matching entries.
 # cb_fp signature: `void remove_cb(SSL_CTX *ctx, SSL_SESSION *session)`.
 fn tls_ctx_set_session_remove_cb(handle, cb_fp): i64 {
+    if (handle == 0) { return 0; }                     # 6.6.17: was a SIGSEGV inside libssl
+    if (_tls_handle_native(handle) == 1) { return 0; } # a native handle (6.6.16; per handle since 6.6.17)
     if (_fn_SSL_CTX_sess_set_remove_cb == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     fncall2(_fn_SSL_CTX_sess_set_remove_cb, handle, cb_fp);
     return 0;
 }
@@ -1033,20 +1870,31 @@ fn tls_ctx_set_session_remove_cb(handle, cb_fp): i64 {
 # Set *copy = 1 to bump the refcount on the returned session;
 # 0 to transfer ownership.
 fn tls_ctx_set_session_get_cb(handle, cb_fp): i64 {
+    if (handle == 0) { return 0; }                     # 6.6.17: was a SIGSEGV inside libssl
+    if (_tls_handle_native(handle) == 1) { return 0; } # a native handle (6.6.16; per handle since 6.6.17)
     if (_fn_SSL_CTX_sess_set_get_cb == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     fncall2(_fn_SSL_CTX_sess_set_get_cb, handle, cb_fp);
     return 0;
 }
 
-# Enable session caching at the SSL_CTX level. Pass one of:
-#   SSL_SESS_CACHE_OFF (0)     — no caching (libssl default)
+# Set session caching at the SSL_CTX level (`handle`, the hook's). Pass one of:
+#   SSL_SESS_CACHE_OFF (0)     — no caching
 #   SSL_SESS_CACHE_CLIENT (1)  — client-side caching enabled
-#   SSL_SESS_CACHE_SERVER (2)  — server-side caching enabled
+#   SSL_SESS_CACHE_SERVER (2)  — server-side caching enabled (OpenSSL's default for a new SSL_CTX)
 #   SSL_SESS_CACHE_BOTH (3)    — both client + server
-# Returns the previous mode, or 0 if libssl missing the symbol.
+# Returns the previous mode — through SSL_CTX_ctrl(handle, SSL_CTRL_SET_SESS_CACHE_MODE, mode, 0)
+# — or 0 for a null handle, on the native backend (no SSL_CTX), or when libssl lacks SSL_CTX_ctrl.
+# ⛔ 6.6.16 — WHY. It dlsym'd "SSL_CTX_set_session_cache_mode", which is a macro in every OpenSSL,
+# so the pointer was 0 and the verb a silent no-op returning 0: the mode was never set, and
+# tls_supports_session_resumption read 0 on every OpenSSL 3. The native guard comes FIRST: the
+# working ctrl, handed a native handle, would write into the native ctx. CHANGELOG [6.6.16]
 fn tls_ctx_set_session_cache_mode(handle, mode): i64 {
-    if (_fn_SSL_CTX_set_session_cache_mode == 0) { return 0; }
-    return fncall2(_fn_SSL_CTX_set_session_cache_mode, handle, mode);
+    if (handle == 0) { return 0; }
+    if (_tls_handle_native(handle) == 1) { return 0; } # a native handle (per handle since 6.6.17)
+    if (_fn_SSL_CTX_ctrl == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
+    return fncall4(_fn_SSL_CTX_ctrl, handle, _TLS_SSL_CTRL_SET_SESS_CACHE_MODE, mode, 0);
 }
 
 # Enable TLS 1.3 0-RTT receive on the CTX. `max` is the byte budget
@@ -1054,7 +1902,10 @@ fn tls_ctx_set_session_cache_mode(handle, mode): i64 {
 # point per RFC 8446: 16384. Caller's session-cache impl should also
 # bound this against replay-attack risk.
 fn tls_ctx_set_max_early_data(handle, max): i64 {
+    if (handle == 0) { return 0; }                     # 6.6.17: was a SIGSEGV inside libssl
+    if (_tls_handle_native(handle) == 1) { return 0; } # a native handle (6.6.16; per handle since 6.6.17)
     if (_fn_SSL_CTX_set_max_early_data == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     return fncall2(_fn_SSL_CTX_set_max_early_data, handle, max);
 }
 
@@ -1065,11 +1916,13 @@ fn tls_ctx_set_max_early_data(handle, max): i64 {
 # the symbol via tls_supports_early_data() before attempting).
 fn tls_write_early_data(ctx, buf, len): i64 {
     if (ctx == 0) { return 0 - 1; }
+    if (_tls_shim_native(ctx) == 1) { return 0 - 1; }  # a native ctx (6.6.16; per ctx since 6.6.17)
     if (_fn_SSL_write_early_data == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     var ssl = load64(ctx + 8);
-    var written[1];
+    var written[8];
     store64(&written, 0);
-    var rc = fncall4(_fn_SSL_write_early_data, ssl, buf, len, &written);
+    var rc = _tls_ssl_call(_TLS_IO_WRITE_EARLY, ssl, buf, len, &written);
     if (rc != 1) { return 0 - 1; }
     return load64(&written);
 }
@@ -1083,11 +1936,13 @@ fn tls_write_early_data(ctx, buf, len): i64 {
 #   -1        — error or library missing the symbol
 fn tls_read_early_data(ctx, buf, maxlen): i64 {
     if (ctx == 0) { return 0 - 1; }
+    if (_tls_shim_native(ctx) == 1) { return 0 - 1; }  # a native ctx (6.6.16; per ctx since 6.6.17)
     if (_fn_SSL_read_early_data == 0) { return 0 - 1; }
+    if (_tls_libssl_thread_ok() == 0) { return 0 - 1; }
     var ssl = load64(ctx + 8);
-    var rdb[1];
+    var rdb[8];
     store64(&rdb, 0);
-    var status = fncall4(_fn_SSL_read_early_data, ssl, buf, maxlen, &rdb);
+    var status = _tls_ssl_call(_TLS_IO_READ_EARLY, ssl, buf, maxlen, &rdb);
     if (status == SSL_READ_EARLY_DATA_SUCCESS) { return load64(&rdb); }
     if (status == SSL_READ_EARLY_DATA_FINISH)  { return 0 - 2; }
     return 0 - 1;
@@ -1120,7 +1975,9 @@ fn tls_read_early_data(ctx, buf, maxlen): i64 {
 # was not in play here," safe for consumers to treat as non-rejection.
 fn tls_get_early_data_status(ctx): i64 {
     if (ctx == 0) { return TLS_EARLY_DATA_NOT_SENT; }
+    if (_tls_shim_native(ctx) == 1) { return TLS_EARLY_DATA_NOT_SENT; }   # a native ctx (6.6.16; per ctx 6.6.17)
     if (_fn_SSL_get_early_data_status == 0) { return TLS_EARLY_DATA_NOT_SENT; }
+    if (_tls_libssl_thread_ok() == 0) { return TLS_EARLY_DATA_NOT_SENT; }
     var ssl = load64(ctx + 8);
     return fncall1(_fn_SSL_get_early_data_status, ssl);
 }
@@ -1144,15 +2001,22 @@ fn tls_get_early_data_status(ctx): i64 {
 fn tls_session_get_max_early_data(session): i64 {
     if (session == 0) { return 0; }
     if (_fn_SSL_SESSION_get_max_early_data == 0) { return 0; }
+    if (_tls_libssl_thread_ok() == 0) { return 0; }
     return fncall1(_fn_SSL_SESSION_get_max_early_data, session);
 }
 
-# Returns 1 if the linked libssl exposes the FULL 0-RTT client-
+# Returns 1 if the ACTIVE backend is libssl and the loaded libssl exposes the FULL 0-RTT client-
 # correctness surface (write + read + max_early_data setter
 # v5.10.21, plus get_early_data_status + SESSION_get_max_early_data
-# v5.10.34); 0 otherwise. Sandhi's 1.3.2 0-RTT path probes this
-# before attempting early-data send/recv with retry-on-rejection.
+# v5.10.34); 0 otherwise — on the native backend always, even with libssl loaded in-process.
+# Sandhi's 1.3.2 0-RTT path probes this before attempting early-data send/recv with
+# retry-on-rejection.
+# ⛔ 6.6.17 — WHY the backend check: the resumption probe's twin (6.6.16). It read the symbol
+# cache only, so once anything had loaded libssl it answered 1 under the native backend, where
+# every 0-RTT verb refuses (measured: tls_available() on libssl, then tls_set_backend(NATIVE) ->
+# 1). Misleading, not corrupting — the verbs it points at refuse on a native ctx.
 fn tls_supports_early_data(): i64 {
+    if (_tls_backend_is_native() == 1) { return 0; }
     if (_fn_SSL_write_early_data == 0) { return 0; }
     if (_fn_SSL_read_early_data == 0) { return 0; }
     if (_fn_SSL_CTX_set_max_early_data == 0) { return 0; }
@@ -1161,14 +2025,19 @@ fn tls_supports_early_data(): i64 {
     return 1;
 }
 
-# Returns 1 if the linked libssl exposes the session-resumption
-# symbols (get1_session + set_session + SESSION_free + cache mode
-# setter). Sandhi's 1.3.1 cache impl probes this before installing
-# session callbacks.
+# Returns 1 if the ACTIVE backend is libssl and the loaded libssl exposes the
+# session-resumption symbols (get1_session + set_session + SESSION_free + SSL_CTX_ctrl, the cache
+# mode's setter); 0 otherwise — on the native backend always, even with libssl loaded in-process.
+# Reads the symbol cache only (0 until libssl has loaded). Sandhi's 1.3.1 cache impl probes this
+# before installing session callbacks.
+# ⛔ 6.6.16 — WHY the backend check. Folded sandhi follows the documented protocol — probe, then
+# tls_set_session / tls_get_session — so a 1 under the native backend would steer it into libssl
+# calls on native ctxs (those verbs now refuse there, too). CHANGELOG [6.6.16]
 fn tls_supports_session_resumption(): i64 {
+    if (_tls_backend_is_native() == 1) { return 0; }
     if (_fn_SSL_get1_session == 0) { return 0; }
     if (_fn_SSL_set_session == 0) { return 0; }
     if (_fn_SSL_SESSION_free == 0) { return 0; }
-    if (_fn_SSL_CTX_set_session_cache_mode == 0) { return 0; }
+    if (_fn_SSL_CTX_ctrl == 0) { return 0; }
     return 1;
 }

@@ -1,5 +1,5 @@
 # sync.cyr — portable process-internal mutex.
-# Usage: include "lib/atomic.cyr", "lib/alloc.cyr", then "lib/sync.cyr".
+# Usage: include "lib/sync.cyr" (it includes syscalls.cyr, alloc.cyr and atomic.cyr itself, 6.6.9).
 #
 # WHY THIS EXISTS (issue 2026-06-09-no-portable-mutex-stdlib.md, from patra):
 # the only stdlib mutex used to live inside lib/thread.cyr, bundled with the
@@ -20,19 +20,29 @@
 #   pointer (heap cell); callers may null-check it.
 #
 # BACKENDS (one active per build — selected like alloc.cyr, no #else in cyrius):
-#   Linux x86_64 / aarch64 : SYS_FUTEX 2-state lock, BLOCKS on contention
-#                            (mirrors lib/thread.cyr's proven mutex).
+#   Linux x86_64 / aarch64 : SYS_FUTEX 3-state lock (below, v6.5.9), BLOCKS on
+#                            contention; the uncontended path makes no syscall.
 #   Windows                : SRWLOCK — lib/sync_windows.cyr (blocks, fair-ish).
-#   macOS                  : atomic_cas SPINLOCK — lib/sync_macos.cyr. macOS has
-#                            no routed futex/__ulock/os_unfair_lock primitive
-#                            (see lib/alloc.cyr:37 + _macho_arm_routes), so the
-#                            macOS lock SPINS. Correct for short, low-contention
-#                            critical sections (the portable-lock use case); a
-#                            blocking macOS lock awaits __ulock backend routing.
+#   macOS                  : the same 3-state lock parked on Darwin `__ulock` —
+#                            lib/sync_macos.cyr (v6.5.44; it was an atomic_cas
+#                            spinlock until the Mach-O backends routed __ulock).
+#   agnos                  : no-op (single-core, threads run serially; below).
+#   cx (cxvm bytecode)     : no-op (cxvm is one thread and thread_create fails
+#                            there; below, 6.6.11).
+# The "no syscall when uncontended" property is asserted on every crossos host by
+# tests/tcyr/crossos/sync_mutex_contended.tcyr, relative to a syscall timed in the
+# same run (CHANGELOG [6.6.6]).
 #
 # Provides: MUTEX_SIZE, mutex_new(), mutex_lock(m), mutex_unlock(m).
 # (No trylock: Windows SRWLOCK has no routed TryAcquire, so a non-blocking
 # acquire isn't portable yet — keep the surface to what every backend supports.)
+
+# 6.6.9: the usage line used to tell the caller to include atomic.cyr and alloc.cyr first; a
+# bare include was a hard error on Linux (`undefined variable 'SYS_FUTEX'` — the syscall peer
+# was never named at all) and left alloc / atomic_* undefined everywhere. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/atomic.cyr"
 
 var MUTEX_SIZE = 8;
 
@@ -45,32 +55,75 @@ include "lib/sync_macos.cyr"
 #endif
 
 #ifdef CYRIUS_TARGET_LINUX
-# 2-state futex mutex. SYS_FUTEX + FUTEX_* are the per-arch constants from
-# lib/syscalls_{x86_64,aarch64}_linux.cyr (x86 202 / aarch64 98); they are
-# compile-time literals, so the syscall lowers correctly on both arches.
+# THREE-STATE futex mutex (Drepper "Futexes Are Tricky", Mutex Take 3). v6.5.9.
+#   0 = free · 1 = held, no waiters · 2 = held, waiters may be parked
+#
+# WHY THE THIRD STATE EXISTS. With only 0/1 the releaser cannot know whether anyone is
+# parked, so `mutex_unlock` had to enter the kernel with FUTEX_WAKE on EVERY release —
+# even when the lock was never contended, which is the overwhelmingly common case.
+# Measured on 6.5.7: an uncontended lock/unlock pair cost **392 ns** against a **7 ns**
+# `atomic_cas`, i.e. the syscall was ~98 % of it, and that tax compounds through every
+# lock-guarded structure in the stdlib (patra, sankoch, thread.cyr's channels). The third
+# state records "someone might be waiting", so the uncontended path never syscalls at all:
+# **392 ns → 48 ns**, with contended correctness held across 4 threads × 20k iterations.
+#
+# ⭐ IT NEEDED NO NEW PRIMITIVE. The roadmap (W1 item 3) recorded this as blocked on
+# `atomic_swap` plus a value-returning CAS, neither of which `lib/atomic.cyr` ships. That
+# premise is wrong: a SUCCESSFUL boolean `atomic_cas(m, 1, 0)` already proves the
+# pre-value was exactly 1 — which is precisely the information `atomic_swap` would have
+# returned. So unlock's fast path is "CAS 1→0; if it took, nobody was waiting, return
+# without a syscall". `atomic_swap` remains worth adding on its own merits (it would save
+# one CAS here) but it is an additive bite, not a gate.
+#
+# ⚠ THE `2` DISCIPLINE IS LOAD-BEARING, AND IT IS WHERE THIS DESIGN GOES WRONG IF RUSHED.
+# A waiter that re-acquires must take the lock AS 2, never as 1: it cannot know whether
+# OTHER threads are still parked, and claiming 1 would tell the next releaser there are no
+# waiters — stranding them until some unrelated lock/unlock happens to wake them. The
+# contended gate mutation-proves exactly this edit.
+#
+# ⚠ And the expected-value passed to FUTEX_WAIT stays the CONSTANT 2 — never a re-read of
+# the cell. Two independent loads is the shape that made `thread_join` deadlock at v6.5.8;
+# a constant cannot go stale between the test and the syscall.
+#
+# SYS_FUTEX + FUTEX_* are the per-arch constants from
+# lib/syscalls_{x86_64,aarch64}_linux.cyr (x86 202 / aarch64 98); compile-time literals,
+# so this lowers correctly on both arches.
 fn mutex_new(): i64 {
     alloc_init();
     var m = alloc(MUTEX_SIZE);
+    if (m == 0) { return 0; }
     store64(m, 0);
     return m;
 }
 
-# Blocking acquire. Spins the CAS fast-path; FUTEX_WAITs when contended.
+# Blocking acquire. Uncontended: one CAS, no syscall.
 fn mutex_lock(m): i64 {
-    while (atomic_cas(m, 0, 1) == 0) {
-        # FUTEX_WAIT re-checks *m == 1 against the kernel: if the holder
-        # released in the race window the syscall returns EAGAIN and we
-        # retry the CAS — no lost-wakeup. PRIVATE_FLAG: process-internal.
-        syscall(SYS_FUTEX, m, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    # Fast path — free → held-without-waiters.
+    if (atomic_cas(m, 0, 1) == 1) {
+        atomic_fence();   # acquire barrier
+        return 0;
+    }
+    # Contended. Announce ourselves by moving the cell to 2, then park on 2. We may loop:
+    # FUTEX_WAIT returns EAGAIN if the holder released in the race window, and we simply
+    # retry — the value-recheck inside the kernel is what makes this lost-wakeup-free.
+    while (atomic_cas(m, 0, 2) == 0) {
+        syscall(SYS_FUTEX, m, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 2, 0, 0, 0);
+        # If the cell is held-without-waiters, upgrade it to 2 before parking again —
+        # otherwise the holder's unlock takes the no-syscall path and never wakes us.
+        atomic_cas(m, 1, 2);
     }
     atomic_fence();   # acquire barrier
     return 0;
 }
 
-# Release. Flushes the critical section (release barrier), clears the cell,
-# wakes one waiter (kernel no-ops the wake when none are parked).
+# Release. Syscalls ONLY when the cell says a waiter may be parked.
 fn mutex_unlock(m): i64 {
     atomic_fence();   # release barrier
+    # A successful 1→0 proves the pre-value was 1: held, and nobody announced themselves.
+    # Nothing to wake, so return without entering the kernel — this is the 392→48 ns.
+    if (atomic_cas(m, 1, 0) == 1) { return 0; }
+    # Otherwise the cell is 2 (a waiter announced itself). Clear it and wake exactly one;
+    # whoever wins re-acquires AS 2, so any remaining waiters stay reachable.
     atomic_store(m, 0);
     syscall(SYS_FUTEX, m, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
     return 0;
@@ -99,5 +152,26 @@ fn mutex_new(): i64 {
 fn mutex_lock(m): i64 { return 0; }
 
 # Release — pairs with mutex_lock; no-op (single-threaded).
+fn mutex_unlock(m): i64 { return 0; }
+#endif
+
+#ifdef CYRIUS_TARGET_CX
+# cx bytecode: cxvm runs ONE guest thread and lib/thread.cyr's thread_create fails there, so a
+# contender never exists — the agnos contract, and the same reasoning as thread_local.cyr's cx
+# arms. Before 6.6.11 no arm matched cx (it predefines CYRIUS_TARGET_CX only, not LINUX), so
+# mutex_* were undefined and lib/thread.cyr — and every module that locks — refused to compile
+# for cx. The cell is still allocated so a caller's null check behaves. CHANGELOG [6.6.11]
+fn mutex_new(): i64 {
+    alloc_init();
+    var m = alloc(MUTEX_SIZE);
+    if (m == 0) { return 0; }
+    store64(m, 0);
+    return m;
+}
+
+# Acquire — no-op on cx (single guest thread, no contender).
+fn mutex_lock(m): i64 { return 0; }
+
+# Release — pairs with mutex_lock; no-op on cx.
 fn mutex_unlock(m): i64 { return 0; }
 #endif

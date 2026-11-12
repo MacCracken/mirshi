@@ -1,6 +1,12 @@
 # http.cyr — minimal HTTP/1.0 client
 # Usage: include "lib/http.cyr"
-# Requires: alloc.cyr, string.cyr, net.cyr, str.cyr
+# Includes its own definers (6.6.9): result.cyr and net.cyr (which brings syscalls.cyr, alloc.cyr,
+# string.cyr and io.cyr) — `include "lib/http.cyr"` alone is a complete build.
+# The URL's host is resolved with net.cyr's net_resolve_ipv4 — an IPv4 literal, `localhost`,
+# /etc/hosts, then DNS; the system resolver on Windows (v6.6.9; before it no http_* call could
+# reach any host). The request is at most _HTTP_REQ_CAP (2048) bytes; a longer one is refused as
+# a bad URL (CVE-50). Every socket is closed with net.cyr's sock_close: on Windows it is a
+# Winsock SOCKET, which sys_close (CloseHandle there) does not close (6.6.11).
 
 # v5.8.31: Result-returning *_r variant (`http_get_r`) for typed
 # error returns. Also v5.8.31 fixes a long-standing bug in the
@@ -13,6 +19,12 @@
 # inserting `payload(...)` unwraps and `is_err_result(...)` guards
 # in the same shape as lib/sandhi.cyr.
 include "lib/result.cyr"
+# v6.6.9: SELF-SUFFICIENT for the socket layer. Every http_* call goes through net.cyr
+# (net_resolve_ipv4, tcp_socket, sock_connect, sock_send_all, sock_recv), which this file never
+# included, so `include "lib/http.cyr"` without net.cyr compiled with `undefined function`
+# warnings and a trapping http_get. Include-once, so an existing caller pays nothing.
+# CHANGELOG [6.6.9]
+include "lib/net.cyr"
 
 # v5.8.31 — HttpError variants. `HttpBadUrl` covers _http_parse_url
 # rejection (CRLF/whitespace/empty host/bad port); `HttpNetErr`
@@ -44,23 +56,26 @@ var HTTP_ERROR = 0 - 1;
 # looks like two distinct headers to the upstream server. The
 # defence is to reject any URL with embedded control bytes *before*
 # allocating the host/path pointers. Rejecting early also guards
-# against embedded NULs and stray tabs/spaces that would split the
-# request line. Returning 0 (instead of aborting the process) lets
-# caller-side code treat bad URLs as a normal error path.
+# against stray tabs/spaces that would split the request line.
+# Returning 0 (instead of aborting the process) lets caller-side code
+# treat bad URLs as a normal error path.
 fn _http_parse_url(url): i64 {
-    # Validate: reject CR, LF, NUL-before-end, and any byte < 0x20
-    # or == 0x7F in the host portion. Walk the whole URL first so
-    # malformed input can't corrupt the downstream parse.
+    # Validate the WHOLE URL — host and path both reach the request, and the request-target
+    # forbids control bytes too: reject every control byte (0x01-0x1F: CR and LF split headers,
+    # TAB splits the request line, the rest have no place in a URL), SPACE (a request-line split)
+    # and DEL (0x7F). The URL is NUL-terminated, so the walk ends at its first NUL.
+    # ⛔ Until 6.6.11 only CR, LF, TAB and SPACE were refused, though this comment already
+    # promised every byte below 0x20 and 0x7F — 29 control bytes went through into the Host
+    # header and the request line. CHANGELOG [6.6.11]
     var vi = 0;
     while (load8(url + vi) != 0) {
         var vc = load8(url + vi);
-        if (vc == 13) { return 0; }   # CR — CRLF injection vector
-        if (vc == 10) { return 0; }   # LF — header split
-        if (vc == 9)  { return 0; }   # TAB — request-line split
-        if (vc == 32) { return 0; }   # SPACE — request-line split
+        if (vc <= 32) { return 0; }   # a control byte (CR/LF/TAB among them) or SPACE
+        if (vc == 127) { return 0; }  # DEL
         vi = vi + 1;
     }
     var result = alloc(24);
+    if (result == 0) { return 0; }
     var p = 0;
     # Skip "http://"
     if (memeq(url, "http://", 7) == 1) { p = 7; }
@@ -74,6 +89,7 @@ fn _http_parse_url(url): i64 {
     var host_len = p - host_start;
     if (host_len == 0) { return 0; }  # empty host
     var host = alloc(host_len + 1);
+    if (host == 0) { return 0; }
     memcpy(host, url + host_start, host_len);
     store8(host + host_len, 0);
     store64(result, host);
@@ -94,22 +110,72 @@ fn _http_parse_url(url): i64 {
     return result;
 }
 
-# Build HTTP/1.0 request string
-fn _http_build_request(method, host, path): i64 {
-    var buf = alloc(2048);
-    var pos = 0;
-    # Method + path
+# The longest request this client sends, NUL included: the request line plus the Host and
+# Connection headers. The size of the fixed buffer the builder used to write into unchecked.
+var _HTTP_REQ_CAP = 2048;
+
+# Build the HTTP/1.0 request for `method path` to `host`:`port`. Returns it NUL-terminated in a
+# buffer of exactly its size, or 0 when it would exceed _HTTP_REQ_CAP. The Host header carries
+# `:port` whenever port is not 80 (RFC 9110 §7.2: a Host without a port means the scheme's
+# default, so a server on :8080 used to be told :80 — virtual hosting and absolute-URL
+# redirects then named the wrong origin). The suffix counts toward the cap. CHANGELOG [6.6.11]
+# ⛔ CVE-50: this used to alloc(2048) and memcpy the method, path and host into it unchecked, so a
+# long URL (caller-controlled — a crawled link, a redirect, user input) wrote past the buffer
+# into whatever the allocator handed out next; measured, the NEXT alloc() came back full of the
+# path's bytes. The length is now computed first and an over-long request is refused before the
+# buffer exists. Callers report 0 as a bad URL. CHANGELOG [6.6.9]
+fn _http_build_request(method, host, port, path): i64 {
     var mlen = strlen(method);
+    var plen = strlen(path);
+    var hlen = strlen(host);
+    # ":" + the port's decimal digits, when it is not the default.
+    var ptxt[8];
+    var pdig = 0;
+    if (port != 80) {
+        var pv = port;
+        while (pv > 0 && pdig < 6) { pdig = pdig + 1; pv = pv / 10; }
+        pv = port;
+        var pi = pdig;
+        while (pi > 0) { pi = pi - 1; store8(&ptxt + pi, 48 + pv % 10); pv = pv / 10; }
+    }
+    var plen2 = 0;
+    if (pdig > 0) { plen2 = 1 + pdig; }
+    # method SP path " HTTP/1.0\r\nHost: " host [":" port] "\r\nConnection: close\r\n\r\n" NUL
+    var need = mlen + 1 + plen + 17 + hlen + plen2 + 23 + 1;
+    if (need > _HTTP_REQ_CAP) { return 0; }
+    var buf = alloc(need);
+    if (buf == 0) { return 0; }
+    var pos = 0;
     memcpy(buf + pos, method, mlen); pos = pos + mlen;
     store8(buf + pos, 32); pos = pos + 1;
-    var plen = strlen(path);
     memcpy(buf + pos, path, plen); pos = pos + plen;
     memcpy(buf + pos, " HTTP/1.0\r\nHost: ", 17); pos = pos + 17;
-    var hlen = strlen(host);
     memcpy(buf + pos, host, hlen); pos = pos + hlen;
+    if (pdig > 0) {
+        store8(buf + pos, 58); pos = pos + 1;
+        memcpy(buf + pos, &ptxt, pdig); pos = pos + pdig;
+    }
     memcpy(buf + pos, "\r\nConnection: close\r\n\r\n", 23); pos = pos + 23;
     store8(buf + pos, 0);
     return buf;
+}
+
+# Build the request for `host`:`port` `path` and resolve `host`, IN THAT ORDER: the request is
+# stored at slot[0] and the address at slot[8]. Returns 0, 1 for a request over _HTTP_REQ_CAP
+# (CVE-50), or 2 for a host that does not resolve. slot[8] is written only after a lookup ran, so it is left
+# as the caller set it on 1.
+# ⛔ WHY THE ORDER: the refusal must cost nothing. Resolving first made an over-long URL read
+# /etc/hosts and /etc/resolv.conf and send a DNS datagram for its host before it was refused —
+# the three callers each open-coded build + resolve and two of them resolved first. One helper
+# now owns the order. CHANGELOG [6.6.9]
+fn _http_prepare(host, port, path, slot): i64 {
+    var req = _http_build_request("GET", host, port, path);
+    if (req == 0) { return 1; }
+    store64(slot, req);
+    var addr = net_resolve_ipv4(host);
+    store64(slot + 8, addr);
+    if (addr == 0 - 1) { return 2; }
+    return 0;
 }
 
 # v5.8.36 — Allocator-as-first-arg variant of _http_parse_response.
@@ -147,6 +213,7 @@ fn _http_parse_response_a(a, buf, len): i64 {
 # Parse HTTP response: extract status code and body
 fn _http_parse_response(buf, len): i64 {
     var result = alloc(32);
+    if (result == 0) { return 0; }
     store64(result, 0);
     store64(result + 8, 0);
     store64(result + 16, 0);
@@ -178,12 +245,14 @@ fn _http_parse_response(buf, len): i64 {
 
 # HTTP GET request. Returns response struct {status, body_ptr, body_len}.
 # On malformed or unsafe URL (CRLF injection, empty host, out-of-range
-# port, embedded whitespace), returns a response with status ==
-# HTTP_ERROR so callers can fail fast without a separate validator.
+# port, embedded whitespace, a request over _HTTP_REQ_CAP bytes), a host
+# that does not resolve, or a network failure, returns a response with
+# status == HTTP_ERROR so callers can fail fast without a separate validator.
 fn http_get(url): i64 {
     var parsed = _http_parse_url(url);
     if (parsed == 0) {
         var bad = alloc(24);
+        if (bad == 0) { return 0; }
         store64(bad, HTTP_ERROR);
         store64(bad + 8, 0);
         store64(bad + 16, 0);
@@ -192,43 +261,79 @@ fn http_get(url): i64 {
     var host = load64(parsed);
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
-    var req = _http_build_request("GET", host, path);
+    # v6.6.9: an over-long request (CVE-50) is refused before any lookup, and a host that does
+    # not resolve before any TCP socket. sock_connect wants a packed address; it used to get the
+    # host STRING pointer, so no http_* call reached any host. CHANGELOG [6.6.9]
+    var slot = alloc(16);
+    if (slot == 0) { return 0; }
+    if (_http_prepare(host, port, path, slot) != 0) {
+        var unr = alloc(24);
+        if (unr == 0) { return 0; }
+        store64(unr, HTTP_ERROR);
+        store64(unr + 8, 0);
+        store64(unr + 16, 0);
+        return unr;
+    }
+    var req = load64(slot);
+    var addr = load64(slot + 8);
     # v5.8.31 bug fix — net.cyr fns return Result (heap ptr), not raw
     # int. Pre-fix: `var fd = tcp_socket(); if (fd < 0)` never fired
     # (fd is a positive heap ptr) and subsequent syscalls received
     # the Result ptr as a fd. Now: explicit is_err_result + payload
-    # unwrap, mirroring the lib/sandhi.cyr / regression-tls-live.sh
-    # call shape.
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) { var err = alloc(24); store64(err, HTTP_ERROR); return err; }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) { sys_close(fd); var err = alloc(24); store64(err, HTTP_ERROR); return err; }
-    # Send request — drop the Result; transient-send-error tolerated
-    # for parity with the historic best-effort shape.
-    sock_send(fd, req, strlen(req));
+    # unwrap, mirroring the lib/sandhi.cyr / TLS live-gate call shape
+    # (then regression-tls-live.sh; now the check driver's
+    # `_tls_live_gate`, programs/checks/services.cyr).
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) {
+        var err = alloc(24);
+        if (err == 0) { return 0; }
+        store64(err, HTTP_ERROR);
+        return err;
+    }
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, addr, port);
+    if (is_err_result(c_r_tag) == 1) {
+        sock_close(fd);
+        var cerr = alloc(24);
+        if (cerr == 0) { return 0; }
+        store64(cerr, HTTP_ERROR);
+        return cerr;
+    }
+    # Send the WHOLE request. v6.6.8: this used to call sock_send and drop its count, so a
+    # short write (SO_SNDTIMEO, a signal) sent half a request and then waited for a response to
+    # it. A failed or short send is now HTTP_ERROR. CHANGELOG [6.6.8]
+    var qlen = strlen(req);
+    if (sock_send_all(fd, req, qlen) != qlen) {
+        sock_close(fd);
+        var serr = alloc(24);
+        if (serr == 0) { return 0; }
+        store64(serr, HTTP_ERROR);
+        return serr;
+    }
     # Read response — sock_recv returns Result; payload(Ok) is bytes
     # read, Err short-circuits the loop.
     var rbuf = alloc(65536);
+    if (rbuf == 0) { sock_close(fd); return 0; }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }
     }
-    sys_close(fd);
+    sock_close(fd);
     return _http_parse_response(rbuf, total);
 }
 
 # v5.8.31 — Result variant of http_get. Failures land as typed
 # HttpError variants instead of the back-compat HTTP_ERROR sentinel
-# in resp.status. Bad URL → Err(HttpBadUrl); net.cyr Err in
-# tcp_socket / sock_connect → Err(HttpNetErr); 2xx response →
+# in resp.status. Bad URL (or a request over _HTTP_REQ_CAP bytes) →
+# Err(HttpBadUrl); a host that does not resolve, or a net.cyr Err in
+# tcp_socket / sock_connect / the send → Err(HttpNetErr); 2xx response →
 # Ok(resp); non-2xx → Err(HttpNon2xx).
 fn http_get_r(url) : Result {
     var parsed = _http_parse_url(url);
@@ -236,26 +341,34 @@ fn http_get_r(url) : Result {
     var host = load64(parsed);
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
-    var req = _http_build_request("GET", host, path);
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) { return Err(HttpNetErr); }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) { sys_close(fd); return Err(HttpNetErr); }
-    sock_send(fd, req, strlen(req));
+    var slot = alloc(16);
+    if (slot == 0) { return Err(HttpOther); }
+    var prep = _http_prepare(host, port, path, slot);
+    if (prep == 1) { return Err(HttpBadUrl); }                # v6.6.9: over-long (CVE-50)
+    if (prep != 0) { return Err(HttpNetErr); }                # v6.6.9: does not resolve
+    var req = load64(slot);
+    var addr = load64(slot + 8);
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) { return Err(HttpNetErr); }
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, addr, port);
+    if (is_err_result(c_r_tag) == 1) { sock_close(fd); return Err(HttpNetErr); }
+    var qlen = strlen(req);
+    if (sock_send_all(fd, req, qlen) != qlen) { sock_close(fd); return Err(HttpNetErr); }   # v6.6.8
     var rbuf = alloc(65536);
+    if (rbuf == 0) { sock_close(fd); return Err(HttpOther); }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }
     }
-    sys_close(fd);
+    sock_close(fd);
     var resp = _http_parse_response(rbuf, total);
     var st = load64(resp);
     if (st < 200) { return Err(HttpNon2xx); }
@@ -289,38 +402,56 @@ fn http_get_a(a, url): i64 {
     var host = load64(parsed);
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
-    var req = _http_build_request("GET", host, path);
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) {
+    var slot = alloc(16);
+    if (slot == 0) { return 0; }
+    if (_http_prepare(host, port, path, slot) != 0) {               # v6.6.9: CVE-50 / unresolved
+        var unr = alloc_via(a, 24);
+        if (unr == 0) { return 0; }
+        store64(unr, HTTP_ERROR);
+        store64(unr + 8, 0);
+        store64(unr + 16, 0);
+        return unr;
+    }
+    var req = load64(slot);
+    var addr = load64(slot + 8);
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) {
         var err = alloc_via(a, 24);
         if (err == 0) { return 0; }
         store64(err, HTTP_ERROR);
         return err;
     }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) {
-        sys_close(fd);
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, addr, port);
+    if (is_err_result(c_r_tag) == 1) {
+        sock_close(fd);
         var err = alloc_via(a, 24);
         if (err == 0) { return 0; }
         store64(err, HTTP_ERROR);
         return err;
     }
-    sock_send(fd, req, strlen(req));
+    var qlen = strlen(req);
+    if (sock_send_all(fd, req, qlen) != qlen) {                 # v6.6.8: a short send is an error
+        sock_close(fd);
+        var serr = alloc_via(a, 24);
+        if (serr == 0) { return 0; }
+        store64(serr, HTTP_ERROR);
+        return serr;
+    }
     var rbuf = alloc_via(a, 65536);
-    if (rbuf == 0) { sys_close(fd); return 0; }
+    if (rbuf == 0) { sock_close(fd); return 0; }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }
     }
-    sys_close(fd);
+    sock_close(fd);
     return _http_parse_response_a(a, rbuf, total);
 }
 

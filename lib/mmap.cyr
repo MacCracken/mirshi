@@ -1,6 +1,9 @@
 # mmap.cyr — memory-mapped I/O via direct syscalls
 # Usage: include "lib/mmap.cyr"
-# Requires: syscalls.cyr
+# Includes nothing: it issues SYS_MMAP / SYS_MUNMAP as raw syscall() numbers, so it compiles
+# alone on every target. Its PROT_* / MAP_* values agree with the syscall peers' MmapConst in
+# EITHER include order (v6.5.15 — see below); dynlib, fdlopen and thread include this file
+# themselves, so the caller no longer controls the order and must not need to.
 #
 # Wraps SYS_MMAP (9) and SYS_MUNMAP (11) for:
 # - Dynamic library loading (dynlib.cyr)
@@ -54,11 +57,40 @@ enum MmapProt {
     PROT_EXEC  = 4;
 }
 
+# v6.5.11: MAP_ANONYMOUS is the ONE flag whose value differs by platform —
+# Linux/agnos 32, Darwin 0x1000 — and this enum used to declare 32 UNGUARDED.
+# Because consumers include syscalls.cyr first and this file second, the 32 SHADOWED
+# the correct Darwin value from lib/syscalls_macos.cyr:152, so on macOS every
+# `MAP_PRIVATE | MAP_ANONYMOUS` became 0x22: a FILE mapping with fd = -1, i.e. EBADF.
+# `mmap_anon()` therefore returned 0 on macOS for EVERY caller — lib/dynlib.cyr:728/:764,
+# lib/fdlopen.cyr:467, lib/freelist.cyr:86 — not just the threading path the issue named.
+# Measured on real ecb (macOS-arm64): flag resolved to 32 and mmap_anon(4096) gave no
+# usable pointer, while the same probe on Linux returned a working one.
+#
+# ⚠ Deleting the declaration is NOT the fix, and neither is guarding it out. On macOS
+# **arm64** `lib/syscalls.cyr:69` deliberately includes `syscalls_aarch64_linux.cyr` — NOT
+# `syscalls_macos.cyr`, which is the x86-only arm — so the 32 arrives from
+# `syscalls_aarch64_linux.cyr:243` regardless of what this file omits. And agnos declares
+# no MAP_* at all, so this enum is its only source. Duplicates are last-wins, so the value
+# in whichever file comes SECOND decides it — which is why both must be right: this enum
+# declares the per-platform value, and since v6.5.15 so does every syscall peer's MmapConst
+# (syscalls_aarch64_linux.cyr, syscalls_macos.cyr, syscalls_x86_64_linux.cyr). Both include
+# orders therefore agree (CHANGELOG [6.6.9]: pinned by tests/tcyr/crossos/mmap_anon_flag.tcyr).
+#
+# ⚠ ESYSXLAT renumbers SYSCALLS, never flag VALUES — so a Linux flag whose Darwin value
+# differs is simply wrong on macOS and no translation layer will catch it. MAP_ANONYMOUS
+# is one instance of a wider class (EAGAIN 11 vs 35, the STAT_* struct offsets, several
+# signal numbers) — see the macOS-arm64 constant-divergence issue.
 enum MmapFlags {
     MAP_SHARED    = 1;
     MAP_PRIVATE   = 2;
     MAP_FIXED     = 16;
+    #ifdef CYRIUS_TARGET_MACOS
+    MAP_ANONYMOUS = 0x1000;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
     MAP_ANONYMOUS = 32;
+    #endif
 }
 
 # Convenience: map a file read-only

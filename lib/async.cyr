@@ -1,6 +1,6 @@
 # async.cyr — cooperative async runtime with epoll event loop
 # Usage: include "lib/async.cyr"
-# Requires: syscalls.cyr, alloc.cyr, string.cyr, fnptr.cyr
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, fnptr.cyr, atomic.cyr.
 #
 # Event-loop based cooperative multitasking. Tasks are function
 # pointers scheduled on an epoll loop with timer and IO support.
@@ -21,35 +21,112 @@
 # iteration. Pair with `chan_try_recv` (lib/thread.cyr) for the
 # progress channel side. See CHANGELOG [5.11.15].
 
-# v6.2.7: AGNOS has no epoll_create1 / fcntl / clone-fork / wait4 in its frozen
-# syscall surface, and async is a SERVER-path runtime unused on the agnos
-# CLIENT target (inbound TCP is AGNOS Phase B; sit is a client). Route to a
-# serial/blocking peer, exactly as thread.cyr → thread_agnos.cyr (v6.2.3). The
-# cancel-token API at the bottom stays SHARED (atomic-only, portable). Resolves
-# docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
+# v6.2.7: AGNOS has no epoll_create1 / fcntl / clone / wait4 in its syscall surface, so the
+# reactor below cannot exist there. Route to a serial/blocking peer, exactly as thread.cyr →
+# thread_agnos.cyr (v6.2.3). agnos DOES have fork#96 (1.56.55), a from-disk spawn (#43, 1.57.6)
+# and a blocking wait (1.57.7), and the peer's async_timeout / async_run_process use them
+# (6.6.10); inbound TCP (sock_bind/listen/accept on #56/#57) works since v6.2.22, so an async
+# server does run there, serially. (This read "clone-fork … inbound TCP is AGNOS Phase B; sit
+# is a client" until 6.6.10. CHANGELOG [6.6.10]) The cancel-token API at the bottom stays
+# SHARED (atomic-only, portable). Resolves
+# docs/development/issues/archived/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
+
+# 6.6.9: every arm calls the syscall peer, alloc / alloc_via and fncall*; they were a Requires
+# line for the caller, so a bare include was a hard error on Linux (`SYS_EPOLL_CREATE1`) and
+# left ~25 functions undefined. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fnptr.cyr"
+
+# 6.6.10: async_run_process's deadline ends the child's whole tree through lib/process.cyr's
+# `proc_kill_tree`. Named here so this module stays self-sufficient, under the SAME guard as
+# the epoll body below that calls it — NOT `#ifdef CYRIUS_TARGET_LINUX`: cx defines only
+# CYRIUS_TARGET_CX, compiles that body too, and was left with proc_kill_tree undefined. The
+# agnos, PE and macOS arms route to their own files, which carry their own include.
+# CHANGELOG [6.6.10]
+#ifndef CYRIUS_TARGET_AGNOS
+#ifndef CYRIUS_TARGET_WIN
+#ifndef CYRIUS_TARGET_MACOS
+include "lib/process.cyr"
+#endif
+#endif
+#endif
+
+# 6.6.11: the per-target peers' `_async_step` asks `_async_coro_pending` (defined below, in the
+# shared Futures section) whether a task that returned still READY is a suspended coroutine.
+# That helper exists only when the peer is reached THROUGH this file; a whole-lib build that
+# concatenates the peers on their own (tests/gates/codegen/dce_pe_macho_layout_declines_
+# compaction.sh) has no Futures to force, and compiles the check out.
+#define CYRIUS_ASYNC_FUTURES
+
 #ifdef CYRIUS_TARGET_AGNOS
 include "lib/async_agnos.cyr"
 #endif
 
+# v6.4.43: Windows (PE) has no epoll/timerfd/fork either — route to an IOCP backend
+# (lib/async_win.cyr), the same per-target split as agnos. The epoll body below is
+# gated NOT-agnos AND NOT-win. Nested-guard precedent: lib/fs.cyr. Resolves
+# docs/development/issues/archived/2026-07-08-async-epoll-only-blocks-win-transport.md.
+#ifdef CYRIUS_TARGET_WIN
+include "lib/async_win.cyr"
+#endif
+
+# v6.5.27: macOS (Darwin) has no epoll either — its readiness API is kqueue. Before this guard
+# macOS fell into the epoll body below and carried an undefined `sys_epoll_wait`; route it to
+# lib/async_macos.cyr, the same per-target split as agnos and win. That file is a kqueue REACTOR
+# (EVFILT_READ/WRITE for fd parking, EVFILT_TIMER for async_with_timeout's deadline and
+# async_interval, EVFILT_PROC for async_spawn_process), not a serial fallback; this note said
+# "no kqueue wrappers ... a fallback" until 6.6.10. CHANGELOG [6.6.10]
+#ifdef CYRIUS_TARGET_MACOS
+include "lib/async_macos.cyr"
+#endif
+
 #ifndef CYRIUS_TARGET_AGNOS
+#ifndef CYRIUS_TARGET_WIN
+#ifndef CYRIUS_TARGET_MACOS
 
 # Task states
 var TASK_READY = 0;
 var TASK_WAITING = 1;
 var TASK_DONE = 2;
 
-# Task struct: { fp, arg, state, next } = 32 bytes
-var TASK_SIZE = 32;
+# Task struct: { fp, arg, state, next, wait_fd, result, owned_fd } = 56 bytes.
+# wait_fd (@32, v6.4.33 F1) = the fd a parked task is blocked on, so async_run's
+# reactor can EPOLL_CTL_DEL it on wake; -1 when the task is not fd-waiting.
+# result (@40, v6.4.34 F2) = the task fn's return value, captured on completion so
+# task_join(rt, handle) can hand it back (the JoinHandle primitive).
+# owned_fd (@48, v6.4.42) = an fd the task itself opened and must close if it is
+# RETIRED without resuming (connect socket / resolve UDP fd); -1 when the task owns
+# no fd. _async_retire closes it — without this a timed-out/retired connect or resolve
+# leaks its socket every time (CHANGELOG [6.4.42]). recv/send park on a CALLER-owned
+# fd so they leave owned_fd = -1; process cleanup is handled by async_run_process.
+#
+# wait_ev (@56, v6.5.26) = the epoll event mask this task is parked on (EPOLLIN 1 /
+# EPOLLOUT 4 / their union), 0 when not fd-waiting. It exists because ONE waiter per fd
+# was a hard limit before: `_async_wait_events` put the TASK POINTER in epoll_data, so an
+# fd had room for exactly one task, and its EPOLL_CTL_ADD return was UNCHECKED — a second
+# waiter on the same fd got -EEXIST and was SILENTLY LOST (parked, never woken). epoll_data
+# now carries the FD and the wake path walks the task list, so an fd can have many waiters;
+# this mask is what keeps a read-waiter from being woken by EPOLLOUT and vice versa.
+#
+# ⭐ THIS IS WHAT BLOCKED stiva's `exec -it`. "Two independent directions inside one task"
+# and select!-style waiting over N streams were filed as needing stackless coroutines /
+# a CPS transform (2026-07-25). They did not: they needed a waiter REGISTRY that can hold
+# more than one entry per fd. The park/resume runtime already worked.
+var TASK_SIZE = 64;
 
-# Runtime struct: { epfd, tasks, task_count, active, allocator } = 40 bytes.
+# Runtime struct: { epfd, tasks, task_count, active, allocator, current } = 48 bytes.
 # v6.1.22 — +allocator slot @32: async_new_in threads a caller-owned Allocator
 # so the rt AND its spawned task structs come from it. A long-running batched
 # accept loop (daimon serve_async, sandhi sandhi_server_run_async) recreates the
 # runtime each batch (async_run closes its epfd → single-use); with the global
 # bump (no free) that leaked ~32 B/task + 32 B/batch forever. Passing an
 # arena_allocator + reset_via(a) per batch reclaims it. See
-# docs/development/issues/2026-06-09-async-runtime-no-free-task-leak.md.
-var RT_SIZE = 40;
+# docs/development/issues/archived/2026-06-09-async-runtime-no-free-task-leak.md.
+# v6.4.33 F1 — +current slot @40: the task async_run is executing, so
+# async_wait_fd(rt, fd) can park THAT task on the runtime's shared epfd.
+var RT_SIZE = 48;
 
 # Create a new async runtime whose rt + every async_spawn task struct are
 # allocated from `a` — an Allocator from lib/alloc.cyr (bump_allocator /
@@ -59,12 +136,13 @@ var RT_SIZE = 40;
 fn async_new_in(a): i64 {
     var rt = alloc_via(a, RT_SIZE);
     if (rt == 0) { return 0; }
-    var epfd = syscall(SYS_EPOLL_CREATE1, 0);
+    var epfd = syscall(SYS_EPOLL_CREATE1, EPOLL_CLOEXEC);   # CLOEXEC: a fork-in-reactor child (v6.4.43)
     store64(rt, epfd);
     store64(rt + 8, 0);
     store64(rt + 16, 0);
     store64(rt + 24, 0);
     store64(rt + 32, a);
+    store64(rt + 40, 0);        # current task (set by async_run before dispatch)
     return rt;
 }
 
@@ -88,90 +166,1055 @@ fn async_spawn(rt, fp, arg): i64 {
     store64(t + 8, arg);
     store64(t + 16, TASK_READY);
     store64(t + 24, load64(rt + 8));
+    store64(t + 32, 0 - 1);          # wait_fd: not fd-waiting (F1)
+    store64(t + 40, 0);              # result: task fn's return, captured on done (F2)
+    store64(t + 48, 0 - 1);          # owned_fd: no task-owned fd to reclaim on retire (v6.4.42)
+    store64(t + 56, 0);              # wait_ev: not parked on any event mask (v6.5.26)
     store64(rt + 8, t);
     store64(rt + 16, load64(rt + 16) + 1);
     store64(rt + 24, load64(rt + 24) + 1);
     return t;
 }
 
-# Run all spawned tasks to completion.
-# Tasks run cooperatively — each task runs to completion or yield.
-fn async_run(rt): i64 {
-    var go = 1;
-    while (go == 1) {
-        var active = 0;
-        var t = load64(rt + 8);
-        while (t != 0) {
-            var state = load64(t + 16);
-            if (state == TASK_READY) {
-                var fp = load64(t);
-                var arg = load64(t + 8);
-                fncall1(fp, arg);
-                store64(t + 16, TASK_DONE);
+# One reactor step (extracted from the F1/F2 pump at v6.4.37 so task_join /
+# async_with_timeout / async_join_all / async_select share one loop body). Runs every
+# TASK_READY task, capturing its return into the result slot (@40); a task that parks
+# via async_wait_fd stays TASK_WAITING, and a coroutine that suspended without parking stays
+# TASK_READY (`_async_coro_pending`). If nothing ran and tasks are parked, block on the shared
+# epfd once and wake the task whose fd fired. If a coroutine was kept READY, poll the epfd
+# WITHOUT blocking instead: a coroutine that keeps awaiting non-parking work runs every step,
+# and with only the blocking wait the fd-parked tasks — and async_with_timeout's deadline
+# sentinel — would never be woken until it finished (6.6.11). Returns the count of tasks not
+# yet DONE (0 = the runtime is idle). Does NOT close the epfd.
+fn _async_step(rt): i64 {
+    var active = 0;
+    var ran = 0;
+    var kept = 0;
+    var t = load64(rt + 8);
+    while (t != 0) {
+        var state = load64(t + 16);
+        if (state == TASK_READY) {
+            store64(rt + 40, t);            # current task, for async_wait_fd
+            var r = fncall1(load64(t), load64(t + 8));
+            ran = 1;
+            if (load64(t + 16) == TASK_READY) {
+                if (_async_coro_pending(t) == 1) { kept = 1; }
+                else {
+                    store64(t + 40, r);         # F2: capture return
+                    store64(t + 16, TASK_DONE);
+                }
             }
-            if (load64(t + 16) != TASK_DONE) {
-                active = active + 1;
-            }
-            t = load64(t + 24);
         }
-        if (active == 0) { go = 0; }
+        if (load64(t + 16) != TASK_DONE) {
+            active = active + 1;
+        }
+        t = load64(t + 24);
     }
-    # Cleanup
+    if (active > 0) {
+        if (ran == 0) { _async_poll(rt, 0 - 1); }
+        elif (kept == 1) { _async_poll(rt, 0); }
+    }
+    return active;
+}
+
+# Wait on the runtime's epfd for at most `timeout` ms (-1 = until something fires, 0 = do not
+# block) and wake every parked task whose fd fired. Returns the number of events taken.
+fn _async_poll(rt, timeout): i64 {
+    var epfd = load64(rt);
+    # v6.5.26 — room for 8 ready fds per wait, not 1. maxevents was 1, so even with
+    # several fds ready the reactor woke one task per syscall; with multiple waiters
+    # that is a needless round trip per direction.
+    var evbuf[128];
+    var nr = sys_epoll_wait(epfd, &evbuf, 8, timeout);
+    var ei = 0;
+    while (ei < nr) {
+        var eoff = ei * 16;
+        var fired = load32(&evbuf + eoff);
+        # epoll_event.data offset is ABI-dependent: x86_64 has EPOLL_PACKED
+        # (data @4); aarch64 leaves the struct unpacked so the u64 aligns to @8.
+        # Must match the write in _async_wait_events. (CHANGELOG [6.4.42])
+        #ifdef CYRIUS_ARCH_AARCH64
+        var wfd = load64(&evbuf + eoff + 8);
+        #endif
+        #ifndef CYRIUS_ARCH_AARCH64
+        var wfd = load64(&evbuf + eoff + 4);
+        #endif
+        # v6.5.26 — data is the FD, so resolve it to EVERY parked task waiting on
+        # it whose mask intersects what actually fired. Previously data was a single
+        # task pointer and exactly one task could ever be woken per fd.
+        # ⚠ EPOLLERR (8) and EPOLLHUP (16) are reported WITHOUT being requested, and
+        # a peer that closes mid-relay delivers HUP only — so they must wake every
+        # waiter on the fd, or a closed TTY/socket parks its readers forever.
+        var wake_all = 0;
+        if (fired & 24 != 0) { wake_all = 1; }
+        var t2 = load64(rt + 8);
+        while (t2 != 0) {
+            if (load64(t2 + 16) == TASK_WAITING) {
+                if (load64(t2 + 32) == wfd) {
+                    if (wake_all == 1 || (load64(t2 + 56) & fired) != 0) {
+                        store64(t2 + 32, 0 - 1);
+                        store64(t2 + 56, 0);
+                        store64(t2 + 16, TASK_READY);
+                    }
+                }
+            }
+            t2 = load64(t2 + 24);
+        }
+        # Re-register the REMAINDER. Unconditionally DELeting the fd (what the old
+        # single-waiter path did) would drop the registration for waiters still
+        # parked on the other direction. DEL only when nobody is left.
+        var rem = _async_fd_mask(rt, wfd);
+        if (rem == 0) {
+            syscall(SYS_EPOLL_CTL, epfd, 2, wfd, 0);   # EPOLL_CTL_DEL
+        } else {
+            var rev[16];
+            store32(&rev, rem);
+            #ifdef CYRIUS_ARCH_AARCH64
+            store64(&rev + 8, wfd);
+            #endif
+            #ifndef CYRIUS_ARCH_AARCH64
+            store64(&rev + 4, wfd);
+            #endif
+            syscall(SYS_EPOLL_CTL, epfd, 3, wfd, &rev);   # EPOLL_CTL_MOD
+        }
+        ei = ei + 1;
+    }
+    return nr;
+}
+
+# Drive the reactor until either watched handle (until_a / until_b) is DONE — task_join
+# watches one, async_with_timeout races a task against a deadline sentinel — or, when
+# both are 0, until the runtime is idle (async_run). Does NOT close the epfd.
+fn _async_pump(rt, until_a, until_b): i64 {
+    while (1 == 1) {
+        if (until_a != 0) { if (load64(until_a + 16) == TASK_DONE) { return 0; } }
+        if (until_b != 0) { if (load64(until_b + 16) == TASK_DONE) { return 0; } }
+        if (_async_step(rt) == 0) { return 0; }
+    }
+}
+
+# Run every spawned task to completion, then close the runtime's epfd (single-use).
+# Byte-for-byte the F1 run-to-completion behavior for consumers that ignore results
+# (sandhi/daimon accept loops).
+fn async_run(rt): i64 {
+    _async_pump(rt, 0, 0);
     syscall(SYS_CLOSE, load64(rt));
     return 0;
 }
 
-# Timer: sleep for ms milliseconds using timerfd + epoll
-fn async_sleep_ms(ms): i64 {
-    var tfd = syscall(SYS_TIMERFD_CREATE, 1, 0);
+# Await a spawned task's result without tearing down the runtime (JoinHandle, F2).
+# `handle` is the pointer async_spawn / async_spawn_future returned. Drives the loop
+# until that task completes and returns its fn's captured return value; if it is
+# already done, returns the stored result without pumping. Unlike async_run it does
+# NOT close the epfd, so you can join several handles and/or async_run afterward.
+# Pairs with async_spawn_future: joining a Future handle yields the async fn's value
+# (multi-arg via future_force). Returns 0 on a null handle.
+fn task_join(rt, handle): i64 {
+    if (handle == 0) { return 0; }
+    if (load64(handle + 16) != TASK_DONE) { _async_pump(rt, handle, 0); }
+    return load64(handle + 40);
+}
+
+# Await every task handle in handles[0..n) (i64[n]), collecting each result into
+# results[0..n). The tasks run concurrently on the reactor — join_all drives the loop
+# until all of them finish. Returns n. v6.4.37 (P3 — tokio's join!/join_all).
+fn async_join_all(rt, handles, n, results): i64 {
+    var i = 0;
+    while (i < n) {
+        store64(results + i * 8, task_join(rt, load64(handles + i * 8)));
+        i = i + 1;
+    }
+    return n;
+}
+
+# Await the FIRST task in handles[0..n) to complete; returns its index (0..n-1), or -1
+# if the runtime went idle with none done. The other tasks are left pending (the caller
+# may task_join or retire them). v6.4.37 (P3 — tokio's select!).
+fn async_select(rt, handles, n): i64 {
+    while (1 == 1) {
+        var i = 0;
+        while (i < n) {
+            var hnd = load64(handles + i * 8);          # null-guard: OOM-failed spawn → 0
+            if (hnd != 0) { if (load64(hnd + 16) == TASK_DONE) { return i; } }
+            i = i + 1;
+        }
+        if (_async_step(rt) == 0) {
+            # The step that idled the runtime may itself have completed a watched handle
+            # (a task that runs to DONE and drives active→0 in the SAME sweep is not
+            # counted as active). Re-scan once before reporting "none done" — otherwise a
+            # select over the last/only live task returns -1 instead of its index.
+            i = 0;
+            while (i < n) {
+                var hd = load64(handles + i * 8);
+                if (hd != 0) { if (load64(hd + 16) == TASK_DONE) { return i; } }
+                i = i + 1;
+            }
+            return 0 - 1;
+        }
+    }
+}
+
+# Cooperatively wait for `fd` to become readable from inside a running task.
+# Registers `fd` on the runtime's shared epfd keyed to the current task, parks
+# the task (TASK_WAITING), and returns; async_run blocks on the epfd and re-runs
+# the task once the fd is ready. The task must be poll-structured (re-entrant):
+# it advances its own progress and returns after calling this, resuming from the
+# top when woken. Returns -1 if called outside async_run (no current task).
+# v6.4.33 (F1) — the rt-integrated reactor path; async_await_readable stays the
+# standalone one-shot blocking helper (used by sandhi on the idle listen fd).
+# Union of the event masks every PARKED task is waiting on for `fd`. The registry IS the
+# task list — no separate waiter table, no allocation — which is why an fd can now hold
+# any number of waiters. Used to compute the mask to register with epoll, and again after
+# a wake to decide between EPOLL_CTL_MOD (waiters remain) and EPOLL_CTL_DEL (none do).
+fn _async_fd_mask(rt, fd): i64 {
+    var m = 0;
+    var t = load64(rt + 8);
+    while (t != 0) {
+        if (load64(t + 16) == TASK_WAITING) {
+            if (load64(t + 32) == fd) { m = m | load64(t + 56); }
+        }
+        t = load64(t + 24);
+    }
+    return m;
+}
+
+fn _async_wait_events(rt, fd, events): i64 {
+    var cur = load64(rt + 40);
+    if (cur == 0) { return 0 - 1; }
+    var epfd = load64(rt);
+    # Park FIRST so this task is counted by _async_fd_mask below — the mask we register
+    # must include the waiter we are adding, not just the ones already there.
+    store64(cur + 32, fd);           # remember fd (wake match + EPOLL_CTL_DEL)
+    store64(cur + 56, events);       # remember the mask this task waits on (v6.5.26)
+    store64(cur + 16, TASK_WAITING); # park
+    var mask = _async_fd_mask(rt, fd);
+    var ev[16];
+    store32(&ev, mask);              # EPOLLIN (1) / EPOLLOUT (4) / union
+    # v6.5.26 — epoll_data now carries the FD, not the task pointer. With a task pointer
+    # an fd could identify exactly ONE waiter, which is the whole reason two concurrent
+    # directions on one fd (or two tasks on one listener) were inexpressible. The fd is
+    # the stable key; _async_step resolves it back to every matching parked task.
+    # Offset is ABI-dependent: x86_64 packs the struct (EPOLL_PACKED → data @4); aarch64
+    # leaves it unpacked so the u64 aligns to @8. The wake read in _async_step must use
+    # the same offset. (CHANGELOG [6.4.42])
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, fd);
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
+    store64(&ev + 4, fd);
+    #endif
+    # ⛔ CHECK THE RETURN. EPOLL_CTL_ADD on an fd already in the set returns -EEXIST, and
+    # ignoring that is exactly how the second waiter used to be lost: it parked, its fd was
+    # never (re)registered with its event bit, and nothing ever woke it. On -EEXIST the fd
+    # is already there, so MOD it to the UNION mask instead (op 3 = EPOLL_CTL_MOD).
+    var rc = syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
+    if (rc < 0) {
+        rc = syscall(SYS_EPOLL_CTL, epfd, 3, fd, &ev);
+        if (rc < 0) {
+            # Neither ADD nor MOD took: un-park rather than sleep forever on an fd the
+            # reactor is not watching. A caller that sees -1 can fall back to blocking I/O.
+            store64(cur + 16, TASK_READY);
+            store64(cur + 32, 0 - 1);
+            store64(cur + 56, 0);
+            return 0 - 1;
+        }
+    }
+    return 0;
+}
+# Cooperatively wait for `fd` to become READABLE (EPOLLIN) from inside a running task —
+# parks the current task on the reactor until fd is ready; a poll-structured task resumes
+# from the top when woken. Returns -1 if called outside async_run. v6.4.33 (F1).
+fn async_wait_fd(rt, fd): i64 {
+    return _async_wait_events(rt, fd, 1);       # EPOLLIN — wait for readable
+}
+# Cooperatively wait for `fd` to become WRITABLE (EPOLLOUT) — the write-readiness
+# complement of async_wait_fd. A non-blocking connect signals completion as
+# writable, and a socket send that hit EAGAIN resumes here. v6.4.38.
+fn async_wait_writable(rt, fd): i64 {
+    return _async_wait_events(rt, fd, 4);       # EPOLLOUT — wait for writable
+}
+
+# v6.5.26 — park until `fd` is readable OR writable, whichever comes first (EPOLLIN|EPOLLOUT).
+# Impossible before the waiter-list rework: registering both directions meant two waiters on
+# one fd, and the second was silently dropped by an unchecked EPOLL_CTL_ADD -EEXIST.
+# The woken task must test which direction is actually ready (attempt the read, then the
+# write, handling EAGAIN) — epoll is level-triggered here, so a spurious attempt is cheap and
+# a missed one re-arms on the next park.
+fn async_wait_rw(rt, fd): i64 {
+    return _async_wait_events(rt, fd, 5);       # EPOLLIN | EPOLLOUT
+}
+
+# v6.5.26 — one direction of a byte relay, as a reusable primitive rather than a state
+# machine every consumer re-writes. Parks until `rfd` is readable, reads once into `buf`,
+# writes what it read to `wfd`, and returns the byte count (0 = clean EOF, -1 = error or
+# not inside async_run). Poll-structured: a caller spawns TWO of these with the directions
+# reversed and both live in ONE runtime, which is exactly the shape
+# `docker exec -it`-style TTY relaying needs and the shape that had no expression before —
+# the two directions are independent tasks parked on different fds, and now on the SAME fd
+# too if the consumer wants a single duplex handle.
+#
+# ⚠ Short writes are the caller's business: this returns what it WROTE, so a caller relaying
+# a stream should compare against the read count and re-drive. Kept deliberately minimal
+# (one read, one write, no internal loop) because owning a loop is what made the previous
+# poll-loop workarounds unable to interleave two directions.
+# ⛔ v6.5.37 — THE LINUX ARM PARKED THE TASK AND THEN BLOCKED, WHICH DEADLOCKS.
+#
+# It used to open with `if (async_wait_fd(rt, rfd) < 0) { return 0 - 1; }`. That call does
+# NOT wait: `_async_wait_events` marks the current task TASK_WAITING, registers the fd with
+# the reactor, and RETURNS 0 — because cyrius has no mid-body suspend (that is an open arc).
+# Execution therefore fell straight into a BLOCKING `sys_read` on an fd that is by
+# construction not ready yet, while the task was already parked. Both halves fail together:
+# the read never returns, and the reactor cannot make progress either because the task that
+# would consume the wakeup is blocked inside a syscall.
+#
+# MEASURED at 6.5.36 from inside a spawned task, relaying an empty pipe: "task: calling
+# relay" printed, "task: relay returned" never did, `timeout 5` killed it (exit 124).
+# Outside a task it silently did nothing instead — `rt + 40` is 0 with no task running, so
+# `_async_wait_events` bailed at its first line and the function returned -1 without ever
+# touching the fds. So it was a deadlock in the only context it was meant for and a no-op
+# everywhere else. It shipped under the async Half-A work with zero tests and, as of
+# 6.5.37, zero callers anywhere in the ecosystem.
+#
+# ⭐ THE FIX IS NOT A DESIGN CHOICE — IT IS RESTORING CONSISTENCY. The three sibling
+# implementations (`async_win.cyr`, `async_macos.cyr`, `async_agnos.cyr`) all already ship
+# exactly the body below: read, then write, with no park. The Linux arm was the outlier, so
+# matching them makes all four agree rather than inventing a fourth semantics.
+#
+# ⚠ WHAT THIS DOES AND DOES NOT PROMISE. It is a straight relay of one chunk. On a
+# non-blocking fd (the normal case under a reactor) an unready fd yields -EAGAIN promptly
+# and the caller retries; on a blocking fd it waits for data like any other read. What it
+# is NOT is cooperative — it does not yield to other tasks while waiting. A genuinely
+# cooperative relay needs mid-body suspend, which does not exist yet; the honest interim
+# behaviour is the one the other three platforms already had, not a deadlock.
+fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
+    var n = sys_read(rfd, buf, len);
+    if (n <= 0) { return n; }
+    # wfd may be a socket or a pipe: the leaf answers -EPIPE for a reset socket instead of a
+    # SIGPIPE kill, and keeps write(2) for a pipe. CHANGELOG [6.6.16]
+    return _fd_write_nosigpipe(wfd, buf, n);
+}
+
+# Record `fd` as owned by the CURRENT task, so _async_retire closes it if the task is
+# retired (timed out / select loser) without ever resuming. A task that opens its own
+# fd and parks on it (connect socket, resolve UDP fd) calls this right after parking;
+# recv/send park on a caller-owned fd and must NOT call it. v6.4.42 (retire fd-leak fix).
+fn _async_own_fd(rt, fd): i64 {
+    var cur = load64(rt + 40);
+    if (cur != 0) { store64(cur + 48, fd); }
+    return 0;
+}
+
+# ================================================================
+# Async net client (v6.4.38) — non-blocking connect on the reactor.
+# ================================================================
+
+# Reactor connect task: initiate a non-blocking TCP connect and park on the socket's
+# write-readiness; on resume, read back SO_ERROR to confirm the handshake. Raw Linux
+# socket syscalls (async.cyr stays net.cyr-free). ctx = { step, addr, port, fd, rt }.
+fn _async_connect_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        var fd = syscall(SYS_SOCKET, 2, 1 | 524288, 0);  # AF_INET, SOCK_STREAM|SOCK_CLOEXEC (v6.4.43)
+        if (fd < 0) { return 0 - 1; }
+        # v6.6.8: through the wrapper, and a failed F_SETFL closes the socket and fails the
+        # task instead of parking a BLOCKING connect on the reactor. CHANGELOG [6.6.8]
+        if (fd_set_nonblocking(fd) < 0) { syscall(SYS_CLOSE, fd); return 0 - 1; }
+        var sa[16];                                     # sockaddr_in (Linux)
+        store16(&sa, 2);                                # AF_INET
+        var port = load64(ctx + 16);
+        store16(&sa + 2, ((port & 0xFF) << 8) | ((port >> 8) & 0xFF));   # port, network order
+        store32(&sa + 4, load64(ctx + 8));              # addr (network-order IPv4 as int)
+        store64(&sa + 8, 0);
+        store64(ctx + 24, fd);
+        if (syscall(SYS_CONNECT, fd, &sa, 16) == 0) { return fd; }   # connected immediately
+        store64(ctx, 1);
+        async_wait_writable(load64(ctx + 32), fd);      # EINPROGRESS → park on writable
+        _async_own_fd(load64(ctx + 32), fd);             # retire closes the socket on timeout
+        return 0;
+    }
+    # resumed (writable): getsockopt(SOL_SOCKET, SO_ERROR)
+    var fd = load64(ctx + 24);
+    var sb[8];
+    var slen[8];
+    store32(&sb, 0);
+    store32(&slen, 4);
+    syscall(55, fd, 1, 4, &sb, &slen);                  # getsockopt SO_ERROR (Linux SOL_SOCKET=1)
+    if (load32(&sb) == 0) { return fd; }                # connected
+    syscall(SYS_CLOSE, fd);
+    return 0 - 1;
+}
+
+# Async TCP connect on the reactor. `addr` is the 4 IPv4 bytes in network order as an
+# int (e.g. 0x0100007F for 127.0.0.1); `port` is host-order. Returns a task handle
+# whose result — via task_join(rt, handle) — is the connected socket fd, or -1 on
+# failure; the reactor parks on the socket's write-readiness during the handshake, so
+# other tasks run concurrently. Linux only (agnos/macOS degrade). v6.4.38 (async net
+# client — connect).
+fn async_connect(rt, addr, port): i64 {
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, addr);
+    store64(ctx + 16, port);
+    store64(ctx + 24, 0);       # fd
+    store64(ctx + 32, rt);
+    return async_spawn(rt, &_async_connect_task, ctx);
+}
+
+# Reactor accept task (Linux, v6.4.44 R3): park on the LISTEN fd's read-readiness (EPOLLIN),
+# then accept the pending connection. ctx = { step, rt, listen_fd }. The Linux/epoll parity
+# for async_win.cyr's AcceptEx server — the readiness model instead of a posted overlap.
+fn _async_accept_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        store64(ctx, 1);
+        async_wait_fd(load64(ctx + 8), load64(ctx + 16));   # park on the listen fd (EPOLLIN)
+        return 0;
+    }
+    # woken (a connection is pending): accept it. x86 accept=43; aarch64 202 via ESYSXLAT.
+    var afd = syscall(43, load64(ctx + 16), 0, 0);          # accept(lfd, NULL, NULL)
+    if (afd >= 0) { sys_fcntl(afd, 2, 1); }                 # F_SETFD FD_CLOEXEC (v6.4.43 hygiene)
+    return afd;
+}
+
+# Async accept on the reactor: the caller sets up + listens `listen_fd`; this parks the task
+# on its readiness and accepts one connection. Returns a task handle whose result — via
+# task_join — is the accepted fd (or a negative errno). Target-agnostic mirror of
+# async_win.cyr's `async_accept` (AcceptEx). v6.4.44 R3 (async "W"-arc server step).
+fn async_accept(rt, listen_fd): i64 {
+    var ctx = alloc_via(load64(rt + 32), 24);
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, rt);
+    store64(ctx + 16, listen_fd);
+    return async_spawn(rt, &_async_accept_task, ctx);
+}
+
+# Reactor socket recv task: park on the fd's read-readiness, then read once into buf.
+# ctx = { step, fd, buf, len, rt }.
+fn _async_recv_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        store64(ctx, 1);
+        async_wait_fd(load64(ctx + 32), load64(ctx + 8));      # park on EPOLLIN
+        return 0;
+    }
+    return syscall(SYS_READ, load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
+}
+
+# Async single-shot recv on the reactor: park until `fd` is readable, then read up to
+# `len` bytes into `buf`. Returns a task handle whose result (via task_join) is the byte
+# count (0 = EOF, <0 = error). One read per call — a full-message read re-spawns per
+# chunk (streaming with backpressure awaits the mid-body-suspend follow-on). v6.4.39.
+fn async_recv(rt, fd, buf, len): i64 {
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, fd);
+    store64(ctx + 16, buf);
+    store64(ctx + 24, len);
+    store64(ctx + 32, rt);
+    return async_spawn(rt, &_async_recv_task, ctx);
+}
+
+# Reactor socket send task: park on the fd's write-readiness, then write once from buf.
+# ctx = { step, fd, buf, len, rt }.
+fn _async_send_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        store64(ctx, 1);
+        async_wait_writable(load64(ctx + 32), load64(ctx + 8));   # park on EPOLLOUT
+        return 0;
+    }
+    # Not a raw SYS_WRITE: a reset peer must answer -EPIPE, never a SIGPIPE kill. CHANGELOG [6.6.16]
+    return _fd_write_nosigpipe(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
+}
+
+# Async single-shot send on the reactor: park until `fd` is writable, then write up to
+# `len` bytes from `buf`. Returns a task handle whose result (via task_join) is the byte
+# count written (<0 = error). One write per call. v6.4.39.
+fn async_send(rt, fd, buf, len): i64 {
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, fd);
+    store64(ctx + 16, buf);
+    store64(ctx + 24, len);
+    store64(ctx + 32, rt);
+    return async_spawn(rt, &_async_send_task, ctx);
+}
+
+# ================================================================
+# Async DNS (v6.4.40) — reactor A-record resolution (UDP query, self-contained
+# wire-format; ported from the sandhi resolver so async.cyr stays sandhi-free).
+# ================================================================
+
+# Encode a hostname (C-string) into DNS label wire-format at `out`. Returns length.
+fn _async_dns_encode_labels(host, out): i64 {
+    var label_start = 0;
+    var p = 0;
+    var wi = 1;                         # +1: leaves room for label 0's length byte
+    while (load8(host + p) != 0) {
+        var c = load8(host + p);
+        if (c == 46) {                 # '.'
+            var llen = p - label_start;
+            if (llen == 0) { return 0 - 1; }
+            if (llen > 63) { return 0 - 1; }
+            store8(out + (wi - llen - 1), llen);
+            label_start = p + 1;
+            wi = wi + 1;
+        } else {
+            store8(out + wi, c);
+            wi = wi + 1;
+        }
+        p = p + 1;
+    }
+    var last_len = p - label_start;
+    if (last_len == 0) { return 0 - 1; }
+    if (last_len > 63) { return 0 - 1; }
+    store8(out + (wi - last_len - 1), last_len);
+    store8(out + wi, 0);               # root terminator
+    wi = wi + 1;
+    if (wi > 255) { return 0 - 1; }
+    return wi;
+}
+
+# Build a DNS A-record query (txid `id`, hostname `host`) into `out`. Returns length.
+fn _async_dns_build_query(id, host, out): i64 {
+    store8(out + 0, (id >> 8) & 0xFF);
+    store8(out + 1, id & 0xFF);
+    store8(out + 2, 0x01);             # flags MSB: RD=1
+    store8(out + 3, 0x00);
+    store8(out + 4, 0x00); store8(out + 5, 0x01);   # QDCOUNT=1
+    store8(out + 6, 0x00); store8(out + 7, 0x00);
+    store8(out + 8, 0x00); store8(out + 9, 0x00);
+    store8(out + 10, 0x00); store8(out + 11, 0x00);
+    var qlen = _async_dns_encode_labels(host, out + 12);
+    if (qlen < 0) { return 0 - 1; }
+    var qi = 12 + qlen;
+    store8(out + qi + 0, 0x00); store8(out + qi + 1, 0x01);   # QTYPE=A
+    store8(out + qi + 2, 0x00); store8(out + qi + 3, 0x01);   # QCLASS=IN
+    return qi + 4;
+}
+
+# Skip a DNS name at `off` (labels + 0xC0 compression pointer). Returns offset past it.
+fn _async_dns_skip_name(buf, blen, off): i64 {
+    var p = off;
+    var safety = 0;
+    while (safety < 256) {
+        if (p >= blen) { return 0 - 1; }
+        var c = load8(buf + p);
+        if (c == 0) { return p + 1; }
+        if ((c & 0xC0) == 0xC0) {
+            if (p + 1 >= blen) { return 0 - 1; }
+            return p + 2;
+        }
+        if (c > 63) { return 0 - 1; }
+        p = p + 1 + c;
+        safety = safety + 1;
+    }
+    return 0 - 1;
+}
+
+# Parse a DNS response: verify the txid + rcode, skip the question, and return the
+# first A record's IPv4 (network-order bytes as an int, ready for async_connect), or
+# -1. Pragmatic — returns the first A answer (no CNAME-chain / name-match validation).
+fn _async_dns_parse_a(buf, blen, expected_id): i64 {
+    if (blen < 12) { return 0 - 1; }
+    if (((load8(buf + 0) << 8) | load8(buf + 1)) != expected_id) { return 0 - 1; }
+    if ((load8(buf + 3) & 0x0F) != 0) { return 0 - 1; }        # rcode
+    var ancount = (load8(buf + 6) << 8) | load8(buf + 7);
+    if (ancount == 0) { return 0 - 1; }
+    var off = _async_dns_skip_name(buf, blen, 12);             # skip the question name
+    if (off < 0) { return 0 - 1; }
+    off = off + 4;                                             # QTYPE + QCLASS
+    var i = 0;
+    while (i < ancount) {
+        off = _async_dns_skip_name(buf, blen, off);
+        if (off < 0) { return 0 - 1; }
+        if (off + 10 > blen) { return 0 - 1; }
+        var rtype = (load8(buf + off + 0) << 8) | load8(buf + off + 1);
+        var rdlength = (load8(buf + off + 8) << 8) | load8(buf + off + 9);
+        off = off + 10;
+        if (rtype == 1) {
+            if (rdlength != 4) { return 0 - 1; }
+            if (off + 4 > blen) { return 0 - 1; }
+            var b0 = load8(buf + off);
+            var b1 = load8(buf + off + 1);
+            var b2 = load8(buf + off + 2);
+            var b3 = load8(buf + off + 3);
+            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        off = off + rdlength;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Resolve task: UDP-connect to the nameserver, send the A query, park on the reply,
+# parse it. ctx = { step, host, ns_addr, ns_port, fd, id, rt }.
+fn _async_resolve_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        var fd = syscall(SYS_SOCKET, 2, 2 | 524288, 0);  # AF_INET, SOCK_DGRAM|SOCK_CLOEXEC (v6.4.43)
+        if (fd < 0) { return 0 - 1; }
+        var sa[16];
+        store16(&sa, 2);
+        var port = load64(ctx + 24);
+        store16(&sa + 2, ((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
+        store32(&sa + 4, load64(ctx + 16));             # nameserver addr
+        store64(&sa + 8, 0);
+        if (syscall(SYS_CONNECT, fd, &sa, 16) < 0) { syscall(SYS_CLOSE, fd); return 0 - 1; }
+        var qbuf[288];
+        var qlen = _async_dns_build_query(load64(ctx + 40), load64(ctx + 8), &qbuf);
+        if (qlen < 0) { syscall(SYS_CLOSE, fd); return 0 - 1; }
+        syscall(SYS_WRITE, fd, &qbuf, qlen);
+        store64(ctx + 32, fd);
+        store64(ctx, 1);
+        async_wait_fd(load64(ctx + 48), fd);            # park for the response
+        _async_own_fd(load64(ctx + 48), fd);             # retire closes the UDP fd on timeout
+        return 0;
+    }
+    var fd = load64(ctx + 32);
+    var rbuf[512];
+    var n = syscall(SYS_READ, fd, &rbuf, 512);
+    syscall(SYS_CLOSE, fd);
+    return _async_dns_parse_a(&rbuf, n, load64(ctx + 40));
+}
+
+# Async DNS A-record resolution on the reactor via nameserver `ns_addr`:`ns_port`
+# (`ns_addr` = network-order IPv4 bytes as an int, e.g. 0x0100007F for 127.0.0.1;
+# `ns_port` host-order, usually 53). Returns a task handle whose result (via task_join)
+# is the resolved IPv4 in the same network-order-int form — feed it straight to
+# async_connect — or -1 on failure. The reactor parks on the UDP reply, so other tasks
+# run concurrently. Linux only. v6.4.40 (async DNS).
+fn async_resolve(rt, ns_addr, ns_port, host): i64 {
+    var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, host);
+    store64(ctx + 16, ns_addr);
+    store64(ctx + 24, ns_port);
+    store64(ctx + 32, 0);          # fd
+    store64(ctx + 40, 0x4342);     # txid
+    store64(ctx + 48, rt);
+    return async_spawn(rt, &_async_resolve_task, ctx);
+}
+
+# ================================================================
+# P1 timers (v6.4.35) — async_with_timeout + async_interval on the reactor.
+# ================================================================
+
+# Create a CLOCK_MONOTONIC timerfd that first fires after value_ms and then every
+# interval_ms (interval_ms == 0 = one-shot). `value_ms <= 0` is a deadline that has already
+# passed: the timer fires at once. Returns the fd, or -1 on failure.
+# ⛔ 6.6.11 — value_ms went straight into it_value. An all-zero it_value DISARMS a timerfd and a
+# negative one is EINVAL (the settime return was unchecked), so `async_with_timeout(rt, h, 0)`,
+# `async_interval(.., 0, ..)` and `async_sleep_ms(0)` — and their negative forms — waited for
+# ever (measured: all six hung). It is now 1 ns, which expires at once, matching macOS's
+# "a deadline that has already passed"; a refused settime closes the fd and fails. CHANGELOG [6.6.11]
+fn _async_timerfd(value_ms, interval_ms): i64 {
+    var tfd = syscall(SYS_TIMERFD_CREATE, 1, TFD_CLOEXEC);   # CLOEXEC (v6.4.43)
     if (tfd < 0) { return 0 - 1; }
     # itimerspec: { interval_sec, interval_nsec, value_sec, value_nsec }
     var spec[32];
-    store64(&spec, 0);
-    store64(&spec + 8, 0);
-    store64(&spec + 16, ms / 1000);
-    store64(&spec + 24, (ms % 1000) * 1000000);
-    syscall(SYS_TIMERFD_SETTIME, tfd, 0, &spec, 0);
-    # Block until timer fires
+    store64(&spec, interval_ms / 1000);
+    store64(&spec + 8, (interval_ms % 1000) * 1000000);
+    if (value_ms <= 0) {
+        store64(&spec + 16, 0);
+        store64(&spec + 24, 1);
+    } else {
+        store64(&spec + 16, value_ms / 1000);
+        store64(&spec + 24, (value_ms % 1000) * 1000000);
+    }
+    if (syscall(SYS_TIMERFD_SETTIME, tfd, 0, &spec, 0) < 0) {
+        syscall(SYS_CLOSE, tfd);
+        return 0 - 1;
+    }
+    return tfd;
+}
+
+# Retire a task that may still be parked (the loser of a timeout race): DEL its
+# wait_fd from the epfd and mark it DONE so the reactor never re-runs it. A process task's
+# child is ended too — its tree TERMed now, the rest of the kill left to a task on `rt`
+# (`_async_process_end`). Returns that kill task's handle, which the caller must pump to DONE
+# (async_with_timeout does), or 0 when there is none. No-op (0) if the task is already done.
+fn _async_retire(rt, t): i64 {
+    if (t == 0) { return 0; }
+    if (load64(t + 16) == TASK_DONE) { return 0; }
+    var wfd = load64(t + 32);
+    if (wfd >= 0) {
+        syscall(SYS_EPOLL_CTL, load64(rt), 2, wfd, 0);   # EPOLL_CTL_DEL
+        store64(t + 32, 0 - 1);
+    }
+    # Close any fd the task itself opened (connect socket / resolve UDP fd). Its resume
+    # body — the only other close site — never runs once the task is retired, so without
+    # this the fd leaks on every timeout/select-loser. -1 = task owns none. (v6.4.42)
+    var ofd = load64(t + 48);
+    if (ofd >= 0) {
+        syscall(SYS_CLOSE, ofd);
+        store64(t + 48, 0 - 1);
+    }
+    # ⛔ 6.6.11 — a retired PROCESS task left its child running and unreaped, and leaked its
+    # pidfd: `async_with_timeout(rt, h, 100)` on an async_spawn_process handle returned 0 with
+    # `/bin/sleep 7` still running, and it outlived the caller (measured). Only
+    # async_run_process killed, after its own timeout. The Windows peer ends the child's job
+    # here; this is that shape.
+    var kt = 0;
+    if (load64(t) == &_async_process_task) { kt = _async_process_end(rt, load64(t + 8)); }
+    store64(t + 16, TASK_DONE);
+    return kt;
+}
+
+# Deadline sentinel for async_with_timeout — a poll task that parks on the deadline
+# timerfd and completes (→ 1) when it fires. ctx = { step, tfd, rt }.
+fn _async_timeout_sentinel(ctx): i64 {
+    if (load64(ctx) == 0) {
+        store64(ctx, 1);
+        async_wait_fd(load64(ctx + 16), load64(ctx + 8));   # park on the timerfd
+        return 0;
+    }
     var buf[8];
-    syscall(SYS_READ, tfd, &buf, 8);
+    syscall(SYS_READ, load64(ctx + 8), &buf, 8);            # drain the expiration
+    return 1;
+}
+
+# Await `handle` (an async_spawn / async_spawn_future return) with a deadline of `ms`.
+# Returns 1 if the task completed in time (its result is then available via
+# task_join(rt, handle) or the handle's result slot), 0 if the deadline fired first
+# (the still-pending task is retired — it will not run again; an async_spawn_process
+# handle's child tree is ended and reaped before this returns, 6.6.11), or -1 if the timerfd
+# could not be created. Races the task against a timerfd sentinel on the reactor;
+# does NOT close the runtime. `ms <= 0` is a deadline that has already passed: the handle
+# still gets the steps that are READY now, but nothing that parks (6.6.11 — it hung).
+# v6.4.35 (P1 — tokio's `timeout(future, dur)`).
+fn async_with_timeout(rt, handle, ms): i64 {
+    if (handle == 0) { return 0; }
+    if (load64(handle + 16) == TASK_DONE) { return 1; }
+    var tfd = _async_timerfd(ms, 0);
+    if (tfd < 0) { return 0 - 1; }
+    var sctx = alloc_via(load64(rt + 32), 24);      # rt's allocator (arena-reclaimable)
+    # Out of memory: -1, like a failed timerfd. With no sentinel, `_async_pump(rt, handle, 0)`
+    # would wait for the handle alone — a deadline that never fires. CHANGELOG [6.6.10]
+    if (sctx == 0) { syscall(SYS_CLOSE, tfd); return 0 - 1; }
+    store64(sctx, 0);
+    store64(sctx + 8, tfd);
+    store64(sctx + 16, rt);
+    var sentinel = async_spawn(rt, &_async_timeout_sentinel, sctx);
+    if (sentinel == 0) { syscall(SYS_CLOSE, tfd); return 0 - 1; }
+    _async_pump(rt, handle, sentinel);
+    # snapshot the winner BEFORE retiring (retire marks the loser DONE, which would
+    # otherwise make the handle look completed)
+    var completed = 0;
+    if (load64(handle + 16) == TASK_DONE) { completed = 1; }
+    # drop the race loser so nothing is left parked on the fd we close
+    var kt = _async_retire(rt, handle);
+    _async_retire(rt, sentinel);
+    syscall(SYS_CLOSE, tfd);
+    # A process loser's child is being ended by a kill task: drive it to done, so the child is
+    # reaped when this returns, while the runtime's other tasks keep running (6.6.11).
+    if (kt != 0) { _async_pump(rt, kt, 0); }
+    return completed;
+}
+
+# Repeating-timer task for async_interval — parks on an interval timerfd, invokes
+# fp(arg) each tick, and completes when `tok` (a cancel-token cell) is non-zero.
+# ctx = { step, fp, arg, tfd, rt, tok }.
+fn _async_interval_task(ctx): i64 {
+    var tfd = load64(ctx + 24);
+    var tok = load64(ctx + 40);                   # cancel-token CELL (0 = never cancel)
+    if (tok != 0) { if (load64(tok) != 0) {       # cancel-token cell signalled?
+            syscall(SYS_CLOSE, tfd);
+            return 0;
+        } }
+    if (load64(ctx) == 1) {
+        var buf[8];
+        syscall(SYS_READ, tfd, &buf, 8);          # drain the tick(s)
+        fncall1(load64(ctx + 8), load64(ctx + 16));   # fp(arg)
+        if (tok != 0) { if (load64(tok) != 0) {   # callback may have cancelled
+                syscall(SYS_CLOSE, tfd);
+                return 0;
+            } }
+    }
+    store64(ctx, 1);
+    async_wait_fd(load64(ctx + 32), tfd);         # park for the next tick
+    return 0;
+}
+
+# Invoke fp(arg) every `ms` milliseconds on the reactor until `tok` is signalled,
+# then stop (and close the timer). `tok` is a cancel-token cell (cancel_token_new(),
+# or any 8-byte cell set non-zero to stop — cancel_token_signal / store64(tok, 1)).
+# Returns the interval task handle; async_run / task_join drive the ticks. The
+# callback runs synchronously each tick — keep it short. Returns 0 (no handle) when `ms <= 0`
+# — there is no period — as macOS does (6.6.11; it armed a disarmed timer and the runtime
+# waited for ever). v6.4.35 (P1 — `interval`). CHANGELOG [6.6.11]
+fn async_interval(rt, fp, arg, ms, tok): i64 {
+    if (ms <= 0) { return 0; }
+    var tfd = _async_timerfd(ms, ms);
+    if (tfd < 0) { return 0; }
+    var ctx = alloc_via(load64(rt + 32), 48);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { syscall(SYS_CLOSE, tfd); return 0; }   # out of memory. CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, fp);
+    store64(ctx + 16, arg);
+    store64(ctx + 24, tfd);
+    store64(ctx + 32, rt);
+    store64(ctx + 40, tok);
+    var h = async_spawn(rt, &_async_interval_task, ctx);
+    if (h == 0) { syscall(SYS_CLOSE, tfd); }         # no task owns the timer: do not leak it
+    return h;
+}
+
+# ================================================================
+# P2 async subprocess (v6.4.36) — fork+exec a child and await its exit on the
+# reactor via a pidfd (no blocking waitpid); the task result is the exit code.
+# ================================================================
+
+# Async subprocess task: on first run fork+exec the child and park on its pidfd
+# (readable when the child exits); on wake reap it and return the exit code as the
+# task result. ctx = { step, path, argv, envp, pid, pidfd, rt }; step 0 = not forked,
+# 1 = forked and parked, 2 = retired and handed to a kill task (`_async_process_end`).
+fn _async_process_task(ctx): i64 {
+    if (load64(ctx) == 0) {
+        var pid = sys_fork();
+        if (pid < 0) { return 0 - 1; }
+        if (pid == 0) {
+            sys_execve(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
+            sys_exit(127);                                       # exec failed
+        }
+        store64(ctx + 32, pid);
+        var pfd = sys_pidfd_open(pid, 0);
+        if (pfd < 0) {
+            # pidfd_open failed (kernel < 5.3, or the pid raced away). Parking on a
+            # negative fd would deadlock the reactor forever (epoll_wait(-1) on an empty
+            # epfd) and leave the child a zombie — reap it and complete with an error.
+            var rb[8];
+            sys_waitpid(pid, &rb, 0);
+            return 0 - 1;
+        }
+        store64(ctx + 40, pfd);
+        store64(ctx, 1);
+        async_wait_fd(load64(ctx + 48), pfd);                    # park on the pidfd
+        return 0;
+    }
+    # wake: the child has exited — reap it (returns at once) and close the pidfd. Only a wait
+    # that returned the child's pid wrote statusbuf: under an inherited SIGCHLD = SIG_IGN the
+    # kernel has already reaped it (the pidfd still wakes us), waitpid fails ECHILD, and the
+    # stale stack word decoded as "exit 0" for a child that failed. Not observed is -1.
+    # CHANGELOG [6.6.20]
+    var cpid = load64(ctx + 32);
+    var statusbuf[8];
+    var w = sys_waitpid(cpid, &statusbuf, 0);
+    while (w == 0 - 4) { w = sys_waitpid(cpid, &statusbuf, 0); }
+    syscall(SYS_CLOSE, load64(ctx + 40));
+    if (w != cpid) { return 0 - 1; }
+    var status = load32(&statusbuf);
+    if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
+    return 0 - 1;
+}
+
+# Spawn a child process on the reactor: exec `path` with NULL-terminated `argv` and
+# `envp`, non-blocking (the reactor parks on a pidfd until the child exits). Returns
+# a task handle whose result — via task_join(rt, handle) — is the child's exit code.
+# v6.4.36 (P2 — tokio::process::Command spawn).
+fn async_spawn_process(rt, path, argv, envp): i64 {
+    var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    store64(ctx, 0);
+    store64(ctx + 8, path);
+    store64(ctx + 16, argv);
+    store64(ctx + 24, envp);
+    store64(ctx + 32, 0);        # pid
+    store64(ctx + 40, 0);        # pidfd
+    store64(ctx + 48, rt);
+    return async_spawn(rt, &_async_process_task, ctx);
+}
+
+# ── The deadline's kill as a reactor task (6.6.11) ──────
+# ⛔ async_run_process called the BLOCKING proc_kill_tree after its deadline: TERM, then a 10 ms
+# sleep-poll for up to `_PROC_GRACE_MS` (5 s) during which NO task ran — measured, a TERM-
+# ignoring child held a sibling 10 ms interval for 5,234 ms. Now the deadline TERMs the tree
+# (`_proc_kill_begin`) and a task on the same reactor finishes the kill: it parks on a 10 ms
+# timerfd and takes one non-blocking look (`_proc_kill_step`) per tick until nothing is left
+# or the grace has run out, then KILLs and reaps (`_proc_kill_finish`) and closes the pidfd.
+# ctx (88 B) = { kill state @0 (40 B, lib/process.cyr), status @40, pidfd @48, tfd @56,
+# waited ms @64, rt @72, parked @80 }.
+fn _async_kill_task(ctx): i64 {
+    if (load64(ctx + 80) == 1) {
+        store64(ctx + 80, 0);
+        var buf[8];
+        store64(&buf, 0);
+        # a timerfd read is the number of 10 ms periods since the last one
+        if (syscall(SYS_READ, load64(ctx + 56), &buf, 8) == 8) {
+            store64(ctx + 64, load64(ctx + 64) + 10 * load64(&buf));
+        }
+    }
+    if (_proc_kill_step(ctx, ctx + 40) == 0) {
+        if (load64(ctx + 64) < _PROC_GRACE_MS) {
+            store64(ctx + 80, 1);
+            if (async_wait_fd(load64(ctx + 72), load64(ctx + 56)) == 0) { return 0; }
+            store64(ctx + 80, 0);
+            # the reactor would not take the timer: finish the grace here, blocking
+            _proc_kill_wait(ctx, ctx + 40, load64(ctx + 64));
+            return _async_kill_close(ctx);
+        }
+    }
+    _proc_kill_finish(ctx, ctx + 40);
+    return _async_kill_close(ctx);
+}
+
+# Close the kill task's timer and the child's pidfd. Returns 0.
+fn _async_kill_close(ctx): i64 {
+    syscall(SYS_CLOSE, load64(ctx + 56));
+    if (load64(ctx + 48) > 0) { syscall(SYS_CLOSE, load64(ctx + 48)); }
+    return 0;
+}
+
+# End the child of a retired process task (ctx `pctx`): TERM its tree now and return a kill task
+# on `rt` that finishes the job, or 0 when there is nothing to end or the kill was completed here
+# because no task could be made (then it BLOCKS for the grace, which is the pre-6.6.11 shape —
+# correct, only not concurrent).
+fn _async_process_end(rt, pctx): i64 {
+    if (load64(pctx) != 1) { return 0; }          # never forked, or already handed over
+    var pid = load64(pctx + 32);
+    if (pid <= 0) { return 0; }
+    store64(pctx, 2);
+    var a = load64(rt + 32);
+    var ctx = alloc_via(a, 88);
+    var tfd = 0 - 1;
+    if (ctx != 0) { tfd = _async_timerfd(10, 10); }
+    if (tfd < 0) {
+        var sb[8];
+        proc_kill_tree(pid, &sb);
+        if (load64(pctx + 40) > 0) { syscall(SYS_CLOSE, load64(pctx + 40)); }
+        return 0;
+    }
+    store64(ctx + 48, load64(pctx + 40));
+    store64(ctx + 56, tfd);
+    store64(ctx + 64, 0);
+    store64(ctx + 72, rt);
+    store64(ctx + 80, 0);
+    _proc_kill_begin(ctx, pid, 0);
+    # The /proc snapshot lives in process.cyr's one shared buffer, which the next snapshot —
+    # any process verb another task runs during the grace — overwrites. Keep a copy.
+    var n = load64(ctx + 24);
+    var kt = 0;
+    if (n > 0) {
+        var cp = alloc_via(a, n * 8);
+        if (cp != 0) {
+            memcpy(cp, load64(ctx + 32), n * 8);
+            store64(ctx + 32, cp);
+            kt = async_spawn(rt, &_async_kill_task, ctx);
+        }
+    } else {
+        kt = async_spawn(rt, &_async_kill_task, ctx);
+    }
+    if (kt == 0) {
+        _proc_kill_wait(ctx, ctx + 40, 0);        # no task: finish it here, blocking
+        _async_kill_close(ctx);
+    }
+    return kt;
+}
+
+# Spawn `path` and wait for it, with an optional deadline (ms <= 0 = no deadline).
+# Returns the child's exit code, -2 if the deadline fired first — in which case the child's
+# whole tree has been ended (TERM, grace, KILL), the child reaped and its pidfd closed, while
+# the runtime's other tasks kept running — or -1 if it could not be started or the deadline
+# could not be armed. Does NOT close the runtime. v6.4.36 (P2 — the spawn + wait + timeout
+# combinator). 6.6.11: the kill moved into async_with_timeout's retire of the handle (a kill
+# task, no longer a blocking proc_kill_tree here), which is also what ends the child of a
+# plain async_with_timeout on an async_spawn_process handle. CHANGELOG [6.6.11]
+fn async_run_process(rt, path, argv, envp, ms): i64 {
+    var h = async_spawn_process(rt, path, argv, envp);
+    if (h == 0) { return 0 - 1; }
+    if (ms <= 0) { return task_join(rt, h); }
+    var w = async_with_timeout(rt, h, ms);
+    if (w == 1) { return load64(h + 40); }
+    if (w < 0) {
+        # No deadline could be armed, so nothing was run: retire the handle so a later pump
+        # does not start a child nobody is waiting for.
+        var kt = _async_retire(rt, h);
+        if (kt != 0) { _async_pump(rt, kt, 0); }
+        return 0 - 1;
+    }
+    return 0 - 2;
+}
+
+# Timer: sleep for ms milliseconds using timerfd + epoll. Shares the one-shot timerfd
+# construction with the reactor via _async_timerfd (interval 0) — v6.4.42 dedup. `ms <= 0`
+# returns at once (6.6.11; it blocked for ever on a disarmed timer).
+fn async_sleep_ms(ms): i64 {
+    var tfd = _async_timerfd(ms, 0);
+    if (tfd < 0) { return 0 - 1; }
+    var buf[8];
+    syscall(SYS_READ, tfd, &buf, 8);          # block until the timer fires
     syscall(SYS_CLOSE, tfd);
     return 0;
 }
 
-# Non-blocking read: set fd non-blocking, try read, restore
+# Non-blocking read: set fd non-blocking, try read, restore. Returns the byte count, -EAGAIN
+# when nothing is ready, or -errno (including a failed F_GETFL/F_SETFL — v6.6.8; before, a
+# failed F_GETFL wrote its own -errno back as the status flags).
 fn async_read(fd, buf, len): i64 {
-    # Set O_NONBLOCK (0x800) via fcntl
-    var flags = syscall(SYS_FCNTL, fd, 3, 0);
-    syscall(SYS_FCNTL, fd, 4, flags | 2048);
+    var flags = fd_set_nonblocking(fd);
+    if (flags < 0) { return flags; }
     var n = syscall(SYS_READ, fd, buf, len);
-    # Restore original flags
-    syscall(SYS_FCNTL, fd, 4, flags);
+    fd_restore_flags(fd, flags);
     return n;
 }
 
-# Wait for fd to be readable using epoll (blocks efficiently)
-fn async_await_readable(fd): i64 {
-    var epfd = syscall(SYS_EPOLL_CREATE1, 0);
-    # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
-    var ev[16];
-    store32(&ev, 1);
-    store64(&ev + 4, fd);
-    syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
-    var revents[16];
-    sys_epoll_wait(epfd, &revents, 1, 0 - 1);
-    syscall(SYS_CLOSE, epfd);
+# Wait for fd to be readable, or until `ms` milliseconds elapse. Returns 1 if fd
+# became readable — data, a hang-up, a pending connection, or a regular file (always
+# readable) — and 0 if the wait ended without it: the timeout, EINTR, or an fd that is
+# not open (at once, never a hang). A negative `ms` blocks forever; one above INT_MAX
+# is clamped to it.
+#
+# Prefer this over async_await_readable whenever the wait must be interruptible: a
+# cooperative server parked on an infinite wait cannot observe a stop flag set by
+# another thread, because control never leaves the wait. Bounding the wait is what
+# lets the caller re-check between waits.
+#
+# A signal-interrupted wait (EINTR) reports 0, the same as a timeout — the caller's
+# loop re-checks its own condition and waits again, which is the correct response to
+# both. CHANGELOG [6.5.6]
+# One poll(2) through fd_wait_ready (lib/syscalls_linux_common.cyr), the same primitive as
+# the macOS and Windows peers. ⛔ Until 6.6.20 this built a one-fd epoll set and ignored a
+# failed EPOLL_CTL_ADD: epoll refuses a regular file (EPERM) and a closed fd (EBADF), so the
+# wait ran on an EMPTY set — a file read as a timeout and a closed fd hung for ever with
+# `ms` < 0 — and the kernel truncated `ms` to an int. CHANGELOG [6.6.20]
+fn async_await_readable_ms(fd, ms): i64 {
+    if (fd_wait_ready(fd, 0, ms) == 1) { return 1; }
     return 0;
 }
 
-# Run a function with a timeout (ms). Returns function result or -1 on timeout.
-# Uses fork: child runs fn, parent waits with timeout.
+# Wait for fd to be readable (blocks without limit).
+# Always returns 0, discarding whether the fd is actually ready — that contract is
+# preserved for existing callers. Use async_await_readable_ms for a bounded wait
+# that reports which of the two happened.
+fn async_await_readable(fd): i64 {
+    async_await_readable_ms(fd, 0 - 1);
+    return 0;
+}
+
+# Run a function with a timeout (ms). Returns the function's result, or -1 on timeout or on
+# any failure: the pipe, the fork or the epoll set could not be made, or the child ended
+# without writing its 8-byte result (it crashed or exited early). Uses fork: the child runs
+# fn and writes the result down a pipe; the parent waits for it with the deadline. On a
+# timeout the child's whole tree is ended (TERM, grace, KILL — 6.6.11) and the child reaped.
+# ⛔ 6.6.10 — A WAKE IS NOT A RESULT. The parent took any EPOLLIN/HUP as "the child wrote its
+# result" and returned `load64(&rbuf)` after an unchecked read, so a body that crashed or
+# called exit, and a fork that FAILED (the parent closed wfd, epoll saw HUP at once), all
+# returned stale stack bytes as the fn's value (measured 6293997; on aarch64 the previous
+# call's value). And an unchecked sys_pipe left pipefd uninitialised, so the parent's close
+# of "its" fds closed the CALLER's (EBADF on the caller's fd 4 afterwards). Only an exact
+# 8-byte read is a result now; every other outcome reaps the child and returns -1.
+# CHANGELOG [6.6.10]
 fn async_timeout(fp, arg, ms): i64 {
     var pipefd[16];
-    sys_pipe(&pipefd);
+    if (sys_pipe(&pipefd) < 0) { return 0 - 1; }      # no fd was made: close none
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
     var pid = sys_fork();
+    if (pid < 0) {
+        syscall(SYS_CLOSE, rfd);
+        syscall(SYS_CLOSE, wfd);
+        return 0 - 1;
+    }
     if (pid == 0) {
         syscall(SYS_CLOSE, rfd);
         var result = fncall1(fp, arg);
@@ -181,29 +1224,45 @@ fn async_timeout(fp, arg, ms): i64 {
     }
     syscall(SYS_CLOSE, wfd);
     # Use epoll with timeout to wait for result
+    var got = 0 - 1;
+    var rbuf[8];
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
-    var ev[16];
-    store32(&ev, 1);
-    store64(&ev + 4, rfd);
-    syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev);
-    var revents[16];
-    var nr = sys_epoll_wait(epfd, &revents, 1, ms);
-    syscall(SYS_CLOSE, epfd);
-    if (nr > 0) {
-        # Child finished in time
-        var rbuf[8];
-        syscall(SYS_READ, rfd, &rbuf, 8);
-        syscall(SYS_CLOSE, rfd);
-        syscall(SYS_WAIT4, pid, 0, 0, 0);
-        return load64(&rbuf);
+    if (epfd >= 0) {
+        var ev[16];
+        store32(&ev, 1);
+        #ifdef CYRIUS_ARCH_AARCH64
+        store64(&ev + 8, rfd);        # epoll_data @8 on aarch64 (unpacked); @4 on x86 (v6.4.42)
+        #endif
+        #ifndef CYRIUS_ARCH_AARCH64
+        store64(&ev + 4, rfd);
+        #endif
+        var nr = 0;
+        if (syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev) >= 0) {
+            var revents[16];
+            nr = sys_epoll_wait(epfd, &revents, 1, ms);
+        }
+        syscall(SYS_CLOSE, epfd);
+        # Child finished in time — or died: only a whole 8-byte result counts.
+        if (nr > 0) { got = syscall(SYS_READ, rfd, &rbuf, 8); }
     }
-    # Timeout: kill child
-    syscall(SYS_KILL, pid, 9);
-    syscall(SYS_WAIT4, pid, 0, 0, 0);
+    # Timed out, or no result: end the body AND whatever it started. 6.6.11 — this SIGKILLed the
+    # body's pid alone, so a child the body had forked (measured: `/bin/sleep 8`) kept running
+    # at PPID 1 past the deadline. proc_kill_tree (TERM the tree, grace, KILL) reaps `pid` itself.
+    # A body that already EXITED without a result has had its children reparented before this
+    # walk, so only the timeout case — the measured one — reaches them. CHANGELOG [6.6.11]
+    if (got != 8) {
+        var ksb[8];
+        proc_kill_tree(pid, &ksb);
+    } else {
+        syscall(SYS_WAIT4, pid, 0, 0, 0);
+    }
     syscall(SYS_CLOSE, rfd);
-    return 0 - 1;
+    if (got != 8) { return 0 - 1; }
+    return load64(&rbuf);
 }
 
+#endif
+#endif
 #endif
 
 # ================================================================
@@ -256,39 +1315,165 @@ fn cancel_token_check(tok): i64 {
 }
 
 # ================================================================
+# Async RwLock (v6.4.41) — SHARED across all targets (plain state ops, no epoll). A
+# cooperative reader/writer lock for state a single-threaded reactor holds across an
+# await. Tasks are atomic between yields, so a lock is only needed ACROSS a yield — the
+# TRY-acquire family is what the cooperative model needs. A blocking await-until-free
+# acquire needs mid-body suspend (the execution-model follow-on) and is not provided
+# here. Layout: { writer_held (0/1), reader_count } = 16 bytes. For cross-THREAD sharing
+# use lib/thread.cyr's preemptive mutex; this is the reactor-cooperative lock.
+# ================================================================
+
+# Create a fresh async RwLock (unlocked). Returns a lock handle, or 0 on OOM.
+fn async_rwlock_new(): i64 {
+    var lk = alloc(16);
+    if (lk == 0) { return 0; }
+    store64(lk, 0);          # writer_held
+    store64(lk + 8, 0);      # reader_count
+    return lk;
+}
+
+# Try to take a shared (read) lock: returns 1 and bumps the reader count if no writer
+# holds it, else 0 (no wait). Pair with async_read_unlock.
+fn async_try_read_lock(lk): i64 {
+    if (lk == 0) { return 0; }
+    if (load64(lk) != 0) { return 0; }          # a writer holds it
+    store64(lk + 8, load64(lk + 8) + 1);
+    return 1;
+}
+
+# Release a shared (read) lock.
+fn async_read_unlock(lk): i64 {
+    if (lk == 0) { return 0; }
+    var rc = load64(lk + 8);
+    if (rc > 0) { store64(lk + 8, rc - 1); }
+    return 0;
+}
+
+# Try to take an exclusive (write) lock: returns 1 and marks it held if no writer AND no
+# readers hold it, else 0 (no wait). Pair with async_write_unlock.
+fn async_try_write_lock(lk): i64 {
+    if (lk == 0) { return 0; }
+    if (load64(lk) != 0) { return 0; }          # a writer holds it
+    if (load64(lk + 8) != 0) { return 0; }      # readers hold it
+    store64(lk, 1);
+    return 1;
+}
+
+# Release an exclusive (write) lock.
+fn async_write_unlock(lk): i64 {
+    if (lk == 0) { return 0; }
+    store64(lk, 0);
+    return 0;
+}
+
+# ================================================================
 # Futures (v6.3.11, G) — SHARED across all targets (pure fncallN dispatch, no
 # epoll/fork/syscalls). Backing for the `async fn` / `await` sugar:
 #
 #   async fn fetch(url): i64 { ... }      # compiles to a constructor that builds
-#   var f = fetch(addr);                  # a Future [ &fetch$impl, 1, addr ] (lazy)
+#   var f = fetch(addr);                  # a Future [ &fetch$impl, 1|FUT_MEMO, addr, done, value ] (lazy)
 #   var result = await f;                 # → future_force(f): runs the body, returns its value
 #
 # A Future is a heap object `[ impl_fn_ptr, argc, arg0, …, arg{argc-1} ]` produced
 # by the async-fn constructor (synthesized in PARSE_FN_DEF). Forcing it calls the
 # impl with the bundled args. The lazy shape means an `async fn` only runs when
 # awaited (or spawned + run) — matching the cooperative runtime above, where a
-# Future is exactly a task with its arguments bundled in. v1 re-runs the body on
-# each force; force-once memoization (cache the result + a done flag) is a follow-on
-# (CHANGELOG [6.3.11]). Requires lib/fnptr.cyr (already a hard requirement of this
-# file — async_run dispatches tasks via fncall1).
+# Future is exactly a task with its arguments bundled in.
+#
+# The argc word carries two compiler-set markers (src/frontend/parse_fn.cyr
+# `_async_argc_word`; the compiler and this file ship in LOCKSTEP):
+#   FUT_MEMO (256) — a compiler-built PLAIN Future, laid out
+#                    `[fp, argc|256, arg0 … arg{n-1}, done, value]`. It runs its body ONCE;
+#                    every later force answers from `value`. (It re-ran the body on every
+#                    force until 6.6.10 — `await F; await F;` ran it twice.)
+#   FUT_CORO (512) — a COROUTINE (an async fn that awaits mid-body), `[fp, 1|512, SELF,
+#                    state, …]`. Its impl takes SELF alone; each force resumes it once, and
+#                    once it has returned it answers with the same value and runs nothing
+#                    (CHANGELOG [6.6.8]).
+# A hand-built Future (`[fp, argc, args…]`, argc 0..8, no marker) is re-run on each force.
+# Requires lib/fnptr.cyr (already a hard requirement of this file — async_run dispatches
+# tasks via fncall1).
+var FUT_MEMO = 256;
+var FUT_CORO = 512;
+
+# Force a Future and return its value (0 for a null Future). See the layout above; the
+# header is never rewritten, so a force that re-enters the same Future (a spawned copy plus
+# a direct await) sees the same shape. CHANGELOG [6.6.10]
 fn future_force(fut): i64 {
     if (fut == 0) { return 0; }
-    var fp = load64(fut);
-    var argc = load64(fut + 8);
+    var aw = load64(fut + 8);
+    if ((aw & FUT_MEMO) == 0) {
+        var argc = aw;
+        if ((aw & FUT_CORO) != 0) { argc = aw & 255; }
+        return _future_call(load64(fut), argc, fut);
+    }
+    var n = aw & 255;
+    var mw = fut + 16 + n * 8;             # [done, value], past the arguments
+    if (load64(mw) == 1) { return load64(mw + 8); }
+    var v = _future_call(load64(fut), n, fut);
+    store64(mw + 8, v);
+    store64(mw, 1);
+    return v;
+}
+
+# 1 when `fut` is a coroutine Future that has not completed yet, else 0 (a plain or
+# hand-built Future is complete once forced). A coroutine's `await inner(..)` of a
+# coroutine Future re-suspends while this is 1, so the nested body is driven to its value.
+fn future_pending(fut): i64 {
+    if (fut == 0) { return 0; }
+    if ((load64(fut + 8) & FUT_CORO) == 0) { return 0; }
+    if (load64(fut + 24) == 0 - 1) { return 0; }   # C[state] == DONE (parse.cyr _coro_mark_done)
+    return 1;
+}
+
+# 1 when task `t`, which has just returned while still TASK_READY, is a COROUTINE that
+# suspended at an `await` that did not park — it must stay READY and be forced again, not be
+# finished with the 0 its suspend returned. Shared by all four backends' `_async_step`, which is why it lives
+# here, outside the epoll guard.
+# ⛔ 6.6.11 — every backend marked such a task DONE, so `await inner(a)` inside a spawned
+# coroutine ended it with 0 under async_run (measured: 0 where future_force gave 41), and the
+# guide wrote the defect down as a rule ("force such a coroutine yourself"). CHANGELOG [6.6.11]
+fn _async_coro_pending(t): i64 {
+    if (load64(t) != &future_force) { return 0; }
+    return future_pending(load64(t + 8));
+}
+
+# Call a Future's impl `fp` with its `argc` bundled arguments (fut+16 …). Split out of
+# future_force so the memo path calls the SAME ladder with the unmarked arity.
+fn _future_call(fp, argc, fut): i64 {
     if (argc == 0) { return fncall0(fp); }
     if (argc == 1) { return fncall1(fp, load64(fut + 16)); }
     if (argc == 2) { return fncall2(fp, load64(fut + 16), load64(fut + 24)); }
     if (argc == 3) { return fncall3(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32)); }
     if (argc == 4) {
         return fncall4(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-        load64(fut + 40));
+          load64(fut + 40));
     }
     if (argc == 5) {
         return fncall5(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-        load64(fut + 40), load64(fut + 48));
+          load64(fut + 40), load64(fut + 48));
     }
-    return fncall6(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-    load64(fut + 40), load64(fut + 48), load64(fut + 56));
+    if (argc == 6) {
+        return fncall6(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+          load64(fut + 40), load64(fut + 48), load64(fut + 56));
+    }
+    if (argc == 7) {
+        return fncall7(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+          load64(fut + 40), load64(fut + 48), load64(fut + 56), load64(fut + 64));
+    }
+    if (argc == 8) {
+        return fncall8(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
+          load64(fut + 40), load64(fut + 48), load64(fut + 56), load64(fut + 64),
+          load64(fut + 72));
+    }
+    # v6.5.70: past the fncall ladder's top rung. ⛔ THIS USED TO FALL THROUGH TO fncall6 —
+    # `argc >= 7` called the impl with six arguments, so arguments 7+ were never written and
+    # the body read stack garbage. A compiler-built Future can no longer get here (a plain
+    # async fn with 9+ parameters is refused at its declaration, 6.6.10); a hand-built one can.
+    sys_write(2, "future_force: async fn arity above 8 is not supported\n", 54);
+    sys_exit(70);
+    return 0;
 }
 
 # Spawn a Future onto an async runtime so async_run forces it cooperatively. The

@@ -3,8 +3,10 @@
 # ================================================================
 # sigil's x509 parser doesn't surface the SubjectAltName, so the client
 # walks the cert DER for the SAN extension (OID 2.5.29.17) and matches
-# its dNSName entries against the SNI host. Modern, SAN-only (the
-# legacy subject-CN fallback is deprecated by RFC 6125 §6.4.4).
+# the host against it: a DNS name against the dNSName entries, an IP
+# literal against the iPAddress entries, never across (RFC 9525 §6.3).
+# Modern, SAN-only (the legacy subject-CN fallback is deprecated by
+# RFC 6125 §6.4.4).
 
 # Read a DER TLV header at `pos`. Stores the content start in *out_cpos
 # and content length in *out_clen; returns the tag byte, or -1 on a
@@ -49,169 +51,107 @@ fn _tn_ci_eq(a, b, n): i64 {
     return 1;
 }
 
-# Match one dNSName (`dns`/`dns_len`) against `host` (RFC 6125): exact
-# case-insensitive, or a leftmost wildcard "*.domain" that matches
-# exactly one extra label (no embedded dot in the host's first label).
-fn _tn_host_match(dns, dns_len, host, host_len): i64 {
-    if (dns_len >= 2) {
-        if ((load8(dns) & 0xFF) == 0x2A) {
-            if ((load8(dns + 1) & 0xFF) == 0x2E) {
-                var suffix = dns + 1;            # ".domain.tld"
-                var suffix_len = dns_len - 1;
-                if (host_len <= suffix_len) { return 0; }
-                var firstdot = 0 - 1;
-                var i = 0;
-                while (i < host_len) {
-                    if ((load8(host + i) & 0xFF) == 0x2E) { firstdot = i; i = host_len; }
-                    else { i = i + 1; }
-                }
-                if (firstdot < 0) { return 0; }
-                if (host_len - firstdot != suffix_len) { return 0; }
-                return _tn_ci_eq(host + firstdot, suffix, suffix_len);
+# Is the presented dNSName `dns`/`dns_len` a wildcard pattern? OpenSSL's valid_star under the
+# X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS the libssl binder sets (lib/tls.cyr _TLS_LIBSSL_HOSTFLAGS):
+# "*." then at least two more labels — so the star stands over a label of a name with two or more
+# labels of its own ("*.com", "*." are not wildcards) — each label 1+ of [A-Za-z0-9-], not starting
+# or ending in '-', no second '*', no empty label and no trailing dot. 1 / 0. A dNSName this
+# refuses is compared LITERALLY (as OpenSSL does), so "*.com" matches only the host "*.com".
+# ⛔ 6.6.14 (CVE-67) — WHY. Native took any "*." prefix as a wildcard over the host's first label,
+# so a certificate for "*.com" verified every .com host, and "*.example.com.", "*.a_b.com" and
+# "*.*.example.com" matched names libssl refuses — the backends disagreed on what a certificate
+# binds. CHANGELOG [6.6.14]
+fn _tn_wildcard_ok(dns, dns_len): i64 {
+    if (dns_len < 2) { return 0; }
+    if ((load8(dns) & 0xFF) != 0x2A) { return 0; }          # '*'
+    if ((load8(dns + 1) & 0xFF) != 0x2E) { return 0; }      # '.'
+    var dots = 1;
+    var start = 1;                                          # at a label's first byte
+    var hyphen = 0;                                         # the last byte was '-'
+    var i = 2;
+    while (i < dns_len) {
+        var c = load8(dns + i) & 0xFF;
+        if (c == 0x2E) {
+            if (start == 1) { return 0; }                   # an empty label
+            if (hyphen == 1) { return 0; }                  # a label ending in '-'
+            start = 1;
+            dots = dots + 1;
+        } else {
+            if (c == 0x2D) {
+                if (start == 1) { return 0; }               # a label starting with '-'
+                hyphen = 1;
+            } else {
+                if (_tn_ldh_alnum(c) == 0) { return 0; }    # '*', '_', a NUL, any other byte
+                hyphen = 0;
             }
+            start = 0;
         }
+        i = i + 1;
+    }
+    if (start == 1) { return 0; }                           # a trailing dot
+    if (hyphen == 1) { return 0; }
+    if (dots < 2) { return 0; }
+    return 1;
+}
+
+# 1 for an ASCII letter or digit.
+fn _tn_ldh_alnum(c): i64 {
+    if (c >= 0x30) { if (c <= 0x39) { return 1; } }
+    if (c >= 0x41) { if (c <= 0x5A) { return 1; } }
+    if (c >= 0x61) { if (c <= 0x7A) { return 1; } }
+    return 0;
+}
+
+# Match one dNSName (`dns`/`dns_len`) against a DNS-name `host` exactly as OpenSSL's
+# X509_check_host does under the libssl binder's flags (NO_PARTIAL_WILDCARDS |
+# NEVER_CHECK_SUBJECT): a wildcard pattern (_tn_wildcard_ok) matches a host whose labels after the
+# first equal its own, case-insensitively, where that first label is non-empty and either the
+# single byte '*' or only [A-Za-z0-9-] (so one label, never two). Anything else is an exact
+# case-insensitive compare, and a dNSName holding a NUL byte never matches. CHANGELOG [6.6.14]
+fn _tn_host_match(dns, dns_len, host, host_len): i64 {
+    if (_tn_wildcard_ok(dns, dns_len) == 1) {
+        var suffix = dns + 1;                               # ".domain.tld"
+        var suffix_len = dns_len - 1;
+        var wl = host_len - suffix_len;                     # the bytes the star stands for
+        if (wl <= 0) { return 0; }
+        if (_tn_ci_eq(host + wl, suffix, suffix_len) == 0) { return 0; }
+        if (wl == 1) {
+            if ((load8(host) & 0xFF) == 0x2A) { return 1; }   # the literal "*" label
+        }
+        var i = 0;
+        while (i < wl) {
+            var c = load8(host + i) & 0xFF;
+            if (c != 0x2D) {
+                if (_tn_ldh_alnum(c) == 0) { return 0; }    # '.', '_', any non-LDH byte
+            }
+            i = i + 1;
+        }
+        return 1;
     }
     if (dns_len != host_len) { return 0; }
+    var k = 0;
+    while (k < dns_len) {
+        if ((load8(dns + k) & 0xFF) == 0) { return 0; }
+        k = k + 1;
+    }
     return _tn_ci_eq(dns, host, dns_len);
 }
 
-# Hex digit value (0-15) or -1. CVE-18: used by the IPv6 literal parser.
-fn _tn_hexval(c): i64 {
-    if (c >= 0x30) { if (c <= 0x39) { return c - 0x30; } }       # 0-9
-    if (c >= 0x61) { if (c <= 0x66) { return c - 0x61 + 10; } }  # a-f
-    if (c >= 0x41) { if (c <= 0x46) { return c - 0x41 + 10; } }  # A-F
-    return 0 - 1;
-}
+# The host classifier (`_tn_parse_ip_literal` and the strict IPv4 / IPv6 literal
+# parsers under it) lives in lib/tls_hostid.cyr, which lib/tls_native.cyr includes
+# before this file: the libssl backend classifies with the same code. CHANGELOG [6.6.13]
 
-# CVE-18 (v6.1.36): parse an IPv4 dotted-decimal literal (`host`/`host_len`)
-# into 4 network-order bytes at `out`. Returns 4 on success, 0 if not a
-# well-formed IPv4 literal. Used for iPAddress-SAN matching of IP connects.
-fn _tn_parse_ipv4(host, host_len, out): i64 {
-    var octet = 0;
-    var digits = 0;
-    var count = 0;
-    var i = 0;
-    while (i < host_len) {
-        var c = load8(host + i) & 0xFF;
-        if (c == 0x2E) {                        # '.'
-            if (digits == 0) { return 0; }
-            if (count >= 3) { return 0; }
-            store8(out + count, octet & 0xFF);
-            count = count + 1;
-            octet = 0;
-            digits = 0;
-        } else {
-            if (c < 0x30) { return 0; }
-            if (c > 0x39) { return 0; }
-            octet = octet * 10 + (c - 0x30);
-            if (octet > 255) { return 0; }
-            digits = digits + 1;
-            if (digits > 3) { return 0; }
-        }
-        i = i + 1;
-    }
-    if (digits == 0) { return 0; }
-    if (count != 3) { return 0; }
-    store8(out + 3, octet & 0xFF);
-    return 4;
-}
-
-# Parse colon-separated 16-bit hex groups of an IPv6 literal segment into
-# `out` (network order, max `max_bytes`). Returns bytes written or -1.
-fn _tn_ipv6_groups(s, slen, out, max_bytes): i64 {
-    var written = 0;
-    var group = 0;
-    var ghas = 0;
-    var i = 0;
-    while (i < slen) {
-        var c = load8(s + i) & 0xFF;
-        if (c == 0x3A) {                        # ':'
-            if (ghas == 0) { return 0 - 1; }
-            if (written + 2 > max_bytes) { return 0 - 1; }
-            store8(out + written, (group >> 8) & 0xFF);
-            store8(out + written + 1, group & 0xFF);
-            written = written + 2;
-            group = 0;
-            ghas = 0;
-        } else {
-            var hv = _tn_hexval(c);
-            if (hv < 0) { return 0 - 1; }
-            group = (group << 4) | hv;
-            if (group > 0xFFFF) { return 0 - 1; }
-            ghas = 1;
-        }
-        i = i + 1;
-    }
-    if (ghas == 1) {
-        if (written + 2 > max_bytes) { return 0 - 1; }
-        store8(out + written, (group >> 8) & 0xFF);
-        store8(out + written + 1, group & 0xFF);
-        written = written + 2;
-    }
-    return written;
-}
-
-# CVE-18: parse an IPv6 literal into 16 bytes at `out`. Supports one `::`
-# zero-compression. Returns 16 on success, 0 otherwise. (Embedded-IPv4 form
-# `::ffff:1.2.3.4` is not handled — vanishingly rare in iPAddress SANs.)
-fn _tn_parse_ipv6(host, host_len, out): i64 {
-    var z = 0;
-    while (z < 16) { store8(out + z, 0); z = z + 1; }
-    var dpos = 0 - 1;                            # index of "::" or -1
-    var i = 0;
-    while (i + 1 < host_len) {
-        if ((load8(host + i) & 0xFF) == 0x3A) {
-            if ((load8(host + i + 1) & 0xFF) == 0x3A) {
-                if (dpos >= 0) { return 0; }      # only one "::" allowed
-                dpos = i;
-            }
-        }
-        i = i + 1;
-    }
-    if (dpos < 0) {
-        if (_tn_ipv6_groups(host, host_len, out, 16) != 16) { return 0; }
-        return 16;
-    }
-    var head_len = dpos;
-    var tail_start = dpos + 2;
-    var tail_len = host_len - tail_start;
-    var hb = 0;
-    if (head_len > 0) {
-        hb = _tn_ipv6_groups(host, head_len, out, 16);
-        if (hb < 0) { return 0; }
-    }
-    var tailbuf[16];
-    var tb = 0;
-    if (tail_len > 0) {
-        tb = _tn_ipv6_groups(host + tail_start, tail_len, &tailbuf, 16 - hb);
-        if (tb < 0) { return 0; }
-    }
-    if (hb + tb > 16) { return 0; }
-    var k = 0;
-    while (k < tb) {
-        store8(out + (16 - tb) + k, load8(&tailbuf + k) & 0xFF);
-        k = k + 1;
-    }
-    return 16;
-}
-
-# CVE-18: parse `host` as an IP literal into `out`. Returns the byte length
-# (4 for IPv4, 16 for IPv6) or 0 if `host` is a domain name, not an IP.
-fn _tn_parse_ip_literal(host, host_len, out): i64 {
-    var has_colon = 0;
-    var i = 0;
-    while (i < host_len) {
-        if ((load8(host + i) & 0xFF) == 0x3A) { has_colon = 1; i = host_len; }
-        else { i = i + 1; }
-    }
-    if (has_colon == 1) { return _tn_parse_ipv6(host, host_len, out); }
-    return _tn_parse_ipv4(host, host_len, out);
-}
-
-# Walk a cert DER to its SubjectAltName extension and match `host` against the
-# dNSName entries (RFC 6125), and — CVE-18 (v6.1.36) — the iPAddress entries
-# when `host` is an IP literal. Returns 1 on a match, 0 otherwise.
+# Walk a cert DER to its SubjectAltName extension and match `host` against it.
+# The host is classified ONCE, up front (RFC 9525 §6.3, RFC 6125 §6.2.1): a DNS
+# name is compared with the dNSName entries only (exact or single-label
+# wildcard), an IP literal with the iPAddress entries only (CVE-18, octet for
+# octet), and a ':'-bearing non-literal with nothing — so neither DNS:127.0.0.1
+# nor DNS:*.0.0.1 verifies 127.0.0.1. CHANGELOG [6.6.13] (CVE-63).
+# Returns 1 on a match, 0 otherwise.
 fn _tn_cert_san_match(der, der_len, host, host_len): i64 {
+    var ipb[16];                                 # 16 BYTES (local-array rule)
+    var iplen = _tn_parse_ip_literal(host, host_len, &ipb);
+    if (iplen < 0) { return 0; }
     var cp = 0;
     var cl = 0;
     if (_tn_der_hdr(der, der_len, 0, &cp, &cl) != 0x30) { return 0; }   # Certificate
@@ -270,13 +210,13 @@ fn _tn_cert_san_match(der, der_len, host, host_len): i64 {
                                 var ntag = _tn_der_hdr(der, der_len, np, &ncp, &ncl);
                                 if (ntag < 0) { return 0; }
                                 if (ntag == 0x82) {
-                                    if (_tn_host_match(der + ncp, ncl, host, host_len) == 1) { return 1; }
+                                    # dNSName: a DNS-ID only — never an IP literal.
+                                    if (iplen == 0) {
+                                        if (_tn_host_match(der + ncp, ncl, host, host_len) == 1) { return 1; }
+                                    }
                                 }
                                 if (ntag == 0x87) {
-                                    # iPAddress SAN (CVE-18): match the raw 4/16
-                                    # octets when `host` is an IP literal.
-                                    var ipb[16];
-                                    var iplen = _tn_parse_ip_literal(host, host_len, &ipb);
+                                    # iPAddress (CVE-18): the raw 4/16 octets, IP-ID only.
                                     if (iplen > 0) {
                                         if (ncl == iplen) {
                                             if (_tn_ct_eq(der + ncp, &ipb, iplen) == 1) { return 1; }
@@ -297,8 +237,10 @@ fn _tn_cert_san_match(der, der_len, host, host_len): i64 {
 }
 
 # Client: verify the SNI host against the server cert's SubjectAltName
-# (.30). Returns TLS_OK on a match, TLS_ERR_CERT_HOSTNAME_MISMATCH if
-# no dNSName matches (or the cert has no SAN), or TLS_ERR_* on bad args.
+# (.30). Returns TLS_OK on a match, TLS_ERR_CERT_HOSTNAME_MISMATCH if no
+# SAN entry of the host's own type matches (dNSName for a DNS name,
+# iPAddress for an IP literal) or the cert has no SAN, or TLS_ERR_* on
+# bad args.
 fn tls_native_client_verify_hostname(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     var cert = load64(ctx + TLS_CTX_OFF_SERVER_CERT);
@@ -346,9 +288,11 @@ fn tls_native_set_version_range(ctx, min_ver, max_ver): i64 {
 # existing TLS_CTX_OFF_SOCK_FD slot (passed verbatim as the leaf helper's `fd`
 # arg — an fd for sockets, an opaque handle for a custom transport). So one
 # global vtable + the existing per-conn handle already covers a multi-connection
-# kernel TLS server. Going global also means ZERO change to the 25 _tn_sock_*
-# call sites — the leaf helpers + _tn_now_unix are the only edits, so a missed
-# site (the untyped-cyrius silent-miscompile risk) is impossible by construction.
+# kernel TLS server. Going global also means ZERO change to the record I/O
+# call sites — the two leaf helpers (_tn_io_read_full / _tn_io_write_all since
+# 6.6.13) + _tn_now_unix are the only readers, so a missed site (the
+# untyped-cyrius silent-miscompile risk) is impossible by construction. A
+# per-connection DEADLINE lives in the ctx instead (tls_native_set_deadline).
 #
 # 0 in any slot = "use the built-in default" (sys_read / sys_write / the
 # per-target _tn_now_unix body) — so the default path is byte-identical to
@@ -378,6 +322,10 @@ var _tn_tx_rand = 0;    # fn-ptr: rand(buf, n)          → bytes filled (==n on
 #   - A coherent set is the caller's responsibility: e.g. a custom read that
 #     polls against a custom now's deadline paired with a blocking default write
 #     can stall — keep the transport's read/write/clock semantics consistent.
+#   - A ctx deadline (tls_native_set_deadline, 6.6.13) bounds a custom transport only
+#     BETWEEN its calls: the handle is opaque and cannot be polled, so read_fn and
+#     write_fn must bound a single call themselves. With no deadline set the deadline
+#     code reads no clock at all, so a freestanding host needs no clock_now_ns().
 fn tls_native_set_transport(read_fn, write_fn, now_fn): i64 {
     _tn_tx_read = read_fn;
     _tn_tx_write = write_fn;
@@ -389,7 +337,7 @@ fn tls_native_set_transport(read_fn, write_fn, now_fn): i64 {
 # transport vtable covers read/write/now; this covers randomness). SEPARATE from
 # tls_native_set_transport so the existing 3-arg signature + its lib/tls.cyr
 # callers + vidya examples stay stable. rand_fn(buf, n) must fill n bytes and
-# return n on success (the getrandom contract; the 11 handshake call sites check
+# return n on success (the getrandom contract; every handshake call site checks
 # `!= n`). A bare-metal kernel installs its CSPRNG here at init; default 0 routes
 # to the platform sys_getrandom. Set ONCE before connect/accept. Returns TLS_OK.
 fn tls_native_set_entropy(rand_fn): i64 {
@@ -470,47 +418,92 @@ fn _tn_connect_verify(ctx): i64 {
 # TCP socket, already connect()'d). Blocking; returns TLS_OK when
 # handshake completes AND (CVE-18) the peer verifies per the ctx verify
 # mode, or a negative TLS_ERR_* on failure.
+# 6.6.15: a HelloRetryRequest is answered with the second ClientHello
+# (tls_native_client_process_hrr) — once; a ServerHello or HelloRetryRequest the client refuses
+# is answered with the alert the refusal recorded (_tn_send_hs_alert); every exit, success or
+# failure, zeroises our ephemeral private key and the shared secret (_tn_wipe_ephemeral) — the
+# steps that use them already have on the paths that reach them. CHANGELOG [6.6.15]
 fn tls_native_connect(ctx, sock_fd): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    var rc = 0;
     # A 1.2-pinned ctx (max_ver == 1.2) routes to the TLS 1.2 driver.
     if (load64(ctx + TLS_CTX_OFF_MAX_VER) == TLS_VERSION_1_2) {
-        return tls_native_connect_12(ctx, sock_fd);
+        rc = tls_native_connect_12(ctx, sock_fd);
+    } else {
+        rc = _tn_connect_hs(ctx, sock_fd);
     }
+    _tn_wipe_ephemeral(ctx);
+    return rc;
+}
+
+fn _tn_connect_hs(ctx, sock_fd): i64 {
     store64(ctx + TLS_CTX_OFF_SOCK_FD, sock_fd);
-    # Send ClientHello as a plaintext handshake record.
-    var ch = alloc(2048);
+    # Send ClientHello as a plaintext handshake record. Every buffer of the handshake comes from
+    # the ctx's allocator (6.6.13), so an arena-backed client gives it back on reset_via.
+    var ch = _tn_alloc(ctx, 2048);
     if (ch == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var chn = tls_native_client_build_hello(ctx, ch, 2048);
     if (chn < 0) { return chn; }
-    var chrec = alloc(chn + TLS_RECORD_HEADER_LEN);
+    var chrec = _tn_alloc(ctx, chn + TLS_RECORD_HEADER_LEN);
     if (chrec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     tls_native_record_write_header(chrec, TLS_CT_HANDSHAKE, 0x0303, chn);
     memcpy(chrec + TLS_RECORD_HEADER_LEN, ch, chn);
-    if (_tn_sock_write_all(sock_fd, chrec, chn + TLS_RECORD_HEADER_LEN) < 0) {
-        return _tn_ctx_fail(ctx, TLS_ERR_IO);
-    }
-    # Read the ServerHello (plaintext handshake record; skip any CCS).
+    var chw = _tn_io_write_all(ctx, sock_fd, chrec, chn + TLS_RECORD_HEADER_LEN);
+    if (chw < 0) { return _tn_ctx_fail(ctx, chw); }
+    # Read the ServerHello (plaintext handshake record; one middlebox CCS may come first).
     var cap = TLS_RECORD_MAX_CIPHERTEXT + TLS_RECORD_HEADER_LEN;
-    var inbuf = alloc(cap);
+    var inbuf = _tn_alloc(ctx, cap);
     if (inbuf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-    var rl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-    if (rl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
-    if ((load8(inbuf) & 0xFF) != TLS_CT_HANDSHAKE) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD); }
-    var pr = tls_native_client_parse_server_hello(ctx, inbuf + TLS_RECORD_HEADER_LEN, rl - TLS_RECORD_HEADER_LEN);
-    if (pr != TLS_OK) { return pr; }
+    var rl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+    if (rl < 0) { return _tn_read_fail(ctx, rl); }
+    var hx_rec = _tn_hs_expect_ct(ctx, load8(inbuf) & 0xFF, TLS_CT_HANDSHAKE);
+    if (hx_rec != TLS_OK) { return hx_rec; }
+    var shm = inbuf + TLS_RECORD_HEADER_LEN;
+    var shl = rl - TLS_RECORD_HEADER_LEN;
+    if (_tn_sh_is_hrr(shm, shl) == 1) {
+        # A HelloRetryRequest (RFC 8446 §4.1.4): the second ClientHello, its cookie echoed — which
+        # can make it longer than one record, hence the fragmenting writer.
+        var ch2cap = 2048 + shl;
+        var ch2 = _tn_alloc(ctx, ch2cap);
+        if (ch2 == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+        var ch2n = tls_native_client_process_hrr(ctx, shm, shl, ch2, ch2cap);
+        if (ch2n < 0) {
+            _tn_send_hs_alert(ctx, sock_fd);
+            return ch2n;
+        }
+        var c2cap = ch2n + TLS_RECORD_HEADER_LEN * (1 + ch2n / TLS_RECORD_MAX_PLAINTEXT);
+        var c2rec = _tn_alloc(ctx, c2cap);
+        if (c2rec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+        var c2rn = _tn_hs_plain_records(ch2, ch2n, c2rec, c2cap);
+        if (c2rn < 0) { return _tn_ctx_fail(ctx, c2rn); }
+        var c2w = _tn_io_write_all(ctx, sock_fd, c2rec, c2rn);
+        if (c2w < 0) { return _tn_ctx_fail(ctx, c2w); }
+        # The ServerHello (the server's one CCS may come first, after its HelloRetryRequest).
+        rl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+        if (rl < 0) { return _tn_read_fail(ctx, rl); }
+        var hx_rec2 = _tn_hs_expect_ct(ctx, load8(inbuf) & 0xFF, TLS_CT_HANDSHAKE);
+        if (hx_rec2 != TLS_OK) { return hx_rec2; }
+        shl = rl - TLS_RECORD_HEADER_LEN;
+    }
+    var pr = tls_native_client_parse_server_hello(ctx, shm, shl);
+    if (pr != TLS_OK) {
+        _tn_send_hs_alert(ctx, sock_fd);
+        return pr;
+    }
     # Read the server's encrypted flight (EE/Cert/CertVerify/Finished).
-    var frl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-    if (frl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+    var frl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+    if (frl < 0) { return _tn_read_fail(ctx, frl); }
     var rf = tls_native_client_recv_flight(ctx, inbuf, frl);
     if (rf != TLS_OK) { return rf; }
     # Verify the server Finished + send the client second flight. v6.2.8: this
     # may include the client Certificate + CertificateVerify (mTLS client-auth)
     # ahead of the Finished, so size for a cert chain (was 256 — Finished-only).
-    var fin = alloc(20480);
+    var fin = _tn_alloc(ctx, 20480);
     if (fin == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var finn = tls_native_client_finish(ctx, fin, 20480);
     if (finn < 0) { return finn; }
-    if (_tn_sock_write_all(sock_fd, fin, finn) < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+    var fw = _tn_io_write_all(ctx, sock_fd, fin, finn);
+    if (fw < 0) { return _tn_ctx_fail(ctx, fw); }
     # Install application-traffic keys (client_finish derived the master).
     var ik = tls_native_install_app_keys(ctx);
     if (ik != TLS_OK) { return ik; }
@@ -520,17 +513,315 @@ fn tls_native_connect(ctx, sock_fd): i64 {
 }
 
 # ----------------------------------------------------------------
-# Socket record I/O (.22)
+# The read path's error table (6.6.13): ONE mapping for every record read
 # ----------------------------------------------------------------
-# Read exactly `n` bytes from `fd` into `buf` (loops over partial
-# reads). Returns n, or a negative TLS_ERR_* on EOF / error. v6.2.4: reads
-# through the transport vtable — _tn_tx_read if installed, else the default
-# sys_read (byte-identical to pre-6.2.4). `fd` is the per-conn handle.
-fn _tn_sock_read_full(fd, buf, n): i64 {
+# What a native read reports, both from tls_native_read and from every handshake read site of
+# the 1.3 / 1.2 connect and accept drivers:
+#
+#   > 0                 bytes of application data (tls_native_read only)
+#   0                   the peer's warning-level close_notify. STICKY: every later read is 0.
+#   TLS_ERR_IO          the socket failed, or it closed with no close_notify (truncation). An
+#                       expired SO_RCVTIMEO is this row too: TLS_ERR_TIMEOUT is only the caller's
+#                       own deadline.
+#   TLS_ERR_TIMEOUT     the caller's deadline passed (tls_native_set_deadline) — the network or
+#                       the peer was too slow, nothing was malformed (6.6.13)
+#   TLS_ERR_BAD_RECORD  a malformed record: a header declaring more than the record ceiling
+#                       (record_overflow — the record reader's own answer since 6.6.13), a frame
+#                       too short to open, an alert that is not exactly 2 bytes, or a non-alert
+#                       record where a handshake record is due
+#   TLS_ERR_PROTOCOL    a ChangeCipherSpec the read site does not allow — a second one, one before
+#                       the ClientHello or after the peer's Finished, one that is not exactly the
+#                       byte 1 — or a TLS 1.2 Finished with no CCS before it (_tn_read_rec; an
+#                       unexpected_message alert is sent first, best effort) (6.6.13)
+#   TLS_ERR_DECRYPT     an AEAD tag mismatch (bad_record_mac: a tampered or misdirected record)
+#   TLS_ERR_ALERT       the peer sent an alert: every alert that is not warning-level
+#                       (close_notify included), every description other than close_notify and
+#                       user_canceled, and any alert in place of a handshake record — a plaintext
+#                       one where the handshake is plaintext (the TLS 1.2 peer's CCS slot included,
+#                       6.6.13), an opened one where it is encrypted, and a plaintext one where it
+#                       is encrypted (6.6.14, _tn_hs_plain_alert)
+#   other TLS_ERR_*     passed through unchanged (RECORD_OVERFLOW, OOM, ...)
+#
+# A warning-level user_canceled is dropped and the read goes on (RFC 8446 §6.1: close_notify
+# follows it). Every negative result FAILS the ctx (_tn_ctx_fail: state ERROR, LAST_ERR = the
+# code) and a later tls_native_read returns LAST_ERR again, so an attacked or truncated stream
+# never reads as a clean end of stream. A record write reports TLS_ERR_IO or TLS_ERR_TIMEOUT and
+# fails the ctx the same way.
+# ⛔ 6.6.13 — WHY. A sealed fatal alert left the ctx CONNECTED (the next read went back to the
+# socket), EOF was not sticky, a fatal-level close_notify read as EOF, user_canceled read as an
+# error, an over-length record read as TLS_ERR_IO, and every handshake read site reported the
+# peer's alert as TLS_ERR_BAD_RECORD. Issue 2026-09-30-tls-client-memory-and-alert-gaps (c);
+# CHANGELOG [6.6.13].
+
+# A negative record read (_tn_read_rec): fail the ctx with the table's code for it. Every code
+# (TLS_ERR_IO, TLS_ERR_TIMEOUT, TLS_ERR_BAD_RECORD, TLS_ERR_PROTOCOL, ...) is its own row. The
+# reader answers a header past the record ceiling with TLS_ERR_BAD_RECORD itself (6.6.13);
+# TLS_ERR_BUFFER_FULL is left for a caller buffer smaller than the ceiling, which no read site
+# has, and is mapped the same way.
+fn _tn_read_fail(ctx, rl): i64 {
+    var e = rl;
+    if (rl == TLS_ERR_BUFFER_FULL) { e = TLS_ERR_BAD_RECORD; }
+    return _tn_ctx_fail(ctx, e);
+}
+
+# What one received alert record means once the handshake is done (RFC 8446 §6, RFC 5246 §7.2):
+# `len` is its plaintext length, `level` / `desc` its two bytes. _TN_ALERT_EOF for a warning-level
+# close_notify, _TN_ALERT_IGNORE for a warning-level user_canceled, TLS_ERR_BAD_RECORD unless the
+# alert is exactly 2 bytes (alerts are never fragmented or coalesced, RFC 8446 §5.1), and
+# TLS_ERR_ALERT for everything else: every level other than warning — fatal, or one no RFC
+# defines — and every other description.
+fn _tn_alert_disposition(level, desc, len): i64 {
+    if (len != 2) { return TLS_ERR_BAD_RECORD; }
+    if (level != TLS_ALERT_WARNING) { return TLS_ERR_ALERT; }
+    if (desc == TLS_AD_CLOSE_NOTIFY) { return _TN_ALERT_EOF; }
+    if (desc == TLS_AD_USER_CANCELED) { return _TN_ALERT_IGNORE; }
+    return TLS_ERR_ALERT;
+}
+
+# A handshake read site's content type `ct` (a plaintext record's outer type, or an opened
+# record's inner type) against the type the handshake needs next (`want`): TLS_OK, else the ctx
+# failed with TLS_ERR_ALERT for an alert (any alert aborts a handshake, whatever its level) and
+# TLS_ERR_BAD_RECORD for anything else.
+fn _tn_hs_expect_ct(ctx, ct, want): i64 {
+    if (ct == want) { return TLS_OK; }
+    if (ct == TLS_CT_ALERT) { return _tn_ctx_fail(ctx, TLS_ERR_ALERT); }
+    return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD);
+}
+
+# A record (`rec`, `rl` bytes) read where an ENCRYPTED handshake record is due — the 1.3 client's
+# server flight, the 1.3 server's client flight, either TLS 1.2 peer's Finished after its CCS:
+# TLS_OK to go on and open it, or, when it is the peer's PLAINTEXT alert, the ctx failed with
+# TLS_ERR_ALERT. A plaintext alert is an alert record of exactly 2 bytes: a sealed record carries
+# a 16-byte tag, so no protected record is that short. Every other record goes on to be opened, and
+# a plaintext one fails there as before (TLS_ERR_BAD_RECORD or TLS_ERR_DECRYPT) — nothing
+# plaintext but this alert is answered. Any level aborts the handshake (as _tn_hs_expect_ct).
+# ⛔ 6.6.14 — WHY. A peer that sent its alert in the clear (it failed before its keys changed, or
+# does not seal its alerts) had the read site try to open it: TLS_ERR_BAD_RECORD, not the peer's
+# TLS_ERR_ALERT, at
+# exactly the points a refused handshake ends (a 1.3 server reading the client's second flight,
+# a 1.2 Finished in either direction). CHANGELOG [6.6.14]
+fn _tn_hs_plain_alert(ctx, rec, rl): i64 {
+    if ((load8(rec) & 0xFF) != TLS_CT_ALERT) { return TLS_OK; }
+    if (rl != TLS_RECORD_HEADER_LEN + 2) { return TLS_OK; }
+    return _tn_ctx_fail(ctx, TLS_ERR_ALERT);
+}
+
+# ----------------------------------------------------------------
+# Socket record I/O (.22) and the per-connection deadline (6.6.13)
+# ----------------------------------------------------------------
+# Every record read and write of a connection goes through the ctx forms below (_tn_io_*), which
+# honour the ctx's deadline (tls_native_set_deadline); with no deadline they are the pre-6.6.13
+# loops, reading no clock. The ctx-less _tn_sock_* names are their ctx == 0 forms. v6.2.4: the
+# leaves are the transport vtable's — _tn_tx_read / _tn_tx_write if installed, else the default
+# transport's _tn_os_read / _tn_os_write (6.6.14, below). `fd` is the per-conn handle.
+# ⛔ 6.6.13 (CVE-61) — WHY. A record read looped read(2) until the record was complete, with
+# no clock: a peer that sent one byte just inside SO_RCVTIMEO held a 16 KB record read for days,
+# and nothing in the client took a deadline (the transport vtable is process-global, so a caller
+# could not install a per-connection one either). Issue 2026-10-01-tls-native-no-deadline (b);
+# CHANGELOG [6.6.13].
+
+# Set an absolute deadline for every later read and write of `ctx`, the handshake included:
+# `abs_ns` is on lib/chrono's monotonic clock_now_ns() scale (clock_now_ns() + 5000000000 is five
+# seconds from now) and 0 clears it. It may be set before connect/accept and changed between reads.
+# Once it passes, the read or write in progress fails with TLS_ERR_TIMEOUT and the ctx fails with
+# it (a record may be half read: the stream cannot resume). Plaintext already held from an earlier
+# record is still delivered after the deadline — that needs no I/O — until a read must touch the
+# socket.
+# How it bounds, by transport:
+#   - the default transport (Linux, macOS, Windows): a read waits for readiness with the time left
+#     (fd_wait_ready — poll, or WSAPoll on Windows) and then reads once, so every byte costs a clock
+#     check; a write switches the fd to non-blocking for the call (O_NONBLOCK, or FIONBIO on a
+#     Windows socket), waits for writability with the time left, and restores the fd on every exit
+#     — its status flags on Linux / macOS; a Windows socket is left BLOCKING, because Windows cannot
+#     read FIONBIO back (the mode lib/net.cyr creates sockets in, as net_connect_sa_nb leaves them);
+#   - agnos, a tagged socket: sock_recv / sock_send take the time left themselves; a send can
+#     overshoot by one sock_send#48 stall (~8 s: the kernel waits for each segment's ACK inside the
+#     call and #48 takes no time bound — agnos needs a bounded send to close it);
+#   - a custom transport (tls_native_set_transport), an agnos fd that is not a socket, and a
+#     Windows HANDLE that is not a socket (a pipe, a file): the clock is checked BETWEEN calls only,
+#     so one call is bounded by the transport itself.
+# Returns TLS_OK, or TLS_ERR_INVALID_PARAM for ctx 0 or abs_ns < 0.
+fn tls_native_set_deadline(ctx, abs_ns): i64 {
+    if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (abs_ns < 0) { return TLS_ERR_INVALID_PARAM; }
+    store64(ctx + TLS_CTX_OFF_DEADLINE, abs_ns);
+    return TLS_OK;
+}
+
+# The ctx's deadline, or 0 (none set, or no ctx).
+fn _tn_deadline(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    return load64(ctx + TLS_CTX_OFF_DEADLINE);
+}
+
+# Wait until `fd` is readable (`want_write` == 0) or writable, or until deadline `dl` passes.
+# Returns 1 ready (an error or hang-up included: the next call reports it), 0 the deadline passed,
+# or a negative errno (the wait itself failed). An early or interrupted (-EINTR) wake re-checks the
+# clock and waits again.
+fn _tn_wait(fd, want_write, dl): i64 {
+    while (1 == 1) {
+        var rem = dl - clock_now_ns();
+        if (rem <= 0) { return 0; }
+        var ms = (rem + 999999) / 1000000;
+        if (ms > 0x7FFFFFFF) { ms = 0x7FFFFFFF; }
+        var r = fd_wait_ready(fd, want_write, ms);
+        if (r == 1) { return 1; }
+        if (r < 0) {
+            if (r != 0 - 4) { return r; }
+        }
+    }
+    return 0;
+}
+
+# 1 when the default read/write leaves can be waited on with fd_wait_ready before each call
+# (Linux, macOS, Windows), else 0 (agnos: bounded by the peer's own deadline-taking calls).
+fn _tn_can_poll(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return 1;
+    #endif
+}
+
+# ----------------------------------------------------------------
+# The default transport's leaves (6.6.14)
+# ----------------------------------------------------------------
+# One read / one write of the default transport (no tls_native_set_transport), per target:
+#   Linux    read(2); send(fd, buf, n, MSG_NOSIGNAL) — write(2) for an fd that is not a socket
+#   macOS    read(2) / write(2), the socket set SO_NOSIGPIPE once per connection (_tn_nosigpipe)
+#   Windows  ws2_32 recv / send — ReadFile / WriteFile for a HANDLE that is not a socket
+#   agnos    read / write: the peer routes a tagged socket fd to sock_recv#49 / sock_send#48, and
+#            agnos raises no signal for a dead connection (#48 answers -1)
+# Each returns the byte count, 0 (read: end of stream), or a negative error: -errno, or on
+# Windows -WSAGetLastError (_tn_eagain and _tn_is_notsock read those).
+# ⛔ 6.6.14 — WHY. (a) The leaves were sys_read / sys_write on every target, and on Windows those
+# are ReadFile / WriteFile, which fail on a Winsock SOCKET: native TLS could not run over a
+# lib/net.cyr socket there at all (roadmap backlog j). (b) A flagless write(2) to a peer that had
+# reset the connection raised SIGPIPE, which KILLED a native TLS client or server that had not
+# ignored it — any peer could end the process (CVE-66). The process-global signal disposition is
+# left alone: the protection is per write (Linux) or per socket (macOS). A pipe or a file keeps
+# write(2)'s SIGPIPE — neither OS has a per-call flag for one. CHANGELOG [6.6.14]
+
+# _tn_nb_write_all's answer for a Windows HANDLE that is not a socket (FIONBIO refused it): the
+# caller writes it through the between-calls loop instead. Private; no TLS_ERR_* value.
+var _TN_NB_NOT_SOCK = 0 - 4096;
+
+#ifdef CYRIUS_TARGET_WIN
+# The calling thread's last Winsock error, negated; never 0 (cf. lib/net.cyr's _net_wsa_err —
+# tls_native does not include net.cyr).
+fn _tn_win_sockerr(): i64 {
+    var e = syscall(0xF024) & 0xFFFFFFFF;          # WSAGetLastError
+    if (e == 0) { return 0 - 1; }
+    return 0 - e;
+}
+#endif
+
+# 1 when `e` (a leaf's or a wait's negative result) says `fd` is not a socket at all, so the
+# default transport falls back to the HANDLE path: Windows only (WSAENOTSOCK, or
+# WSANOTINITIALISED — no socket exists in a process that never started Winsock).
+fn _tn_is_notsock(e): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var code = (0 - e) & 0xFFFFFFFF;                 # only eax is defined by WSAGetLastError
+    if (code == 10038) { return 1; }                 # WSAENOTSOCK
+    if (code == 10093) { return 1; }                 # WSANOTINITIALISED
+    #endif
+    return 0;
+}
+
+# Read up to `n` bytes from `fd`.
+fn _tn_os_read(fd, buf, n): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var len = n;
+    if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }       # recv takes an int length
+    var r = syscall(0xF048, fd, buf, len, 0);        # recv
+    if (r >= 0) { return r; }
+    var e = _tn_win_sockerr();
+    if (_tn_is_notsock(e) == 1) { return sys_read(fd, buf, n); }    # a pipe / file HANDLE
+    return e;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_read(fd, buf, n);
+    #endif
+}
+
+# Write up to `n` bytes to `fd`, never raising SIGPIPE on a socket (see the block above).
+fn _tn_os_write(fd, buf, n): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var len = n;
+    if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }       # send takes an int length; a short write is legal
+    var w = syscall(0xF047, fd, buf, len, 0);        # send
+    if (w >= 0) { return w; }
+    var e = _tn_win_sockerr();
+    if (_tn_is_notsock(e) == 1) { return sys_write(fd, buf, n); }   # a pipe / file HANDLE
+    return e;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    var s = sys_sendto(fd, buf, n, 0x4000, 0, 0);    # MSG_NOSIGNAL: EPIPE, never SIGPIPE
+    if (s == 0 - 88) { return sys_write(fd, buf, n); }   # ENOTSOCK: a pipe / file fd
+    return s;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    #ifndef CYRIUS_TARGET_LINUX
+    return sys_write(fd, buf, n);                    # macOS (SO_NOSIGPIPE: _tn_nosigpipe), agnos
+    #endif
+    #endif
+}
+
+# macOS: MSG_NOSIGNAL is not relied on (SO_NOSIGPIPE works on every Darwin): SO_NOSIGPIPE
+# (SOL_SOCKET 0xFFFF, 0x1022) makes every write on the socket answer EPIPE instead of raising
+# SIGPIPE. Set once per connection, before its first write — the ctx remembers the fd it covered
+# (TLS_CTX_OFF_NOSIGPIPE = fd + 1); a ctx-less write sets it every time. Returns 0, or the
+# setsockopt error: anything but ENOTSOCK (38: a pipe or a file, which keeps write(2)'s SIGPIPE)
+# fails the write CLOSED, because a socket we could not protect may be written into a reset — xnu
+# answers EINVAL for a socket already shut down both ways, which is what an RST leaves. Every
+# other target: 0, nothing to do.
+fn _tn_nosigpipe(ctx, fd): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    if (ctx != 0) {
+        if (load64(ctx + TLS_CTX_OFF_NOSIGPIPE) == fd + 1) { return 0; }
+    }
+    var one[8];
+    store64(&one, 1);
+    var r = sys_setsockopt(fd, 0xFFFF, 0x1022, &one, 4);    # SOL_SOCKET, SO_NOSIGPIPE
+    if (r < 0) {
+        if (r != 0 - 38) { return r; }               # ENOTSOCK is the only failure that is not one
+    }
+    if (ctx != 0) { store64(ctx + TLS_CTX_OFF_NOSIGPIPE, fd + 1); }
+    #endif
+    return 0;
+}
+
+# Read exactly `n` bytes from `fd` into `buf` (loops over partial reads) under ctx's deadline.
+# Returns n, TLS_ERR_TIMEOUT when the deadline passes first, or TLS_ERR_IO on EOF / error.
+fn _tn_io_read_full(ctx, fd, buf, n): i64 {
+    var dl = _tn_deadline(ctx);
     var rf = _tn_tx_read;
-    if (rf == 0) { rf = &sys_read; }
+    var poll = 0;
+    if (rf == 0) {
+        rf = &_tn_os_read;
+        poll = _tn_can_poll();
+        #ifdef CYRIUS_TARGET_AGNOS
+        if (dl != 0) {
+            if (_agnos_is_sock_fd(fd) == 1) { return _tn_agnos_read_full(fd, buf, n, dl); }
+        }
+        #endif
+    }
     var got = 0;
     while (got < n) {
+        if (dl != 0) {
+            if (poll == 1) {
+                var wr = _tn_wait(fd, 0, dl);
+                if (wr == 0) { return TLS_ERR_TIMEOUT; }
+                if (wr < 0) {
+                    if (_tn_is_notsock(wr) == 0) { return TLS_ERR_IO; }
+                    poll = 0;                        # a Windows HANDLE: bounded between calls
+                    if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+                }
+            } else {
+                if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+            }
+        }
         var r = fncall3(rf, fd, buf + got, n - got);
         if (r <= 0) { return TLS_ERR_IO; }
         got = got + r;
@@ -538,51 +829,324 @@ fn _tn_sock_read_full(fd, buf, n): i64 {
     return n;
 }
 
-# Read one TLS record from `fd`: the 5-byte header, then the
-# header-declared fragment length. Returns the total record length
-# (5 + length), or a negative TLS_ERR_*.
-fn _tn_sock_read_record(fd, buf, buf_max): i64 {
-    if (buf_max < TLS_RECORD_HEADER_LEN) { return TLS_ERR_BUFFER_FULL; }
-    if (_tn_sock_read_full(fd, buf, TLS_RECORD_HEADER_LEN) < 0) { return TLS_ERR_IO; }
-    var len = _tn_be16_r(buf + 3);
-    if (len < 0) { return TLS_ERR_BAD_RECORD; }
-    if (TLS_RECORD_HEADER_LEN + len > buf_max) { return TLS_ERR_BUFFER_FULL; }
-    if (len > 0) {
-        if (_tn_sock_read_full(fd, buf + TLS_RECORD_HEADER_LEN, len) < 0) { return TLS_ERR_IO; }
-    }
-    return TLS_RECORD_HEADER_LEN + len;
-}
-
-# Read the next record from `fd`, skipping any ChangeCipherSpec
-# records (content type 20). In TLS 1.3 "middlebox compatibility mode"
-# a peer (e.g. OpenSSL) sends a dummy CCS after its first flight; per
-# RFC 8446 §5 it MUST be ignored. Returns the first non-CCS record's
-# length, or a negative TLS_ERR_*.
-fn _tn_sock_read_record_skip_ccs(fd, buf, buf_max): i64 {
-    var done = 0;
-    var rl = 0;
-    while (done == 0) {
-        rl = _tn_sock_read_record(fd, buf, buf_max);
-        if (rl < 0) { return rl; }
-        if ((load8(buf) & 0xFF) != TLS_CT_CHANGE_CIPHER_SPEC) { done = 1; }
-    }
-    return rl;
-}
-
-# Write all `len` bytes of `buf` to `fd` (loops over partial writes).
-# Returns len, or TLS_ERR_IO. v6.2.4: writes through the transport vtable —
-# _tn_tx_write if installed, else the default sys_write (byte-identical to
-# pre-6.2.4). `fd` is the per-conn handle.
-fn _tn_sock_write_all(fd, buf, len): i64 {
+# Write all `len` bytes of `buf` to `fd` (loops over partial writes) under ctx's deadline.
+# Returns len, TLS_ERR_TIMEOUT when the deadline passes first (an expired one before any I/O), or
+# TLS_ERR_IO — a peer that reset the connection included (no SIGPIPE: _tn_os_write).
+fn _tn_io_write_all(ctx, fd, buf, len): i64 {
+    var dl = _tn_deadline(ctx);
     var wf = _tn_tx_write;
-    if (wf == 0) { wf = &sys_write; }
+    if (dl != 0) {
+        if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+    }
+    if (wf == 0) {
+        if (_tn_nosigpipe(ctx, fd) < 0) { return TLS_ERR_IO; }
+        if (dl != 0) {
+            #ifdef CYRIUS_TARGET_AGNOS
+            if (_agnos_is_sock_fd(fd) == 1) { return _tn_agnos_write_all(fd, buf, len, dl); }
+            #endif
+            if (_tn_can_poll() == 1) {
+                var nb = _tn_nb_write_all(fd, buf, len, dl);
+                if (nb != _TN_NB_NOT_SOCK) { return nb; }
+            }
+        }
+        wf = &_tn_os_write;
+    }
     var sent = 0;
     while (sent < len) {
+        if (dl != 0) {
+            if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+        }
         var w = fncall3(wf, fd, buf + sent, len - sent);
         if (w <= 0) { return TLS_ERR_IO; }
         sent = sent + w;
     }
     return len;
+}
+
+# The would-block error the default write leaf answers on this target, as a positive number:
+# EAGAIN — Darwin 35, Linux 11 — or WSAEWOULDBLOCK (10035) on Windows. Literals, because a
+# program-wide enum may redefine the names (cf. _fd_o_nonblock).
+fn _tn_eagain(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 35;
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 10035;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    #ifndef CYRIUS_TARGET_WIN
+    return 11;
+    #endif
+    #endif
+}
+
+# Make `fd` non-blocking for one write: the state to hand _tn_nb_off, or a negative error.
+# Linux / macOS: O_NONBLOCK (the saved status flags). Windows: ioctlsocket(FIONBIO, 1) — 0.
+fn _tn_nb_on(fd): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var v[8];
+    store64(&v, 1);
+    if (syscall(0xF049, fd, 0x8004667E, &v) != 0) { return _tn_win_sockerr(); }   # FIONBIO
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return fd_set_nonblocking(fd);
+    #endif
+}
+
+# Undo _tn_nb_on. Windows cannot read FIONBIO back, so a socket is left BLOCKING there.
+fn _tn_nb_off(fd, saved): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var v[8];
+    store64(&v, 0);
+    syscall(0xF049, fd, 0x8004667E, &v);             # FIONBIO 0
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return fd_restore_flags(fd, saved);
+    #endif
+}
+
+# The default transport's deadline-bounded write (Linux, macOS, Windows): the fd is non-blocking
+# for the duration — a write either moves bytes or answers would-block, which waits for
+# writability with the time left — and it is restored on every exit (_tn_nb_off). The clock is
+# re-checked after each partial write too, so a peer that reads a trickle cannot stretch the call
+# past the deadline. _TN_NB_NOT_SOCK for a Windows HANDLE that is not a socket.
+fn _tn_nb_write_all(fd, buf, len, dl): i64 {
+    var saved = _tn_nb_on(fd);
+    if (saved < 0) {
+        if (_tn_is_notsock(saved) == 1) { return _TN_NB_NOT_SOCK; }
+        return TLS_ERR_IO;
+    }
+    var res = len;
+    var sent = 0;
+    var more = 1;
+    while (more == 1) {
+        var w = _tn_os_write(fd, buf + sent, len - sent);
+        if (w > 0) {
+            sent = sent + w;
+            if (sent >= len) { more = 0; }
+            elif (clock_now_ns() >= dl) { res = TLS_ERR_TIMEOUT; more = 0; }
+        } else {
+            var again = 0;
+            if (w == 0 - _tn_eagain()) { again = 1; }
+            if (w == 0 - 4) { again = 1; }                   # EINTR
+            if (again == 0) { res = TLS_ERR_IO; more = 0; }
+            else {
+                var wr = _tn_wait(fd, 1, dl);
+                if (wr == 0) { res = TLS_ERR_TIMEOUT; more = 0; }
+                elif (wr < 0) { res = TLS_ERR_IO; more = 0; }
+            }
+        }
+    }
+    _tn_nb_off(fd, saved);
+    return res;
+}
+
+#ifdef CYRIUS_TARGET_AGNOS
+# agnos, a tagged socket fd: sock_recv with the time left as its own bound (µs); its -11 is the
+# deadline when the clock agrees, anything else a failure.
+fn _tn_agnos_read_full(fd, buf, n, dl): i64 {
+    var c = _agnos_fd_conn(fd);
+    if (c < 0) { return TLS_ERR_IO; }
+    var got = 0;
+    while (got < n) {
+        var rem = dl - clock_now_ns();
+        if (rem <= 0) { return TLS_ERR_TIMEOUT; }
+        var r = _agnos_sock_recv_block(c, buf + got, n - got, (rem + 999) / 1000);
+        if (r <= 0) {
+            if (r == 0 - 11) {
+                if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+            }
+            return TLS_ERR_IO;
+        }
+        got = got + r;
+    }
+    return n;
+}
+
+# agnos, a tagged socket fd: one sock_send loop whose bound is the WHOLE transfer (rearm 0), the
+# time left in µs.
+fn _tn_agnos_write_all(fd, buf, len, dl): i64 {
+    var c = _agnos_fd_conn(fd);
+    if (c < 0) { return TLS_ERR_IO; }
+    var rem = dl - clock_now_ns();
+    if (rem <= 0) { return TLS_ERR_TIMEOUT; }
+    var w = _agnos_sock_send_dl(c, buf, len, (rem + 999) / 1000, 0);
+    if (w == len) { return len; }
+    if (clock_now_ns() >= dl) { return TLS_ERR_TIMEOUT; }
+    return TLS_ERR_IO;
+}
+#endif
+
+# Read one TLS record from `fd` under ctx's deadline: the 5-byte header, then the header-declared
+# fragment. Returns the total record length (5 + length), or a negative TLS_ERR_*: the reader's
+# own TLS_ERR_IO / TLS_ERR_TIMEOUT, TLS_ERR_BAD_RECORD for a header declaring more than
+# TLS_RECORD_MAX_CIPHERTEXT (record_overflow, RFC 8446 §5.2 — checked before the caller's buffer),
+# or TLS_ERR_BUFFER_FULL for a record that fits the ceiling but not `buf_max`.
+fn _tn_io_read_record(ctx, fd, buf, buf_max): i64 {
+    if (buf_max < TLS_RECORD_HEADER_LEN) { return TLS_ERR_BUFFER_FULL; }
+    var hr = _tn_io_read_full(ctx, fd, buf, TLS_RECORD_HEADER_LEN);
+    if (hr < 0) { return hr; }
+    var len = _tn_be16_r(buf + 3);
+    if (len < 0) { return TLS_ERR_BAD_RECORD; }
+    if (len > TLS_RECORD_MAX_CIPHERTEXT) { return TLS_ERR_BAD_RECORD; }
+    if (TLS_RECORD_HEADER_LEN + len > buf_max) { return TLS_ERR_BUFFER_FULL; }
+    if (len > 0) {
+        var br = _tn_io_read_full(ctx, fd, buf + TLS_RECORD_HEADER_LEN, len);
+        if (br < 0) { return br; }
+    }
+    return TLS_RECORD_HEADER_LEN + len;
+}
+
+# The ctx == 0 forms (no deadline), kept for callers holding no ctx.
+fn _tn_sock_read_full(fd, buf, n): i64 { return _tn_io_read_full(0, fd, buf, n); }
+fn _tn_sock_read_record(fd, buf, buf_max): i64 { return _tn_io_read_record(0, fd, buf, buf_max); }
+fn _tn_sock_write_all(fd, buf, len): i64 { return _tn_io_write_all(0, fd, buf, len); }
+
+# ----------------------------------------------------------------
+# ChangeCipherSpec: one policy per record read site (6.6.13)
+# ----------------------------------------------------------------
+# A CCS is a plaintext, unauthenticated record, `14 03 03 00 01 01`. TLS 1.3 (RFC 8446 §5) lets a
+# peer send ONE, for middlebox compatibility, after the first ClientHello and before its Finished,
+# and it is dropped; TLS 1.2 (RFC 5246 §7.1) has exactly one per direction, directly before the
+# Finished. Any other CCS — and a CCS that is not exactly the byte 1 — ends the connection with
+# TLS_ERR_PROTOCOL after an unexpected_message alert. The 15 record read sites:
+#   1.3 client  ServerHello or HelloRetryRequest, the ServerHello after
+#               a HelloRetryRequest, server flight (tls_native_connect
+#               x3, tls_native_client_recv_flight)                      _TN_CCS_MAY
+#   1.3 server  ClientHello (tls_native_accept)                         _TN_CCS_REFUSE
+#   1.3 server  the second ClientHello, after our HelloRetryRequest     _TN_CCS_MAY
+#   1.3 server  client Certificate, CertificateVerify, Finished         _TN_CCS_MAY
+#   1.2 client  server flight (tls_native_connect_12)                   _TN_CCS_REFUSE
+#   1.2 client  server Finished                                         _TN_CCS_MUST
+#   1.2 server  ClientHello (tls_native_accept_12), ClientKeyExchange   _TN_CCS_REFUSE
+#   1.2 server  client Finished (_tn_12_server_drive)                   _TN_CCS_MUST
+#   both        tls_native_read, after the handshake                    _TN_CCS_REFUSE
+# The window closes at the read that carries the peer's Finished. A HelloRetryRequest opens no
+# second window: the peer's one CCS comes after the HelloRetryRequest / before the second
+# ClientHello or after the ServerHello / before its encrypted flight (RFC 8446 §D.4), never both
+# (6.6.15). ctx CCS_STATE bit0 records the peer's CCS.
+# ⛔ 6.6.13 (CVE-61) — WHY. Every read went through one helper that dropped ANY number of CCS
+# records, during the handshake and after it: one CCS more often than the read timeout — from
+# anyone on the path, no key needed — held a client thread for ever, even inside a verified
+# session. That helper is deleted; no read skips a CCS outside this policy. Issue
+# 2026-10-01-tls-native-no-deadline (a); CHANGELOG [6.6.13].
+
+# Read one record under CCS `policy` (_TN_CCS_*). Returns the record length, or a negative
+# TLS_ERR_*: the reader's (_tn_io_read_record); TLS_ERR_PROTOCOL — the ctx failed and the alert
+# sent — for a CCS the policy does not allow, a malformed CCS, or (MUST) any other record in its
+# place; or (MUST) TLS_ERR_ALERT for an alert in its place, which is the peer's own plaintext
+# alert (its write state has not changed yet) and is not answered.
+fn _tn_read_rec(ctx, fd, buf, cap, policy): i64 {
+    var rl = _tn_io_read_record(ctx, fd, buf, cap);
+    if (rl < 0) { return rl; }
+    var ct = load8(buf) & 0xFF;
+    if (ct != TLS_CT_CHANGE_CIPHER_SPEC) {
+        if (policy == _TN_CCS_MUST) {
+            if (ct == TLS_CT_ALERT) { return _tn_ctx_fail(ctx, TLS_ERR_ALERT); }
+            return _tn_ccs_violation(ctx, fd);                  # e.g. a Finished with no CCS
+        }
+        return rl;
+    }
+    if (policy == _TN_CCS_REFUSE) { return _tn_ccs_violation(ctx, fd); }
+    if (rl != TLS_RECORD_HEADER_LEN + 1) { return _tn_ccs_violation(ctx, fd); }
+    if ((load8(buf + TLS_RECORD_HEADER_LEN) & 0xFF) != 1) { return _tn_ccs_violation(ctx, fd); }
+    var st = load64(ctx + TLS_CTX_OFF_CCS_STATE);
+    if ((st & 1) != 0) { return _tn_ccs_violation(ctx, fd); }        # one per connection
+    store64(ctx + TLS_CTX_OFF_CCS_STATE, st | 1);
+    rl = _tn_io_read_record(ctx, fd, buf, cap);
+    if (rl < 0) { return rl; }
+    if ((load8(buf) & 0xFF) == TLS_CT_CHANGE_CIPHER_SPEC) { return _tn_ccs_violation(ctx, fd); }
+    return rl;
+}
+
+# A CCS outside its window: tell the peer (unexpected_message, RFC 8446 §5) and fail the ctx.
+fn _tn_ccs_violation(ctx, fd): i64 {
+    _tn_send_fatal_alert(ctx, fd, TLS_AD_UNEXPECTED_MESSAGE);
+    return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+}
+
+# Send a fatal alert `desc`, best effort: its result is ignored, and it goes through the
+# deadline-aware writer, so an expired deadline sends nothing. It is plaintext while our writes
+# still are, else sealed under our current write keys (RFC 8446 §6): in TLS 1.3 our application
+# keys once installed, else our handshake-traffic keys once installed — the client writes under
+# its handshake key from the ServerHello until its own Finished, so a violation at its flight
+# reads is sealed under that key; the server installs its app keys before its first
+# post-ServerHello read; in TLS 1.2 our keys once our CCS has been sent (CCS_STATE bit1).
+fn _tn_send_fatal_alert(ctx, fd, desc): i64 {
+    var al[2];
+    store8(&al, TLS_ALERT_FATAL);
+    store8(&al + 1, desc);
+    var sealed = 0;
+    var hk = 0;
+    var hiv = 0;
+    var hseq = 0;
+    if (load64(ctx + TLS_CTX_OFF_VERSION) == TLS_VERSION_1_2) {
+        if ((load64(ctx + TLS_CTX_OFF_CCS_STATE) & 2) != 0) { sealed = 1; }
+    } else {
+        var ko = TLS_CTX_OFF_SRV_APP_KEY;
+        hk = load64(ctx + TLS_CTX_OFF_SRV_HS_KEY);
+        hiv = load64(ctx + TLS_CTX_OFF_SRV_HS_IV);
+        hseq = ctx + TLS_CTX_OFF_SRV_SEQ;
+        if (load64(ctx + TLS_CTX_OFF_ROLE) == TLS_ROLE_CLIENT) {
+            ko = TLS_CTX_OFF_CLI_APP_KEY;
+            hk = load64(ctx + TLS_CTX_OFF_CLI_HS_KEY);
+            hiv = load64(ctx + TLS_CTX_OFF_CLI_HS_IV);
+            hseq = ctx + TLS_CTX_OFF_CLI_SEQ;
+        }
+        if (load64(ctx + ko) != 0) {
+            sealed = 1;
+        } else {
+            if (hk != 0) { sealed = 2; }
+        }
+    }
+    var rec[64];
+    var rn = 0;
+    if (sealed == 1) {
+        rn = _tn_seal_ct(ctx, TLS_CT_ALERT, &al, 2, &rec, 64);
+    } elif (sealed == 2) {
+        rn = tls_native_record_seal(load64(ctx + TLS_CTX_OFF_CIPHER), hk, hiv, hseq, TLS_CT_ALERT,
+          &al, 2, &rec, 64);
+    } else {
+        tls_native_record_write_header(&rec, TLS_CT_ALERT, 0x0303, 2);
+        memcpy(&rec + TLS_RECORD_HEADER_LEN, &al, 2);
+        rn = TLS_RECORD_HEADER_LEN + 2;
+    }
+    if (rn > 0) { _tn_io_write_all(ctx, fd, &rec, rn); }
+    return 0;
+}
+
+# Send the alert a refusing handshake step recorded (_tn_hs_fail; TLS_CTX_OFF_HS_ALERT), best effort
+# and at most once, then clear it. Nothing recorded sends nothing. Returns 0. CHANGELOG [6.6.15]
+fn _tn_send_hs_alert(ctx, fd): i64 {
+    var desc = load64(ctx + TLS_CTX_OFF_HS_ALERT);
+    if (desc == 0) { return 0; }
+    store64(ctx + TLS_CTX_OFF_HS_ALERT, 0);
+    _tn_send_fatal_alert(ctx, fd, desc);
+    return 0;
+}
+
+# A server refusing the client's authentication (6.6.14, CVE-64): tell the client why with a fatal
+# alert (best effort, _tn_send_fatal_alert) and fail the ctx with `rc`, which is returned.
+# `empty` = 1 when the client presented no certificate under TLS_VERIFY_FAIL_IF_NO_PEER_CERT:
+# certificate_required in TLS 1.3 (`is13`, RFC 8446 §4.4.2.4), handshake_failure in 1.2 (RFC 5246
+# §7.4.6). Otherwise by `rc`: a chain that does not verify is bad_certificate, a malformed
+# message decode_error, a signature that does not verify decrypt_error, a scheme we did not offer
+# illegal_parameter.
+fn _tn_client_auth_alert(ctx, fd, rc, empty, is13): i64 {
+    var desc = TLS_AD_INTERNAL_ERROR;
+    if (rc == TLS_ERR_CERT_INVALID) { desc = TLS_AD_BAD_CERTIFICATE; }
+    if (rc == TLS_ERR_BAD_HANDSHAKE) { desc = TLS_AD_DECODE_ERROR; }
+    if (rc == TLS_ERR_AUTHN) { desc = TLS_AD_DECRYPT_ERROR; }
+    if (rc == TLS_ERR_KEY_UNSUPPORTED) { desc = TLS_AD_ILLEGAL_PARAMETER; }
+    if (rc == TLS_ERR_PROTOCOL) { desc = TLS_AD_UNEXPECTED_MESSAGE; }
+    if (empty == 1) {
+        desc = TLS_AD_HANDSHAKE_FAILURE;
+        if (is13 == 1) { desc = TLS_AD_CERTIFICATE_REQUIRED; }
+    }
+    _tn_send_fatal_alert(ctx, fd, desc);
+    return _tn_ctx_fail(ctx, rc);
 }
 
 # Server-side: drive the TLS 1.3 handshake over `sock_fd` (a connected,
@@ -592,29 +1156,55 @@ fn _tn_sock_write_all(fd, buf, len): i64 {
 # flight (EE/Cert/CertVerify/Finished), then reads + verifies the
 # client's (encrypted) Finished → CONNECTED. Returns TLS_OK on a
 # completed handshake, or a negative TLS_ERR_* (ctx → ERROR).
-# Note: ChangeCipherSpec (middlebox compat) + HelloRetryRequest loops
-# are .23 (OpenSSL interop) — this clean TLS 1.3 path serves the
-# cyrius-native loopback.
+# A client with no usable key_share gets ONE HelloRetryRequest and its second ClientHello is read
+# (6.6.15; one middlebox CCS may precede it, RFC 8446 §D.4). A ClientHello the server refuses is
+# answered with the alert the refusal recorded (_tn_send_hs_alert). Every exit, success or
+# failure, zeroises our ephemeral private key and the shared secret (_tn_wipe_ephemeral) — the
+# steps that use them already have on the paths that reach them. Every server entry path comes
+# here: tls_accept_complete (lib/tls.cyr) calls it, and a TLS 1.2 ClientHello is routed on to
+# _tn_12_server_drive.
+# A client that sent a non-empty legacy_session_id asked for middlebox compatibility mode, and the
+# server MUST then send one dummy ChangeCipherSpec directly after its first handshake message — the
+# HelloRetryRequest, else the ServerHello (RFC 8446 §D.4); it goes out in the same write.
+# ⛔ 6.6.15 — WHY. A HelloRetryRequest was built and then refused here (TLS_ERR_HANDSHAKE_FAILED,
+# nothing sent), so every client that listed a group we take without sending a share for it
+# failed with no alert. And the server never sent the §D.4 CCS (OpenSSL tolerates its absence, so
+# no interop row saw it). CHANGELOG [6.6.15]
 fn tls_native_accept(ctx, sock_fd): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    var rc = _tn_accept_hs(ctx, sock_fd);
+    _tn_wipe_ephemeral(ctx);
+    return rc;
+}
+
+fn _tn_accept_hs(ctx, sock_fd): i64 {
     store64(ctx + TLS_CTX_OFF_SOCK_FD, sock_fd);
     var cap = TLS_RECORD_MAX_CIPHERTEXT + TLS_RECORD_HEADER_LEN;
     var inbuf = _tn_alloc(ctx, cap);
     if (inbuf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     # ClientHello (plaintext handshake record).
-    var rl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-    if (rl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
-    if ((load8(inbuf) & 0xFF) != TLS_CT_HANDSHAKE) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD); }
+    var rl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_REFUSE);
+    if (rl < 0) { return _tn_read_fail(ctx, rl); }
+    var hx_rec = _tn_hs_expect_ct(ctx, load8(inbuf) & 0xFF, TLS_CT_HANDSHAKE);
+    if (hx_rec != TLS_OK) { return hx_rec; }
     var ch_msg = inbuf + TLS_RECORD_HEADER_LEN;
     var ch_len = rl - TLS_RECORD_HEADER_LEN;
     # Version dispatch: route to the TLS 1.2 server when the ClientHello
-    # is a 1.2 hello (no key_share / supported_versions), or when this
-    # ctx is pinned to max 1.2. A 1.3-only ctx (min_ver 1.3) rejects a
-    # 1.2 client.
+    # is a 1.2 hello (its supported_versions, if any, does not list 0x0304;
+    # _tn_ch_is_tls13), or when this ctx is pinned to max 1.2. A 1.3-only
+    # ctx (min_ver 1.3) rejects a 1.2 client.
+    # A refusal here is answered with its alert (6.6.15): a malformed ClientHello is decode_error,
+    # and a 1.2 hello to a TLS 1.3-only ctx is protocol_version — RFC 8446 §4.2.1: a server that
+    # supports only versions above the client's MUST abort with it. Since supported_versions alone
+    # decides the version, a key_share without it lands here too. CHANGELOG [6.6.15]
     var is13 = _tn_ch_is_tls13(ch_msg, ch_len);
-    if (is13 == 0 - 1) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
+    if (is13 == 0 - 1) {
+        _tn_send_fatal_alert(ctx, sock_fd, TLS_AD_DECODE_ERROR);
+        return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE);
+    }
     if (is13 == 0) {
         if (load64(ctx + TLS_CTX_OFF_MIN_VER) == TLS_VERSION_1_3) {
+            _tn_send_fatal_alert(ctx, sock_fd, TLS_AD_PROTOCOL_VERSION);
             return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
         }
         return _tn_12_server_drive(ctx, sock_fd, ch_msg, ch_len);
@@ -625,16 +1215,52 @@ fn tls_native_accept(ctx, sock_fd): i64 {
     var sh = _tn_alloc(ctx, 2048);
     if (sh == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var sh_len = tls_native_server_respond_hello(ctx, ch_msg, ch_len, sh, 2048);
-    if (sh_len < 0) { return sh_len; }
-    if (tls_native_server_sent_hrr(ctx) == 1) { return _tn_ctx_fail(ctx, TLS_ERR_HANDSHAKE_FAILED); }
-    # Send ServerHello as a plaintext handshake record.
-    var shrec = _tn_alloc(ctx, sh_len + TLS_RECORD_HEADER_LEN);
+    if (sh_len < 0) {
+        _tn_send_hs_alert(ctx, sock_fd);
+        return sh_len;
+    }
+    # Middlebox compatibility (RFC 8446 §D.4): the CCS record after our first handshake message,
+    # when the client's legacy_session_id (echoed by both hellos) is not empty.
+    var ccs_n = 0;
+    if (load64(ctx + TLS_CTX_OFF_SESSION_ID_LEN) > 0) { ccs_n = TLS_RECORD_HEADER_LEN + 1; }
+    if (tls_native_server_sent_hrr(ctx) == 1) {
+        var hrrec = _tn_alloc(ctx, sh_len + TLS_RECORD_HEADER_LEN + ccs_n);
+        if (hrrec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+        tls_native_record_write_header(hrrec, TLS_CT_HANDSHAKE, 0x0303, sh_len);
+        memcpy(hrrec + TLS_RECORD_HEADER_LEN, sh, sh_len);
+        if (ccs_n > 0) { tls_native_ccs_record_write(hrrec + TLS_RECORD_HEADER_LEN + sh_len); }
+        var hrw = _tn_io_write_all(ctx, sock_fd, hrrec, sh_len + TLS_RECORD_HEADER_LEN + ccs_n);
+        if (hrw < 0) { return _tn_ctx_fail(ctx, hrw); }
+        ccs_n = 0;                                     # it went after the HelloRetryRequest
+        # The second ClientHello (plaintext; the client may send its one CCS first).
+        var rl2 = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+        if (rl2 < 0) { return _tn_read_fail(ctx, rl2); }
+        var hx_ch2 = _tn_hs_expect_ct(ctx, load8(inbuf) & 0xFF, TLS_CT_HANDSHAKE);
+        if (hx_ch2 != TLS_OK) { return hx_ch2; }
+        var ch2 = inbuf + TLS_RECORD_HEADER_LEN;
+        var ch2_len = rl2 - TLS_RECORD_HEADER_LEN;
+        var v2 = _tn_ch_is_tls13(ch2, ch2_len);
+        if (v2 != 1) {                                 # it must still offer TLS 1.3
+            var vd = TLS_AD_ILLEGAL_PARAMETER;
+            if (v2 < 0) { vd = TLS_AD_DECODE_ERROR; }
+            _tn_send_fatal_alert(ctx, sock_fd, vd);
+            return _tn_ctx_fail(ctx, TLS_ERR_HANDSHAKE_FAILED);
+        }
+        sh_len = tls_native_server_respond_hello(ctx, ch2, ch2_len, sh, 2048);
+        if (sh_len < 0) {
+            _tn_send_hs_alert(ctx, sock_fd);
+            return sh_len;
+        }
+        if (tls_native_server_sent_hrr(ctx) == 1) { return _tn_ctx_fail(ctx, TLS_ERR_INTERNAL); }
+    }
+    # Send ServerHello as a plaintext handshake record (and the §D.4 CCS, if not sent already).
+    var shrec = _tn_alloc(ctx, sh_len + TLS_RECORD_HEADER_LEN + ccs_n);
     if (shrec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     tls_native_record_write_header(shrec, TLS_CT_HANDSHAKE, 0x0303, sh_len);
     memcpy(shrec + TLS_RECORD_HEADER_LEN, sh, sh_len);
-    if (_tn_sock_write_all(sock_fd, shrec, sh_len + TLS_RECORD_HEADER_LEN) < 0) {
-        return _tn_ctx_fail(ctx, TLS_ERR_IO);
-    }
+    if (ccs_n > 0) { tls_native_ccs_record_write(shrec + TLS_RECORD_HEADER_LEN + sh_len); }
+    var shw = _tn_io_write_all(ctx, sock_fd, shrec, sh_len + TLS_RECORD_HEADER_LEN + ccs_n);
+    if (shw < 0) { return _tn_ctx_fail(ctx, shw); }
     # Derive + install handshake-traffic keys (transcript is at CH..SH).
     var dr = tls_native_server_derive_handshake(ctx);
     if (dr != TLS_OK) { return dr; }
@@ -652,7 +1278,8 @@ fn tls_native_accept(ctx, sock_fd): i64 {
     if (flrec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var flrec_len = tls_native_server_seal_handshake(ctx, flight, fl_len, flrec, fl_len + 64);
     if (flrec_len < 0) { return flrec_len; }
-    if (_tn_sock_write_all(sock_fd, flrec, flrec_len) < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+    var flw = _tn_io_write_all(ctx, sock_fd, flrec, flrec_len);
+    if (flw < 0) { return _tn_ctx_fail(ctx, flw); }
     # Derive the master + application-traffic secrets over CH..serverFinished
     # (RFC 8446 §7.1 — now, before the client's Finished extends the
     # transcript) and install the app keys so post-handshake write/read work.
@@ -663,45 +1290,76 @@ fn tls_native_accept(ctx, sock_fd): i64 {
     # v6.2.8: mTLS client-auth receive. When we requested a client cert
     # (VERIFY != NONE → CertificateRequest in our flight), the client's second
     # flight is [Certificate, CertificateVerify,] Finished — each its own
-    # record. Read + verify the Certificate (+ CertificateVerify when the client
-    # presented a non-empty cert) before the Finished. With VERIFY == NONE this
-    # block is skipped and the flight is Finished-only (byte-identical to before).
+    # record. Read + verify the Certificate — its chain to our trust roots since
+    # 6.6.14 (CVE-64) — (+ CertificateVerify when the client presented a non-empty
+    # cert) before the Finished; a refused client is told why (_tn_client_auth_alert).
+    # With VERIFY == NONE this block is skipped and the flight is Finished-only.
     if (load64(ctx + TLS_CTX_OFF_VERIFY) != TLS_VERIFY_NONE) {
-        var ccrl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-        if (ccrl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+        var ccrl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+        if (ccrl < 0) { return _tn_read_fail(ctx, ccrl); }
+        var pa_cc = _tn_hs_plain_alert(ctx, inbuf, ccrl);
+        if (pa_cc != TLS_OK) { return pa_cc; }
         var cmsg = _tn_alloc(ctx, 8192);
         if (cmsg == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
         var ccct = 0;
         var cmsg_len = tls_native_server_open_handshake(ctx, inbuf, ccrl, cmsg, 8192, &ccct);
-        if (cmsg_len < 0) { return cmsg_len; }
-        if (ccct != TLS_CT_HANDSHAKE) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD); }
+        if (cmsg_len < 0) { return _tn_ctx_fail(ctx, cmsg_len); }   # 6.6.14: an open error fails the ctx
+        var hx_cc = _tn_hs_expect_ct(ctx, ccct, TLS_CT_HANDSHAKE);
+        if (hx_cc != TLS_OK) { return hx_cc; }
         var rcc = tls_native_server_recv_client_certificate(ctx, cmsg, cmsg_len);
-        if (rcc != TLS_OK) { return rcc; }
+        if (rcc != TLS_OK) {
+            var cempty = 0;
+            if (_tn_cert_msg_list_len(cmsg, cmsg_len, 1) == 0) { cempty = 1; }
+            return _tn_client_auth_alert(ctx, sock_fd, rcc, cempty, 1);
+        }
         # CertificateVerify only if the client presented a non-empty cert
         # (recv_client_certificate stores the leaf at CLIENT_CERT, else leaves 0).
         if (load64(ctx + TLS_CTX_OFF_CLIENT_CERT) != 0) {
-            var cvrl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-            if (cvrl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+            var cvrl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+            if (cvrl < 0) { return _tn_read_fail(ctx, cvrl); }
+            var pa_cv = _tn_hs_plain_alert(ctx, inbuf, cvrl);
+            if (pa_cv != TLS_OK) { return pa_cv; }
             var cvmsg = _tn_alloc(ctx, 2048);
             if (cvmsg == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
             var cvct = 0;
             var cvmsg_len = tls_native_server_open_handshake(ctx, inbuf, cvrl, cvmsg, 2048, &cvct);
-            if (cvmsg_len < 0) { return cvmsg_len; }
-            if (cvct != TLS_CT_HANDSHAKE) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD); }
+            if (cvmsg_len < 0) { return _tn_ctx_fail(ctx, cvmsg_len); }
+            var hx_cv = _tn_hs_expect_ct(ctx, cvct, TLS_CT_HANDSHAKE);
+            if (hx_cv != TLS_OK) { return hx_cv; }
             var rcv = tls_native_server_recv_client_certverify(ctx, cvmsg, cvmsg_len);
-            if (rcv != TLS_OK) { return rcv; }
+            if (rcv != TLS_OK) { return _tn_client_auth_alert(ctx, sock_fd, rcv, 0, 1); }
         }
     }
     # Read + open the client's (encrypted) Finished.
-    var crl = _tn_sock_read_record_skip_ccs(sock_fd, inbuf, cap);
-    if (crl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+    var crl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
+    if (crl < 0) { return _tn_read_fail(ctx, crl); }
+    var pa_fin = _tn_hs_plain_alert(ctx, inbuf, crl);
+    if (pa_fin != TLS_OK) { return pa_fin; }
     var finmsg = _tn_alloc(ctx, 512);
     if (finmsg == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var finct = 0;
     var fin_len = tls_native_server_open_handshake(ctx, inbuf, crl, finmsg, 512, &finct);
-    if (fin_len < 0) { return fin_len; }
-    if (finct != TLS_CT_HANDSHAKE) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_RECORD); }
+    if (fin_len < 0) { return _tn_ctx_fail(ctx, fin_len); }
+    var hx_fin = _tn_hs_expect_ct(ctx, finct, TLS_CT_HANDSHAKE);
+    if (hx_fin != TLS_OK) { return hx_fin; }
     return tls_native_server_recv_client_finished(ctx, finmsg, fin_len);
+}
+
+# The ctx's record buffers, allocated once, on first use, from the ctx's allocator. READ: one
+# ciphertext record [0, TLS_RECORD_MAX_CIPHERTEXT + header) followed by its decrypt scratch
+# (TLS_RECORD_MAX_CIPHERTEXT — see tls_native_read). WRITE: one sealed record of up to
+# TLS_RECORD_MAX_PLAINTEXT bytes (+ header, inner type, explicit nonce and tag < 64).
+# ⛔ 6.6.13 — WHY. tls_native_read and tls_native_write allocated a fresh record buffer on EVERY
+# call (33,424 B per read/write/close round, measured), so a long-lived stream grew the no-free
+# heap without bound and an arena handed to a client filled on a long body. A connection's
+# footprint is now constant in the number of reads and writes.
+# Issue 2026-09-30-tls-client-memory-and-alert-gaps (b); CHANGELOG [6.6.13].
+fn _tn_ctx_buf(ctx, off, n): i64 {
+    var b = load64(ctx + off);
+    if (b != 0) { return b; }
+    b = _tn_alloc(ctx, n);
+    if (b != 0) { store64(ctx + off, b); }
+    return b;
 }
 
 # Send `len` bytes from `buf` over the connected ctx. Returns bytes
@@ -712,52 +1370,123 @@ fn tls_native_write(ctx, buf, len): i64 {
     if (load64(ctx + TLS_CTX_OFF_STATE) != TLS_STATE_CONNECTED) { return TLS_ERR_PROTOCOL; }
     if (len > TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_INVALID_PARAM; }   # caller fragments
     var fd = load64(ctx + TLS_CTX_OFF_SOCK_FD);
-    var rec = _tn_alloc(ctx, len + 64);
+    var rec = _tn_ctx_buf(ctx, TLS_CTX_OFF_WRITE_BUF, TLS_RECORD_MAX_PLAINTEXT + 64);
     if (rec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var rn = tls_native_seal_app(ctx, buf, len, rec, len + 64);
     if (rn < 0) { return rn; }
-    if (_tn_sock_write_all(fd, rec, rn) < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+    var w = _tn_io_write_all(ctx, fd, rec, rn);
+    if (w < 0) { return _tn_ctx_fail(ctx, w); }
     return len;
 }
 
-# Receive up to `maxlen` bytes into `buf`. Returns bytes read (>=0;
-# 0 means peer-initiated close_notify), or a negative TLS_ERR_*.
+# Receive up to `maxlen` bytes into `buf`. Returns bytes read (>0), 0 for the
+# peer's close_notify, or a negative TLS_ERR_* — the read path's error table
+# above. 6.6.13: the 0 is STICKY (every later read is 0, even with more records
+# on the wire), and a negative result fails the ctx, so every later read returns
+# that same code (a fatal alert stays TLS_ERR_ALERT).
 # v6.1.36 (CVE-30): drains post-handshake records (NewSessionTicket /
 # KeyUpdate, RFC 8446 §4.6) that arrive interleaved with application data,
 # instead of returning 0 (false EOF) on the first one. A standard TLS 1.3
 # server (OpenSSL/nginx) sends a NewSessionTicket immediately after the
 # handshake; before this, the first read collapsed to EOF before any data.
+# Partial-record delivery: one TLS record's plaintext is up to 16384 bytes; when
+# it exceeds the caller's `maxlen` this delivers `maxlen` now and HOLDS the
+# remainder in the ctx (TLS_CTX_OFF_READ_HOLD*), returning it on the next calls
+# before another record is decrypted. So a caller may read in sub-record chunks
+# (an h2 9-byte frame header, the tail of a bounded response buffer) and honors
+# the documented "up to maxlen" contract. The prior "whole record or
+# TLS_ERR_BUFFER_FULL" behavior both broke that contract and, on BUFFER_FULL,
+# discarded a record whose AEAD read sequence had already advanced — a silent
+# stream desync / data loss that broke large HTTP responses read in small chunks.
 fn tls_native_read(ctx, buf, maxlen): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
-    if (load64(ctx + TLS_CTX_OFF_STATE) != TLS_STATE_CONNECTED) { return TLS_ERR_PROTOCOL; }
+    var st = load64(ctx + TLS_CTX_OFF_STATE);
+    if (st != TLS_STATE_CONNECTED) {
+        # A failed ctx answers with the code that failed it, not a generic PROTOCOL.
+        if (st == TLS_STATE_ERROR) {
+            var le = load64(ctx + TLS_CTX_OFF_LAST_ERR);
+            if (le < 0) { return le; }
+        }
+        return TLS_ERR_PROTOCOL;
+    }
+    if (maxlen <= 0) { return TLS_ERR_INVALID_PARAM; }   # a 0 ask would look like EOF
+    # 1) Drain plaintext held from a prior over-length record before touching the
+    #    socket. LEN>0 is only ever set together with the buffer pointer, so
+    #    TLS_CTX_OFF_READ_HOLD is non-zero whenever there is anything to drain.
+    var hlen = load64(ctx + TLS_CTX_OFF_READ_HOLD_LEN);
+    var hoff = load64(ctx + TLS_CTX_OFF_READ_HOLD_OFF);
+    if (hlen > hoff) {
+        var hgive = hlen - hoff;
+        if (hgive > maxlen) { hgive = maxlen; }
+        memcpy(buf, load64(ctx + TLS_CTX_OFF_READ_HOLD) + hoff, hgive);
+        hoff = hoff + hgive;
+        if (hoff >= hlen) {
+            store64(ctx + TLS_CTX_OFF_READ_HOLD_LEN, 0);
+            store64(ctx + TLS_CTX_OFF_READ_HOLD_OFF, 0);
+        } else {
+            store64(ctx + TLS_CTX_OFF_READ_HOLD_OFF, hoff);
+        }
+        return hgive;
+    }
+    # 2) The peer's close_notify was read: the stream has ENDED. Nothing after it is
+    #    read, so a record an attacker appends after the close never reaches the caller.
+    if (load64(ctx + TLS_CTX_OFF_PEER_CLOSED) != 0) { return 0; }
     var fd = load64(ctx + TLS_CTX_OFF_SOCK_FD);
     var cap = TLS_RECORD_MAX_CIPHERTEXT + TLS_RECORD_HEADER_LEN;
-    # One allocation holds the ciphertext [0..cap) AND a full-size plaintext
-    # scratch [cap..) — handshake records must decrypt into a max-size buffer
-    # (a large NewSessionTicket would trip TLS_ERR_BUFFER_FULL against a small
-    # caller `maxlen` and consume the AEAD sequence, wedging the connection).
-    var inbuf = _tn_alloc(ctx, cap + TLS_RECORD_MAX_PLAINTEXT);
+    # The ctx's READ buffer (allocated by the first read, reused by every later
+    # one — 6.6.13) holds the ciphertext [0..cap) AND a decrypt scratch [cap..)
+    # for one record's TLSInnerPlaintext (`content ‖ inner_content_type ‖
+    # padding`, RFC 8446 §5.2). A MAX-size record decrypts to content(2^14) + the
+    # type byte = 2^14+1 — ABOVE TLS_RECORD_MAX_PLAINTEXT — and a padded record
+    # reaches the TLSCiphertext ceiling, so the scratch (and _tn_open_record's
+    # out_max) must be TLS_RECORD_MAX_CIPHERTEXT, not TLS_RECORD_MAX_PLAINTEXT.
+    var inbuf = _tn_ctx_buf(ctx, TLS_CTX_OFF_READ_BUF, cap + TLS_RECORD_MAX_CIPHERTEXT);
     if (inbuf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var plain = inbuf + cap;
     var guard = 0;
     while (guard < TLS_POST_HANDSHAKE_DRAIN_MAX) {
         guard = guard + 1;
-        var rl = _tn_sock_read_record_skip_ccs(fd, inbuf, cap);
-        if (rl < 0) { return _tn_ctx_fail(ctx, TLS_ERR_IO); }
+        var rl = _tn_read_rec(ctx, fd, inbuf, cap, _TN_CCS_REFUSE);
+        if (rl < 0) { return _tn_read_fail(ctx, rl); }
         var ict = 0;
-        var n = _tn_open_record(ctx, inbuf, rl, plain, TLS_RECORD_MAX_PLAINTEXT, &ict);
-        if (n < 0) { return n; }
+        var n = _tn_open_record(ctx, inbuf, rl, plain, TLS_RECORD_MAX_CIPHERTEXT, &ict);
+        if (n < 0) { return _tn_ctx_fail(ctx, n); }   # an error alert, a bad tag, a bad frame
         if (ict == TLS_CT_APPLICATION_DATA) {
             # A 0-length application_data record is legal (RFC 8446 §5.1) and is
             # NOT end-of-stream — drain it and keep reading, so only a real
             # close_notify returns 0. Non-empty data is delivered to the caller.
             if (n > 0) {
-                if (n > maxlen) { return TLS_ERR_BUFFER_FULL; }
-                memcpy(buf, plain, n);
-                return n;
+                if (n <= maxlen) {
+                    memcpy(buf, plain, n);
+                    return n;
+                }
+                # Record longer than the caller's ask: the record is already
+                # decrypted and its AEAD sequence advanced, so stash the tail in
+                # the hold buffer (n <= TLS_RECORD_MAX_PLAINTEXT via the §5.4 guard
+                # in tls_native_record_open; maxlen >= 1, so rem <= 16383 fits the
+                # 16384-byte hold), then deliver the first `maxlen` bytes.
+                var hb = load64(ctx + TLS_CTX_OFF_READ_HOLD);
+                if (hb == 0) {
+                    hb = _tn_alloc(ctx, TLS_RECORD_MAX_PLAINTEXT);
+                    if (hb == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+                    store64(ctx + TLS_CTX_OFF_READ_HOLD, hb);
+                }
+                var rem = n - maxlen;
+                memcpy(hb, plain + maxlen, rem);
+                store64(ctx + TLS_CTX_OFF_READ_HOLD_LEN, rem);
+                store64(ctx + TLS_CTX_OFF_READ_HOLD_OFF, 0);
+                memcpy(buf, plain, maxlen);
+                return maxlen;
             }
         }
-        if (ict == TLS_CT_ALERT) { return 0; }   # close_notify → EOF
+        if (ict == TLS_CT_ALERT) {
+            # n is the alert's disposition (an error alert returned above).
+            if (n == _TN_ALERT_EOF) {
+                store64(ctx + TLS_CTX_OFF_PEER_CLOSED, 1);
+                return 0;
+            }
+            # _TN_ALERT_IGNORE (user_canceled): dropped; read on, inside the drain bound
+        }
         if (ict == TLS_CT_HANDSHAKE) {
             var hr = _tn_handle_post_handshake(ctx, plain, n);
             if (hr < 0) { return _tn_ctx_fail(ctx, hr); }
@@ -767,15 +1496,22 @@ fn tls_native_read(ctx, buf, maxlen): i64 {
     return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);   # too many post-handshake records
 }
 
-# Send a close_notify alert (RFC 5246 §7.2.1 / RFC 8446 §6.1), then mark the
-# context closed. After tls_native_close the handle MUST NOT be reused.
-# Returns TLS_OK regardless of close_notify success (best-effort, per the
-# contract). Idempotent — a second call is a no-op.
+# Send the peer a close_notify alert (RFC 5246 §7.2.1 / RFC 8446 §6.1), then
+# mark the context CLOSED; the handle MUST NOT be used for I/O again. Best
+# effort, per the contract: the alert is sent only from the CONNECTED state (a
+# failed ctx sends nothing), through the deadline-aware writer (an expired
+# tls_native_set_deadline sends nothing), and its result is ignored — TLS_OK
+# whatever happened on the wire (TLS_ERR_INVALID_PARAM for ctx 0). It does not
+# wait for the peer's close_notify. A second call is a no-op while the ctx's
+# memory is intact.
 #
-# Memory note: the ctx is bump-allocated (no per-object free), so this does
-# NOT free the ctx storage — that is reclaimed at arena/process teardown. The
-# caller owns the socket fd (TLS_CTX_OFF_SOCK_FD) and closes it after this
-# returns. The lib/tls.cyr wrapper frees its own shim struct.
+# Memory: nothing is freed here — the ctx and everything it allocated came from
+# its allocator (the no-free global heap, or the Allocator given to an `_in`
+# constructor, which reset_via reclaims; close FIRST, then reset). lib/tls.cyr's
+# tls_close calls this and frees nothing either: its shim lives in the same
+# allocator. Sealing the close_notify allocates nothing: the record (at most 31
+# bytes, TLS 1.2's) is built on the stack. The caller owns the socket fd
+# (TLS_CTX_OFF_SOCK_FD) and closes it after this returns. CHANGELOG [6.6.13]
 fn tls_native_close(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     var state = load64(ctx + TLS_CTX_OFF_STATE);
@@ -785,12 +1521,10 @@ fn tls_native_close(ctx): i64 {
         var alert[2];
         store8(&alert, TLS_ALERT_WARNING);              # level (ignored in 1.3)
         store8(&alert + 1, 0);                          # description 0 = close_notify
-        var rec = _tn_alloc(ctx, 64);
-        if (rec != 0) {
-            var rn = _tn_seal_ct(ctx, TLS_CT_ALERT, &alert, 2, rec, 64);
-            if (rn > 0) {
-                _tn_sock_write_all(load64(ctx + TLS_CTX_OFF_SOCK_FD), rec, rn);
-            }
+        var rec[64];
+        var rn = _tn_seal_ct(ctx, TLS_CT_ALERT, &alert, 2, &rec, 64);
+        if (rn > 0) {
+            _tn_io_write_all(ctx, load64(ctx + TLS_CTX_OFF_SOCK_FD), &rec, rn);
         }
     }
     store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_CLOSED);
@@ -812,13 +1546,29 @@ fn tls_native_get_alpn_selected(ctx, buf, bufmax): i64 {
     return plen;
 }
 
-# Get the peer's leaf certificate in DER form. Writes to `buf` (up
+# The peer's parsed leaf, or 0: the server's on a client ctx; on a server ctx the client's — kept
+# once its chain verified, and answered once the handshake COMPLETED (TLS_CTX_OFF_HS_DONE): a
+# handshake that went on to fail (a CertificateVerify that did not verify, say) exposes no client
+# identity, and a connection error after a completed handshake (the client gone without
+# close_notify) does not take the verified identity away — libssl's behaviour.
+# 6.6.14 (CVE-64): a server read the client-side SERVER_CERT slot, which it never fills, so every
+# getter answered 0 on a server.
+fn _tn_peer_leaf(ctx): i64 {
+    if (load64(ctx + TLS_CTX_OFF_ROLE) == TLS_ROLE_SERVER) {
+        if (load64(ctx + TLS_CTX_OFF_HS_DONE) == 0) { return 0; }
+        return load64(ctx + TLS_CTX_OFF_CLIENT_CERT);
+    }
+    return load64(ctx + TLS_CTX_OFF_SERVER_CERT);
+}
+
+# Get the peer's leaf certificate in DER form — on a server ctx the client's, which mTLS has
+# verified (6.6.14). Writes to `buf` (up
 # to `bufmax`); returns DER length, 0 if no peer cert was sent, or
 # negative TLS_ERR_BUFFER_FULL if bufmax is too small. The leaf's DER
 # ptr+len live in sigil's parsed x509 struct (`+0`/`+8`).
 fn tls_native_get_peer_cert_der(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
-    var leaf = load64(ctx + TLS_CTX_OFF_SERVER_CERT);
+    var leaf = _tn_peer_leaf(ctx);
     if (leaf == 0) { return 0; }
     var der = load64(leaf);
     var der_len = load64(leaf + 8);
@@ -830,14 +1580,15 @@ fn tls_native_get_peer_cert_der(ctx, buf, bufmax): i64 {
 }
 
 # Get the peer leaf's SubjectPublicKeyInfo (SPKI) in DER form — the HPKP
-# pin target (consumers SHA-256 it). Writes to `buf` (up to `bufmax`);
+# pin target (consumers SHA-256 it); on a server ctx the verified client's
+# (6.6.14). Writes to `buf` (up to `bufmax`);
 # returns SPKI length, 0 on no cert / parse failure, or TLS_ERR_BUFFER_FULL.
 # The SPKI is the TLV immediately after the subject in the TBSCertificate;
 # sigil's parsed x509 struct stores the subject span at `+64`/`+72`, and we
 # walk one SEQUENCE past it with sigil's der_walk.
 fn tls_native_get_peer_spki_der(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
-    var leaf = load64(ctx + TLS_CTX_OFF_SERVER_CERT);
+    var leaf = _tn_peer_leaf(ctx);
     if (leaf == 0) { return 0; }
     var der = load64(leaf);
     var der_len = load64(leaf + 8);

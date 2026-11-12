@@ -1,11 +1,21 @@
 # flags.cyr — getopt-long-shaped CLI flag parser
 # Usage: include "lib/flags.cyr"
-# Requires: alloc.cyr, string.cyr, fmt.cyr (for flags_print_help)
+# Includes its own definers: alloc.cyr, string.cyr, syscalls.cyr (sys_write/STDERR_FD).
 #
-# Replaces the 60+ ad-hoc `streq("--foo", argv(i))` loops that
-# every toolchain binary (cyrius, ark, cyrld, cyrfmt, cyrlint,
-# cyrdoc, cybs) and every consumer project ships today on top
-# of `lib/args.cyr`'s bare argc/argv surface.
+# A parser for PROGRAMS built on `lib/args.cyr`'s bare argc/argv
+# surface, so each one need not hand-roll a `streq("--foo", argv(i))`
+# loop.
+#
+# ⚠ The toolchain's own binaries do NOT include it (corrected v6.6.5 —
+# this header used to say it replaced their loops, and none of them
+# has ever included it). The `cyrius` CLI parses through
+# cbt/cli_args.cyr, whose spec tables also generate `--help`; cyrlint,
+# cyrfmt, cyrdoc, cyaudit, cyrsign, cyrsign-efi, cyrld, ark,
+# cyriusly and cyrius-init keep small hand-written loops that follow
+# the same rule (flags anywhere, an unknown '-' token is an error that
+# names it, operand counts enforced). The RULE is what is gated —
+# tests/gates/toolchain/cli_args_never_dropped.sh — not which parser
+# implements it.
 #
 # Typical use:
 #
@@ -38,17 +48,26 @@
 #   -xvalue            attached short value — use -x value
 #   --no-foo           negated bool — toggle in caller
 #
-# Caps: 32 flags, 128 positionals per context. Adjust the MAX
-# constants if a driver needs more (argonaut CLI is the current
-# ceiling at ~20 flags).
+# Caps: 32 flags per context. Positionals are UNBOUNDED — the array
+# starts at 128 and DOUBLES. v6.6.5: it used to stop at 128 and return
+# 0 (success) for every one after that, so a driver handed 200 paths
+# processed 128 of them and reported no error. kriya hit exactly this
+# and re-implemented operand counting by hand (src/lib/args.cyr:781)
+# rather than being told. A cap that is silent is not a cap, it is a
+# data-loss bug; adjust FLAGS_MAX if a driver needs more than 32 flags.
 
 include "lib/alloc.cyr"
 include "lib/string.cyr"
+include "lib/syscalls.cyr"  # sys_write / STDERR_FD for flags_print_help (v6.6.5)
 
 enum FlagType {
     FLAG_BOOL = 0;
     FLAG_INT = 1;
     FLAG_STR = 2;
+    # v6.6.5 — a REPEATABLE string flag. Without it a repeated `-I a -I b` kept
+    # only the LAST value, silently, which is the same shape of drop as the
+    # positional cap below.
+    FLAG_LIST = 3;
 }
 
 enum FlagErr {
@@ -57,14 +76,20 @@ enum FlagErr {
     FLAG_ERR_MISSING_VALUE = 2;
     FLAG_ERR_BAD_INT = 3;
     FLAG_ERR_BUNDLED = 4;
+    # v6.6.5 — `--verbose=0` used to SET the flag (the attached value was ignored
+    # and BOOL stored 1), i.e. the exact opposite of what was typed.
+    FLAG_ERR_UNEXPECTED_VALUE = 5;
+    # 6.6.7 — a list or positional array could not grow. The growth alloc was unchecked,
+    # so a refusal stored the pointer array through 0.
+    FLAG_ERR_NOMEM = 6;
 }
 
 var FLAGS_MAX = 32;
-var FLAGS_POS_MAX = 128;
-var FLAGS_CTX_SIZE = 64;
+var FLAGS_POS_MAX = 128;        # INITIAL positional capacity; the array doubles
+var FLAGS_CTX_SIZE = 80;
 var FLAGS_ENTRY_SIZE = 48;
 
-# Context layout (64 B):
+# Context layout (80 B — v6.6.5 grew it from 64 for the +64 / +72 slots below):
 #   +0  entries_ptr     : i64 array of FLAGS_ENTRY_SIZE entries
 #   +8  entries_cap     : i64 (= FLAGS_MAX)
 #  +16  entries_count   : i64
@@ -73,6 +98,11 @@ var FLAGS_ENTRY_SIZE = 48;
 #  +40  positional_count: i64
 #  +48  prog_name       : i64 (cstr — argv[0] captured at parse)
 #  +56  last_error      : i64 (FlagErr)
+#  +64  error_arg       : i64 (cstr — the offending token, 0 if none)   [v6.6.5]
+#  +72  stop_at_pos     : i64 (1 = POSIX stop-at-first-positional)      [v6.6.5]
+#
+# ⚠ The 48-B ENTRY layout and _flags_find_short are reached into directly by
+# kriya; the CONTEXT grew from 64 to 80 B, which no consumer indexes.
 #
 # Entry layout (48 B):
 #   +0  short_ch        : i64 (ASCII byte value; 0 = no short form)
@@ -83,13 +113,16 @@ var FLAGS_ENTRY_SIZE = 48;
 #  +40  help            : i64 (cstr)
 
 # Allocate a fresh flags context. Returns an opaque handle that
-# all other flags_* functions take as their first argument. The
-# context owns its entries + positional arrays; do not free
-# individually.
+# all other flags_* functions take as their first argument, or 0 when an
+# allocation is refused (6.6.7). The context owns its entries + positional
+# arrays; do not free individually.
 fn flags_new(): i64 {
     var h = alloc(FLAGS_CTX_SIZE);
+    if (h == 0) { return 0; }
     var entries = alloc(FLAGS_MAX * FLAGS_ENTRY_SIZE);
+    if (entries == 0) { return 0; }
     var positional = alloc(FLAGS_POS_MAX * 8);
+    if (positional == 0) { return 0; }
     # Zero entries + context so stale slots read as 0
     var i = 0;
     while (i < FLAGS_MAX * FLAGS_ENTRY_SIZE) {
@@ -104,7 +137,17 @@ fn flags_new(): i64 {
     store64(h + 40, 0);
     store64(h + 48, 0);
     store64(h + 56, FLAG_ERR_NONE);
+    store64(h + 64, 0);
+    store64(h + 72, 0);
     return h;
+}
+
+# POSIX stop-at-first-positional: once a non-flag token is seen, everything after
+# it is a positional, flags included. This is what `prog run <cmd> --its-own-flag`
+# needs so the inner command's flags are not eaten by the outer one.
+fn flags_set_stop_at_positional(h, on): i64 {
+    store64(h + 72, on);
+    return 0;
 }
 
 fn _flags_add(h, short_ch, long_name, type, default_val, help): i64 {
@@ -143,6 +186,13 @@ fn flags_add_str(h, short_ch, long_name, default_val, help): i64 {
     return _flags_add(h, short_ch, long_name, FLAG_STR, default_val, help);
 }
 
+# Register a REPEATABLE string flag. Every occurrence appends; read the result
+# with flags_list_count / flags_list_at. Same arg shape as flags_add_str, except
+# there is no default value (an unseen list is simply empty).
+fn flags_add_list(h, short_ch, long_name, help): i64 {
+    return _flags_add(h, short_ch, long_name, FLAG_LIST, 0, help);
+}
+
 fn _flags_entry(h, idx): i64 {
     return load64(h) + idx * FLAGS_ENTRY_SIZE;
 }
@@ -172,6 +222,39 @@ fn flags_positional(h, idx): i64 {
     if (idx < 0) { return 0; }
     if (idx >= load64(h + 40)) { return 0; }
     return load64(load64(h + 24) + idx * 8);
+}
+
+# Number of values collected for the FLAG_LIST flag at `idx` (0 if it never
+# appeared). Caller must have registered idx via flags_add_list.
+fn flags_list_count(h, idx): i64 {
+    var blk = load64(_flags_entry(h, idx) + 24);
+    if (blk == 0) { return 0; }
+    return load64(blk + 16);
+}
+
+# Value `k` (0-indexed, argv order) of the FLAG_LIST flag at `idx`, as a cstr ptr;
+# 0 if out of range.
+fn flags_list_at(h, idx, k): i64 {
+    var blk = load64(_flags_entry(h, idx) + 24);
+    if (blk == 0) { return 0; }
+    if (k < 0) { return 0; }
+    if (k >= load64(blk + 16)) { return 0; }
+    return load64(load64(blk) + k * 8);
+}
+
+# The argv token that caused the last parse error (cstr), or 0. Without this a
+# driver can only say "bad option" and leave the user to guess which one.
+fn flags_error_arg(h): i64 { return load64(h + 64); }
+
+# A human-readable name for a FlagErr code, for the driver's message.
+fn flags_error_str(code): i64 {
+    if (code == FLAG_ERR_UNKNOWN) { return "unknown option"; }
+    if (code == FLAG_ERR_MISSING_VALUE) { return "option needs a value"; }
+    if (code == FLAG_ERR_BAD_INT) { return "option needs an integer"; }
+    if (code == FLAG_ERR_BUNDLED) { return "bundled/attached short options are not supported"; }
+    if (code == FLAG_ERR_UNEXPECTED_VALUE) { return "option takes no value"; }
+    if (code == FLAG_ERR_NOMEM) { return "out of memory"; }
+    return "ok";
 }
 
 # Last parse error code (FlagErr enum). FLAG_ERR_NONE on
@@ -244,13 +327,48 @@ fn _flags_parse_int(s): i64 {
     return n;
 }
 
+# v6.6.5 — a LIST flag's value slot holds a 24-B block: {ptr, cap, count}.
+# 6.6.7 — every allocation is checked: FLAG_ERR_NOMEM, with the list unchanged.
+fn _flags_list_push(ep, value_ptr): i64 {
+    var blk = load64(ep + 24);
+    if (blk == 0) {
+        var nblk = alloc(24);
+        if (nblk == 0) { return FLAG_ERR_NOMEM; }
+        var arr = alloc(8 * 8);
+        if (arr == 0) { return FLAG_ERR_NOMEM; }
+        blk = nblk;
+        store64(blk, arr);
+        store64(blk + 8, 8);
+        store64(blk + 16, 0);
+        store64(ep + 24, blk);
+    }
+    var n = load64(blk + 16);
+    var cap = load64(blk + 8);
+    if (n >= cap) {
+        var grown = alloc(cap * 2 * 8);
+        if (grown == 0) { return FLAG_ERR_NOMEM; }
+        var i = 0;
+        while (i < n) { store64(grown + i * 8, load64(load64(blk) + i * 8)); i = i + 1; }
+        store64(blk, grown);
+        store64(blk + 8, cap * 2);
+    }
+    store64(load64(blk) + n * 8, value_ptr);
+    store64(blk + 16, n + 1);
+    return FLAG_ERR_NONE;
+}
+
 fn _flags_apply(ep, value_ptr): i64 {
     var type = load64(ep + 16);
     if (type == FLAG_BOOL) {
+        # v6.6.5 — `--flag=0` / `--flag=no` used to fall through here and store 1,
+        # turning the flag ON for a spelling that asks for the opposite. It is an
+        # error: this parser has no negated-bool form (see "NOT supported" above).
+        if (value_ptr != 0) { return FLAG_ERR_UNEXPECTED_VALUE; }
         store64(ep + 24, 1);
         return FLAG_ERR_NONE;
     }
     if (value_ptr == 0) { return FLAG_ERR_MISSING_VALUE; }
+    if (type == FLAG_LIST) { return _flags_list_push(ep, value_ptr); }
     if (type == FLAG_INT) {
         var n = _flags_parse_int(value_ptr);
         if (_flags_pint_ok == 0) { return FLAG_ERR_BAD_INT; }
@@ -262,12 +380,35 @@ fn _flags_apply(ep, value_ptr): i64 {
     return FLAG_ERR_NONE;
 }
 
+# v6.6.5 — GROW, never drop. This used to `return 0` at the cap, so positional
+# 129 and everything after it vanished while parse still reported success.
+# 6.6.7 — the growth alloc is checked: FLAG_ERR_NOMEM (the caller fails the parse)
+# instead of storing the array through 0.
 fn _flags_push_positional(h, tok): i64 {
     var pc = load64(h + 40);
-    if (pc >= load64(h + 32)) { return 0; }
+    var cap = load64(h + 32);
+    if (pc >= cap) {
+        var grown = alloc(cap * 2 * 8);
+        if (grown == 0) { return FLAG_ERR_NOMEM; }
+        var src = load64(h + 24);
+        var i = 0;
+        while (i < pc) { store64(grown + i * 8, load64(src + i * 8)); i = i + 1; }
+        store64(h + 24, grown);
+        store64(h + 32, cap * 2);
+    }
     store64(load64(h + 24) + pc * 8, tok);
     store64(h + 40, pc + 1);
-    return 0;
+    return FLAG_ERR_NONE;
+}
+
+# Push a positional for flags_parse; on a refused grow record FLAG_ERR_NOMEM against `tok`
+# and return -1 so the parse fails instead of reporting success with a token missing.
+fn _flags_pos_or_fail(h, tok): i64 {
+    var r = _flags_push_positional(h, tok);
+    if (r == FLAG_ERR_NONE) { return 0; }
+    store64(h + 56, r);
+    store64(h + 64, tok);
+    return 0 - 1;
 }
 
 # Parse argv[1..] into the flags context. Returns 0 on success,
@@ -275,6 +416,8 @@ fn _flags_push_positional(h, tok): i64 {
 # argv is laid out as argc `cstr*` pointers at `argv + i*8`.
 fn flags_parse(h, argc, argv): i64 {
     if (argc > 0) { store64(h + 48, load64(argv)); }
+    store64(h + 56, FLAG_ERR_NONE);
+    store64(h + 64, 0);
     var i = 1;
     var in_positional = 0;
     while (i < argc) {
@@ -282,19 +425,21 @@ fn flags_parse(h, argc, argv): i64 {
         if (tok == 0) { i = i + 1; continue; }
 
         if (in_positional == 1) {
-            _flags_push_positional(h, tok);
+            if (_flags_pos_or_fail(h, tok) < 0) { return 0 - 1; }
             i = i + 1;
             continue;
         }
 
         # "-" alone is positional (stdin convention)
         if (load8(tok) != 45) {
-            _flags_push_positional(h, tok);
+            if (_flags_pos_or_fail(h, tok) < 0) { return 0 - 1; }
+            # v6.6.5 — POSIX stop-at-first-positional, when the driver asked for it.
+            if (load64(h + 72) == 1) { in_positional = 1; }
             i = i + 1;
             continue;
         }
         if (load8(tok + 1) == 0) {
-            _flags_push_positional(h, tok);
+            if (_flags_pos_or_fail(h, tok) < 0) { return 0 - 1; }
             i = i + 1;
             continue;
         }
@@ -322,12 +467,14 @@ fn flags_parse(h, argc, argv): i64 {
             ep = _flags_find_long(h, name_start, name_len);
             if (ep == 0) {
                 store64(h + 56, FLAG_ERR_UNKNOWN);
+                store64(h + 64, tok);
                 return 0 - 1;
             }
             if (eq >= 0) { value_ptr = name_start + eq + 1; }
             if (value_ptr == 0 && load64(ep + 16) != FLAG_BOOL) {
                 if (i + 1 >= argc) {
                     store64(h + 56, FLAG_ERR_MISSING_VALUE);
+                    store64(h + 64, tok);
                     return 0 - 1;
                 }
                 value_ptr = load64(argv + (i + 1) * 8);
@@ -337,16 +484,19 @@ fn flags_parse(h, argc, argv): i64 {
             # short form: "-x" only (bundled or attached rejected)
             if (load8(tok + 2) != 0) {
                 store64(h + 56, FLAG_ERR_BUNDLED);
+                store64(h + 64, tok);
                 return 0 - 1;
             }
             ep = _flags_find_short(h, load8(tok + 1));
             if (ep == 0) {
                 store64(h + 56, FLAG_ERR_UNKNOWN);
+                store64(h + 64, tok);
                 return 0 - 1;
             }
             if (load64(ep + 16) != FLAG_BOOL) {
                 if (i + 1 >= argc) {
                     store64(h + 56, FLAG_ERR_MISSING_VALUE);
+                    store64(h + 64, tok);
                     return 0 - 1;
                 }
                 value_ptr = load64(argv + (i + 1) * 8);
@@ -357,6 +507,7 @@ fn flags_parse(h, argc, argv): i64 {
         var ar = _flags_apply(ep, value_ptr);
         if (ar != FLAG_ERR_NONE) {
             store64(h + 56, ar);
+            store64(h + 64, tok);
             return 0 - 1;
         }
         i = i + 1;
@@ -365,6 +516,20 @@ fn flags_parse(h, argc, argv): i64 {
 }
 
 # Print usage to stderr, iterating registered flags.
+# v6.6.5 — `sys_write(STDERR_FD, …)` rather than a raw `syscall(1, 2, …)`, for
+# CONSISTENCY with the rest of the stdlib: the number is not spelled twice and the
+# arch dispatch lives in one place (lib/syscalls.cyr).
+# ⚠ The first cut of this comment claimed the raw form "printed nothing on three of
+# the five targets — 1 is io_destroy on aarch64 and unrouted on PE". THAT WAS FALSE
+# and is recorded here rather than deleted, because it is the kind of plausible
+# rationale that gets copied. The compiler REWRITES the source syscall number per
+# target (ESYSXLAT): `src/backend/aarch64/emit.cyr:1162` carries `write: 1→64`,
+# `:757` carries the Darwin `1→4`, `src/backend/x86/emit.cyr:976` the Mach-O
+# `1→0x2000004`, and `.github/workflows/ci.yml:1429` is an ON-HARDWARE Windows gate
+# whose whole body is `syscall(1, 1, "hi\n", 3)`. Measured at 6.6.5: a
+# `syscall(1, 2, …)` probe prints on x86-64 Linux, under qemu-aarch64 and under wine
+# on PE. Taken at face value the old claim condemned ~170 other in-tree sites.
+# CHANGELOG [6.6.5].
 # Format (one line per flag):
 #   -x, --long   help text     (type)
 # Callers typically print their own "Usage: prog ..." first, then
@@ -378,28 +543,29 @@ fn flags_print_help(h): i64 {
         var long_name = load64(ep + 8);
         var type = load64(ep + 16);
         var help = load64(ep + 40);
-        syscall(1, 2, "  ", 2);
+        sys_write(STDERR_FD, "  ", 2);
         if (short_ch != 0) {
-            var sbuf[2];
+            var sbuf[8];
             store8(&sbuf, short_ch);
             store8(&sbuf + 1, 0);
-            syscall(1, 2, "-", 1);
-            syscall(1, 2, &sbuf, 1);
-            if (long_name != 0) { syscall(1, 2, ", ", 2); }
+            sys_write(STDERR_FD, "-", 1);
+            sys_write(STDERR_FD, &sbuf, 1);
+            if (long_name != 0) { sys_write(STDERR_FD, ", ", 2); }
         } else {
-            syscall(1, 2, "    ", 4);
+            sys_write(STDERR_FD, "    ", 4);
         }
         if (long_name != 0) {
-            syscall(1, 2, "--", 2);
-            syscall(1, 2, long_name, strlen(long_name));
+            sys_write(STDERR_FD, "--", 2);
+            sys_write(STDERR_FD, long_name, strlen(long_name));
         }
-        if (type == FLAG_INT)     { syscall(1, 2, " <int>", 6); }
-        elif (type == FLAG_STR)   { syscall(1, 2, " <str>", 6); }
+        if (type == FLAG_INT)     { sys_write(STDERR_FD, " <int>", 6); }
+        elif (type == FLAG_STR)   { sys_write(STDERR_FD, " <str>", 6); }
+        elif (type == FLAG_LIST)  { sys_write(STDERR_FD, " <str> (repeatable)", 19); }
         if (help != 0) {
-            syscall(1, 2, "\t", 1);
-            syscall(1, 2, help, strlen(help));
+            sys_write(STDERR_FD, "\t", 1);
+            sys_write(STDERR_FD, help, strlen(help));
         }
-        syscall(1, 2, "\n", 1);
+        sys_write(STDERR_FD, "\n", 1);
         i = i + 1;
     }
     return 0;

@@ -9,12 +9,152 @@
 # / sys_geteuid in lib/syscalls.cyr) — only `is_root` is provided here since it
 # carries per-target euid-vs-uid logic.
 #
-# Linux + AGNOS are the real targets. uname/sysinfo are Linux-specific syscalls;
-# macOS (sysctl) / Windows (GetVersionEx / GlobalMemoryStatusEx) are not yet
-# wired, so they return -ENOSYS rather than mis-issuing a Linux number.
-# Requires: lib/syscalls.cyr. See CHANGELOG [6.1.28].
+# Linux + AGNOS issue the real uname/sysinfo syscalls. macOS has NEITHER, so
+# v6.5.16 synthesises both from sysctl(2) — see the sysctl section below; the
+# buffers handed back are the same Linux-shaped ones, so every accessor in this
+# file works unchanged there. Windows (GetVersionEx / GlobalMemoryStatusEx) is
+# still unwired and returns -ENOSYS rather than mis-issuing a Linux number.
+# Includes its own definer, lib/syscalls.cyr. See CHANGELOG [6.1.28], [6.5.16].
 
 include "lib/syscalls.cyr"
+
+# ================================================================
+# macOS: sysctl(2) plumbing  (v6.5.16)
+# ================================================================
+# Darwin has no uname(2) and no sysinfo(2). Both are synthesised from sysctl(2),
+# reached from cyrius source through the private alias SYS_SYSCTL (1202 → BSD
+# 202; see the alias-band comment in lib/syscalls_aarch64_linux.cyr) plus
+# SYS_GETTIMEOFDAY (1116 → BSD 116) for the wall clock that uptime needs.
+#
+# lib/ has no precedent for #ifdef-ing an entire `fn` away, so these stay defined
+# on every target and guard their BODIES instead — the same shape sys_uname
+# already uses. That is load-bearing, not cosmetic: SYS_SYSCTL exists only in the
+# two macOS peers, so the syscall line has to be REMOVED by the preprocessor on
+# Linux/AGNOS/Windows rather than merely left unreached.
+
+#ifdef CYRIUS_TARGET_MACOS
+# sysctl MIB selectors (<sys/sysctl.h>). Re-read from the SDK header AND
+# live-probed on both Mach-O hosts — ecb (arm64, Darwin 25.6.0) and ach (x86_64,
+# Darwin 22.6.0) returned identical MIBs, so the namespace does not vary by arch
+# even though the two targets are separate backends.
+enum SysctlMib {
+    CTL_UNSPEC = 0; CTL_KERN = 1; CTL_VM = 2; CTL_HW = 6;
+    KERN_OSTYPE = 1; KERN_OSRELEASE = 2; KERN_VERSION = 4;
+    KERN_HOSTNAME = 10; KERN_BOOTTIME = 21;
+    HW_MACHINE = 1; HW_PAGESIZE = 7; HW_MEMSIZE = 24;
+    CTL_NAME2OID = 3;      # {CTL_UNSPEC, 3} — resolve "a.b.c" to a numeric oid
+}
+#endif
+
+# Byte length of a NUL-terminated string, excluding the NUL. Hand-rolled: this
+# file is self-sufficient off ONE include (lib/syscalls.cyr) and must not grow a
+# dependency on lib/string.cyr just to measure a sysctl node name.
+fn _sys_cstr_len(s): i64 {
+    var n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+# Raw sysctl(2). `mib` is an array of 32-BIT ints and `miblen` its ELEMENT count
+# (not a byte count); `oldlenp` is IN/OUT — capacity in, actual byte length out.
+# Returns 0 / -errno: Darwin signals failure with the carry flag and a POSITIVE
+# errno, which both Mach-O backends already normalise to the Linux shape
+# (aarch64 `csneg x0,x0,x0,cc`, x86 `jnc +3; neg rax`), so `r < 0` is the correct
+# test on both. Live-probed on ecb and ach: bogus mib → -2 (ENOENT), undersized
+# buffer → -12 (ENOMEM).
+fn _sysctl_raw(mib, miblen, oldp, oldlenp, newp, newlen): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(SYS_SYSCTL, mib, miblen, oldp, oldlenp, newp, newlen);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — sysctl is a Darwin-only path
+    #endif
+}
+
+# sysctl a two-element MIB {a, b}. The pair is built with store32 so the element
+# width stays explicit — MIB entries are 32-bit ints, not i64 slots.
+fn _sysctl_two(a, b, oldp, oldlenp): i64 {
+    var mib[8];            # two 32-bit ints
+    var m = &mib;
+    store32(m, a);
+    store32(m + 4, b);
+    return _sysctl_raw(m, 2, oldp, oldlenp, 0, 0);
+}
+
+# Read a fixed-width integer node into the caller's i64 slot. `width` is the
+# exact byte count the node publishes (8 for hw.memsize, 4 for hw.pagesize) and
+# cannot be guessed — Darwin rejects an integer node read at the wrong size with
+# -ERANGE. The staging slot starts at 0 so a 4-byte node zero-extends cleanly.
+fn _sysctl_int(a, b, width, out): i64 {
+    var v = 0;
+    var len = width;
+    var r = _sysctl_two(a, b, &v, &len);
+    if (r < 0) { return r; }
+    store64(out, v);
+    return 0;
+}
+
+# Copy a string node into one 65-byte utsname field, truncating to 64 chars + NUL.
+# ⚠ A short `oldlenp` does NOT truncate — Darwin FAILS the call with -ENOMEM and
+# writes NOTHING. Measured on both hosts: kern.version is 104 bytes on ecb / 103
+# on ach, and reading it with oldlenp = 65 returned -12 with the destination left
+# byte-for-byte untouched (the 0xAA fill survived intact). So every field lands in
+# a scratch buffer first and is copied in. Note `outlen` INCLUDES the NUL
+# ("Darwin" → 7), which is why the copy needs no separate terminator hunt.
+fn _uts_field(a, b, dst, scratch, cap): i64 {
+    var len = cap;
+    var r = _sysctl_two(a, b, scratch, &len);
+    if (r < 0) { return r; }
+    var n = len;
+    if (n > 64) { n = 64; }
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, load8(scratch + i));
+        i = i + 1;
+    }
+    store8(dst + n, 0);    # n <= 64, so this stays inside the 65-byte field
+    return 0;
+}
+
+# Wall clock into a 16-byte struct timeval (tv_sec i64 @ +0, tv_usec i32 @ +8
+# with 4 bytes of tail pad — byte layout measured identically on ecb and ach).
+# clock_gettime is deliberately NOT used here: Darwin has no clock_gettime syscall, and
+# syscall(228)'s two Mach-O reroutes RETURN nanoseconds rather than filling a timespec
+# (arm64 binds _clock_gettime_nsec_np and never touches the buffer; x86 issues this same
+# gettimeofday — EMACHO_CLOCK_X86, routed since v6.5.16 — and returns the timeval composed
+# to ns for clock id 0, or for any other id the mach time the kernel copies out through the
+# third argument, which is ns at Intel's 1:1 timebase; 6.6.12). This note said 228 was
+# "unrouted on x86-macOS" until 6.6.10; gettimeofday is still the one source that fills a
+# struct timeval identically on both Macs.
+#
+# ⚠⚠ THE THIRD ARGUMENT IS NOT OPTIONAL AND MUST BE AN EXPLICIT NULL.
+# Darwin's gettimeofday syscall is
+#     gettimeofday(struct timeval *tp, struct timezone *tzp, uint64_t *mach_abs)
+# — the third parameter is an OUT-pointer the kernel writes mach_absolute_time
+# through. Passing only two args leaves the third ARG REGISTER (x2 / rdx) holding
+# whatever the previous code left there, and the kernel then writes 8 bytes to
+# that address. It is a silent, rc=0, arbitrary-address memory corruption.
+# This bit exactly once during development: `syscall(SYS_GETTIMEOFDAY, tv, 0)`
+# left x2 pointing at sys_sysinfo's OWN kern.boottime buffer, so the kernel
+# overwrote boottime's tv_sec (its tv_usec survived, which is what made the
+# corruption look like a plausible-but-wrong timestamp rather than garbage) and
+# uptime came out negative. Proven on hardware on BOTH targets by pointing the
+# third arg at a sentinel: ecb wrote 0x3AFC14FB55 (÷24 MHz timebase = 10523 s =
+# the box's uptime), ach wrote 0x35568623C86E1 ns (= 938 ks, likewise its
+# uptime); with the third arg 0, the sentinel was untouched on both.
+# ⚠ The compiler's own x86 reroute of syscall(228) (EMACHO_CLOCK_X86) made exactly this
+# mistake from v6.5.16 to 6.6.9 — it set rdi and rsi and never zeroed rdx — so every
+# clock_now_* on Intel-Mac wrote mach time through a stale rdx. CVE-51, CHANGELOG [6.6.10].
+# Since 6.6.12 it points rdx at its own 8-byte stack slot and returns that mach time for
+# every clock id but 0 (the monotonic read); this wrapper wants only the timeval, so NULL.
+fn _macos_gettimeofday(tv): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(SYS_GETTIMEOFDAY, tv, 0, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — Darwin-only path
+    #endif
+}
 
 # ================================================================
 # uname (utsname)
@@ -41,11 +181,37 @@ fn sys_uname(out): i64 {
     return syscall(SYS_UNAME, out);
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    return 0 - 38;   # ENOSYS — macOS uname is sysctl-based (not yet wired)
+    # Darwin has no uname(2) — synthesise the Linux-shaped 390-byte utsname from
+    # five sysctl string nodes so uname_hostname/_release/_machine keep working.
+    # Zero first: the 6th field (domainname, +325) has no sysctl source and no
+    # named offset, and the caller's buffer is uninitialised stack — leaving it
+    # as garbage would hand back an unterminated field.
+    var z = 0;
+    while (z < UTS_SIZE) { store8(out + z, 0); z = z + 1; }
+    var scratch[384];   # kern.version measured 104 B (ecb) / 103 B (ach); headroom to grow
+    var sp = &scratch;
+    var r = _uts_field(CTL_KERN, KERN_OSTYPE, out + UTS_SYSNAME, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_HOSTNAME, out + UTS_NODENAME, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_OSRELEASE, out + UTS_RELEASE, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_VERSION, out + UTS_VERSION, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_HW, HW_MACHINE, out + UTS_MACHINE, sp, 384);
+    if (r < 0) { return r; }
+    return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows has no uname (GetVersionEx)
     #endif
+    # DEFAULT ARM — see the note on sys_utimensat in syscalls_linux_common.cyr:
+    # this preprocessor has no `#else`, so a chain naming only some targets falls
+    # off the end on every other one and returns the register's leftovers. This
+    # file COMPILES for cx (v6.6.6 gave the cx driver a target predefine), so
+    # without this a cx consumer got garbage from a call it had every reason to
+    # trust. CHANGELOG [6.6.6]
+    return 0 - 38;
 }
 
 # Pointer to the nodename (hostname) field of a filled utsname buffer.
@@ -64,8 +230,30 @@ fn uname_machine(uts): i64 { return uts + UTS_MACHINE; }
 # §4.4): uptime@0, totalram@8, freeram@16, procs@24, cpus@32 (byte counts
 # direct — no mem_unit scaling).
 #ifdef CYRIUS_TARGET_AGNOS
-enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 8; SI_FREERAM = 16; SI_PROCS = 24; SI_CPUS = 32; }
-enum SysInfoConst { SYSINFO_SIZE = 40; }
+# v6.5.45: AGNOS `sysinfo`#35 grew a TAIL at 1.56.59 (200 bytes) and again at 1.57.9, and is
+# now 208 bytes / 26 u64 (agnos-userland-abi.md §4.4). The syscall's documented rule is that
+# future fields append at the tail and bump the minimum len, while existing offsets are frozen
+# ABI the moment a consumer reads them — so the base 40-byte layout below is unchanged and
+# everything new is additive.
+#
+# ⛔ THE LENGTH TIERS ARE 40 / 104 / 200 / 208 AND EACH GATES ITS BAND INDEPENDENTLY. A caller
+# passing 40..103 gets exactly the base struct; 104..199 gets the per-core band and NOT the
+# disk band; 200..207 gets both; 208+ also gets `sched_kicks` (1.57.9). That is why
+# `sys_sysinfo` (arity 1) can keep asking for 40 forever without breaking, and why reading a
+# tail field requires `sys_sysinfo_n` with a length that actually covers it — a short buffer
+# does not error, it just leaves your band unwritten, so a caller who forgets reads whatever
+# was on its stack. (A kernel OLDER than the band does the same: it accepts the longer length
+# and never writes the new field.) SYSINFO_SIZE_FULL is the WHOLE struct — it moved 200 -> 208
+# at 6.6.7, and SYSINFO_SIZE_BLK keeps the name for the old 200 tier. CHANGELOG [6.6.7]
+enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 8; SI_FREERAM = 16; SI_PROCS = 24; SI_CPUS = 32;
+    SI_CPU_BASE = 40; SI_BLK_BASE = 104; SI_SCHED_KICKS = 200; }
+enum SysInfoConst { SYSINFO_SIZE = 40;          # base band — uptime/ram/procs/cpus
+    SYSINFO_SIZE_CPU = 104;     # + per-core CPU ticks (agnos 1.56.59)
+    SYSINFO_SIZE_BLK = 200;     # + per-device block counters (agnos 1.56.59)
+    SYSINFO_SIZE_FULL = 208;    # + sched_kicks — the whole struct (agnos 1.57.9)
+    SYSINFO_BAND_STRIDE = 16;   # both tail bands are {read/user, write/kern} u64 pairs
+    SYSINFO_MAX_CPUS = 4;       # the hard kernel-wide cap pcpu_cpu() enforces
+    SYSINFO_MAX_BLK_TAGS = 6; } # BLK_NONE(0) + the 5-value device enum
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
 enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 32; SI_FREERAM = 40; SI_PROCS = 80; SI_MEM_UNIT = 104; }
@@ -81,10 +269,167 @@ fn sys_sysinfo(out): i64 {
     return syscall(SYS_SYSINFO, out);
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    return 0 - 38;   # ENOSYS — macOS uses sysctl(hw.memsize / kern.boottime)
+    # Darwin has no sysinfo(2) — synthesise the Linux-shaped struct:
+    #   uptime   = gettimeofday().tv_sec - kern.boottime.tv_sec
+    #   totalram = hw.memsize
+    #   freeram  = vm.page_free_count * hw.pagesize   (see the note below)
+    # Zero FIRST: the caller's buffer is uninitialised stack and BOTH memory
+    # accessors read mem_unit (+104). Garbage there turns a correct totalram into
+    # a saturated 0x7FFF… via the overflow guard; 0 means "identity scale", so
+    # every field written below is a raw BYTE count. procs (+80) stays 0 — Darwin
+    # has no counter node for it (it needs a KERN_PROC table walk), and 0 is
+    # honest where a made-up figure would not be.
+    var z = 0;
+    while (z < SYSINFO_SIZE) { store8(out + z, 0); z = z + 1; }
+
+    # Uptime. kern.boottime is a struct timeval; only tv_sec (i64 @ +0) is used —
+    # tv_usec is a 32-bit field with tail padding, so load64 past it is not safe
+    # to interpret, and second resolution is all sysinfo carries anyway.
+    var bt[32];
+    var btp = &bt;
+    var btlen = 16;
+    var r = _sysctl_two(CTL_KERN, KERN_BOOTTIME, btp, &btlen);
+    if (r < 0) { return r; }
+    var tv[32];
+    var tvp = &tv;
+    r = _macos_gettimeofday(tvp);
+    if (r < 0) { return r; }
+    store64(out + SI_UPTIME, load64(tvp) - load64(btp));
+
+    # Total RAM. hw.memsize is the ONLY correct source: hw.physmem {6,5} is a
+    # 32-bit node that CLAMPS at 2 GiB (measured 2147483648 on ach's 16 GiB host).
+    var total = 0;
+    r = _sysctl_int(CTL_HW, HW_MEMSIZE, 8, &total);
+    if (r < 0) { return r; }
+    store64(out + SI_TOTALRAM, total);
+
+    # Free RAM. Darwin publishes NO fixed MIB for it: vm.page_free_count is an
+    # OID_AUTO node whose numeric oid is assigned in kernel-registration order at
+    # build time and measurably differs by kernel — {2,292} on ecb (Darwin 25.6.0)
+    # vs {2,259} on ach (Darwin 22.6.0). Hardcoding either is worse than useless:
+    # cross-tested on both hosts, the wrong oid returns rc=0 with value 0 — no
+    # carry, no errno, nothing a caller could check — so a fabricated number would
+    # sail through the `free >= 0` assertion green on both. Resolve the name at
+    # runtime through {CTL_UNSPEC, 3} (name2oid) instead; that reuses the single
+    # SYS_SYSCTL alias rather than adding a second one, and was verified live on
+    # both hosts. (Mach host_statistics64 also reports this, but it is a Mach trap,
+    # not a BSD syscall, so it is unreachable from the `syscall` builtin.)
+    # If either step fails, freeram stays 0 — honest for "not reported"; we do not
+    # invent a figure.
+    var oid[64];
+    var oidp = &oid;
+    var oidlen = 64;
+    var qmib[8];
+    var qp = &qmib;
+    store32(qp, CTL_UNSPEC);
+    store32(qp + 4, CTL_NAME2OID);
+    var nm = "vm.page_free_count";
+    var rq = _sysctl_raw(qp, 2, oidp, &oidlen, nm, _sys_cstr_len(nm));
+    if (rq == 0) {
+        var pages = 0;
+        var plen = 4;
+        var rp = _sysctl_raw(oidp, oidlen / 4, &pages, &plen, 0, 0);
+        var psz = 0;
+        var rs = _sysctl_int(CTL_HW, HW_PAGESIZE, 4, &psz);
+        if (rp == 0) {
+            if (rs == 0) { store64(out + SI_FREERAM, pages * psz); }
+        }
+    }
+    return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows uses GlobalMemoryStatusEx / GetTickCount64
+    #endif
+    # DEFAULT ARM — ENOSYS on any target this chain does not name. CHANGELOG [6.6.6]
+    return 0 - 38;
+}
+
+# Fill a caller-provided sysinfo buffer, asking for `len` bytes. Returns 0 / -errno.
+#
+# ⭐ THIS IS HOW YOU REACH AGNOS'S TAIL BANDS. `sys_sysinfo(out)` hardcodes 40, so every
+# wrapper consumer saw exactly the base struct no matter how much the kernel had to offer —
+# chakshu, the system monitor this was built for, reads #35 only through lib/mihi.cyr and so
+# could not see the per-core or block fields at all. Pass SYSINFO_SIZE_CPU for the CPU band,
+# SYSINFO_SIZE_BLK for CPU + block, or SYSINFO_SIZE_FULL for the whole struct, and size `out`
+# to match.
+#
+# ⚠ NO NEW SYSCALL NUMBER IS INVOLVED, and that is the point of the change. agnos appended to
+# #35's tail precisely so new capability costs no number; the previous attempt minted
+# `blkstats`#105 for the block band, shipped as a cyrius peer in 6.5.44, and WITHDREW it one
+# release later once an audit found a closed tag enum over flat arrays is just a fixed-size
+# tail block. See the withdrawal note in lib/syscalls_x86_64_agnos.cyr.
+#
+# On non-AGNOS targets `len` is advisory: Linux `sysinfo(2)` takes no length and the macOS
+# emulation writes the Linux-shaped struct, so this delegates and the argument is ignored
+# rather than silently changing behaviour.
+fn sys_sysinfo_n(out, len): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_SYSINFO, out, len);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_sysinfo(out);
+    #endif
+}
+
+#ifdef CYRIUS_TARGET_AGNOS
+# ── Tail accessors. Named, because hand-computing `+104 + tag*16 + 8` at every call site is
+# how an off-by-one band read becomes a plausible-looking statistic. Each returns -1 for an
+# out-of-range index; the counters themselves are non-negative sector/tick totals, monotonic
+# since boot and never reset, so a monitor differences two samples for a rate.
+#
+# ⚠ THE BUFFER MUST HAVE BEEN FILLED BY sys_sysinfo_n WITH A LENGTH COVERING THE BAND. These
+# only compute an offset — they cannot tell an unwritten band from a zeroed one.
+
+# 100 Hz ticks whose interrupted context was ring 3 (Linux's %us), for `cpu` in 0..3.
+fn sysinfo_cpu_user(buf, cpu): i64 {
+    if (cpu < 0) { return 0 - 1; }
+    if (cpu >= SYSINFO_MAX_CPUS) { return 0 - 1; }
+    return load64(buf + SI_CPU_BASE + cpu * SYSINFO_BAND_STRIDE);
+}
+# 100 Hz ticks whose interrupted context was ring 0 (Linux's %sy), for `cpu` in 0..3.
+fn sysinfo_cpu_kern(buf, cpu): i64 {
+    if (cpu < 0) { return 0 - 1; }
+    if (cpu >= SYSINFO_MAX_CPUS) { return 0 - 1; }
+    return load64(buf + SI_CPU_BASE + cpu * SYSINFO_BAND_STRIDE + 8);
+}
+# Cumulative sectors READ on device `tag`. Tags are the BLK_* enum blk_enum#75 hands out:
+# 0 = BLK_NONE (reserved, always 0) · 1 virtio · 2 nvme · 3 ahci · 4 usb-ms · 5 ramdisk.
+# ⚠ SECTORS, NOT BYTES, deliberately: a byte figure would need the per-device LBA size, which
+# can be 4096, so multiply by `blk_info`#79's reported lba_bytes if you want bytes.
+fn sysinfo_blk_read(buf, tag): i64 {
+    if (tag < 0) { return 0 - 1; }
+    if (tag >= SYSINFO_MAX_BLK_TAGS) { return 0 - 1; }
+    return load64(buf + SI_BLK_BASE + tag * SYSINFO_BAND_STRIDE);
+}
+# Cumulative sectors WRITTEN on device `tag`. Same tag space as sysinfo_blk_read.
+fn sysinfo_blk_write(buf, tag): i64 {
+    if (tag < 0) { return 0 - 1; }
+    if (tag >= SYSINFO_MAX_BLK_TAGS) { return 0 - 1; }
+    return load64(buf + SI_BLK_BASE + tag * SYSINFO_BAND_STRIDE + 8);
+}
+#endif
+
+# Reschedule kicks (0xE1 IPIs) SENT since boot, all CPUs — agnos `sysinfo`#35 +200, 1.57.9.
+# Wakes plus `sched_yield_to`#108's directed kicks; a racy diagnostic counter that may
+# under-count and never over-counts, monotonic, never reset. Returns the count, -1 when the
+# kernel did not report it (agnos < 1.57.9 accepts the 208-byte length and leaves +200
+# unwritten, so the slot is pre-filled with -1 and comes back unchanged), or -errno.
+# Not wired off agnos (-ENOSYS): Linux's nearest figure, /proc/interrupts' RES row, counts
+# kicks RECEIVED per CPU, which is a different number. CHANGELOG [6.6.7]
+fn sys_sched_kicks(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # Sized by the same constant as the length passed below: the kernel writes that many. (6.6.7
+    # spelled it as the literal 208 because an enum constant past var index 1024 did not fold,
+    # and a program with the folded stdlibs in scope reaches that index before this line — fixed
+    # at 6.6.8, so the constant is back.) agnos_sysinfo_tail_parity pins FULL at 208. CHANGELOG [6.6.8]
+    var buf[SYSINFO_SIZE_FULL];
+    store64(&buf + SI_SCHED_KICKS, 0 - 1);
+    var r = sys_sysinfo_n(&buf, SYSINFO_SIZE_FULL);
+    if (r < 0) { return r; }
+    return load64(&buf + SI_SCHED_KICKS);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return 0 - 38;
     #endif
 }
 
@@ -182,13 +527,18 @@ fn sys_gettid(): i64 {
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows GetCurrentThreadId not yet wired
     #endif
+    # DEFAULT ARM — ENOSYS on any target this chain does not name. CHANGELOG [6.6.6]
+    return 0 - 38;
 }
 
 # ================================================================
 # Root check
 # ================================================================
 # Linux: effective uid == 0. AGNOS: uid == 0 (no separate euid concept —
-# capability gates, not euid perms). macOS/Windows: stubbed false.
+# capability gates, not euid perms). Windows: stubbed false (no getuid;
+# identity is OpenProcessToken). macOS: REAL as of v6.5.16 — computes
+# sys_geteuid() == 0 (was hardcoded 0, which made the whole credential
+# family untestable — see issues/archived/2026-08-09-getuid-geteuid-*).
 fn is_root(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     if (sys_getuid() == 0) { return 1; }
@@ -199,9 +549,24 @@ fn is_root(): i64 {
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_MACOS
+    # v6.5.16: was a hardcoded `return 0`. Darwin is a real POSIX system with a real
+    # euid, so there was never a reason to stub it — and the stub was actively harmful:
+    # it was the ONLY consumer of sys_geteuid on macOS, so short-circuiting it meant the
+    # wrapper was never called, and the fact that sys_geteuid was UNROUTED on both
+    # Mach-O backends (SIGSYS on Intel-Mac, -9 on Apple Silicon) stayed invisible while
+    # the test in the area passed vacuously. Both routes landed this release; this arm is
+    # now identical to the Linux one. See tests/tcyr/crossos/uid_identity.tcyr.
+    if (sys_geteuid() == 0) { return 1; }
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0;
     #endif
+    # DEFAULT ARM — 0, and deliberately NOT the -38/ENOSYS the rest of this file
+    # uses for "not wired": this fn is a BOOLEAN read as `if (is_root())`, so any
+    # non-zero "error" is indistinguishable from "yes, root". Falling off the end
+    # returned the register's leftovers, which is the same coin flip with worse
+    # odds — on a target this chain does not name (cx today), answer "not root".
+    # CHANGELOG [6.6.6]
+    return 0;
 }

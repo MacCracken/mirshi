@@ -1,7 +1,13 @@
 # dynlib.cyr — pure Cyrius dynamic library loader (ELF .so)
 # Usage: include "lib/dynlib.cyr"
-# Requires: string.cyr, syscalls.cyr, mmap.cyr
+# Includes its own definers: string.cyr, alloc.cyr, mmap.cyr, fnptr.cyr, result.cyr.
 
+# 6.6.9: the loader maps segments with cyr_mmap / cyr_munmap and PROT_* (mmap.cyr) and copies
+# with the string.cyr helpers; mmap.cyr was listed for the caller instead of included, so a
+# bare include was a hard error (`undefined variable 'PROT_READ'`). CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/mmap.cyr"
 include "lib/fnptr.cyr"
 # v5.8.31: Result-returning *_r variants (dynlib_open_r,
 # dynlib_sym_r) for typed error returns.
@@ -198,6 +204,7 @@ fn _phdr_memsz(p) : i64 { return load64(p + 40); }
 #   +88+0..63: needed offsets   +88+64: needed_count
 fn _parse_dynamic(base, dyn_offset, dyn_size): i64 {
     var result = alloc(160);
+    if (result == 0) { return 0; }
     var ri = 0;
     while (ri < 160) { store8(result + ri, 0); ri = ri + 1; }
 
@@ -635,6 +642,14 @@ fn dynlib_open(path): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: an x86_64-only loader (R_X86_64_* reloc types, ld-linux-x86-64.so.2) —
+    # declined BY DECISION. ⚠ Land this WITH the ESYSXLAT 5→80 row, never the row alone:
+    # with the row alone this fn turned fail-closed (raw fstat(5) ran as setxattr → EFAULT)
+    # into fail-OPEN — it mmap'd an aarch64 .so, walked its relocs against x86 constants and
+    # handed back a handle (measured under qemu). CHANGELOG [6.6.4]
+    return 0;
+    #endif
     # Check if already loaded
     var existing = _dynlib_find_loaded(path);
     if (existing != 0) { return existing; }
@@ -666,6 +681,15 @@ fn dynlib_open(path): i64 {
 
     # Validate ELF header
     if (_elf_check_magic(hdr) == 0) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+    # v6.6.4: the loader-side belt to the arch decline's braces — this loader applies
+    # R_X86_64_* relocations, so an object for any other machine (e_machine @18 != 62
+    # EM_X86_64) is refused even on an x86 host; the x86 build "loaded" an aarch64 .so
+    # with every reloc skipped before this check existed.
+    if (load16(hdr + 18) != 62) {
         cyr_munmap(hdr, file_size);
         syscall(3, fd);
         return 0;
@@ -756,13 +780,13 @@ fn dynlib_open(path): i64 {
             var map_msz = (msz + page_adj + 4095) & (0 - 4096);
             # Map file-backed portion
             cyr_mmap(bias + page_va, map_fsz, map_prot,
-            MAP_PRIVATE | MAP_FIXED, fd, page_off);
+              MAP_PRIVATE | MAP_FIXED, fd, page_off);
             # BSS: if memsz > filesz, map anonymous pages for the rest
             if (map_msz > map_fsz) {
                 cyr_mmap(bias + page_va + map_fsz,
-                map_msz - map_fsz, map_prot,
-                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
-                0 - 1, 0);
+                  map_msz - map_fsz, map_prot,
+                  MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                  0 - 1, 0);
             }
             # Zero partial BSS within the last file-backed page
             if (msz > fsz) {
@@ -781,6 +805,7 @@ fn dynlib_open(path): i64 {
 
     # Parse dynamic section from the properly loaded segments
     var dinfo = _parse_dynamic(bias, dyn_offset, dyn_size);
+    if (dinfo == 0) { cyr_munmap(base, span); return 0; }
     var symtab_vaddr  = load64(dinfo);
     var strtab_vaddr  = load64(dinfo + 8);
     var gnuhash_vaddr = load64(dinfo + 24);
@@ -799,6 +824,7 @@ fn dynlib_open(path): i64 {
 
     # Allocate handle
     var h = alloc(120);
+    if (h == 0) { cyr_munmap(base, span); return 0; }
     store64(h, base);
     store64(h + 8, span);
     store64(h + 16, dynsym);
@@ -889,16 +915,44 @@ fn dynlib_bootstrap_tls(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: arch_prctl(ARCH_SET_FS) is x86-only; the raw 158 reached aarch64 as
+    # getgroups(0x1002, tls), which SUCCEEDS (rc = ngroups) and fills the buffer with gids
+    # — so a process with zero supplementary groups got rc == 0 and a bogus "TLS installed"
+    # pointer back. Declined because the surrounding loader is x86_64-only, not because an
+    # aarch64 TLS install is impossible: lib/thread_local.cyr's _tlocal_install already does
+    # `msr TPIDR_EL0` for the native path. CHANGELOG [6.6.4]
+    return 0;
+    #endif
+    # v6.6.8: x86-macOS declines too. Darwin has no arch_prctl — its raw 158 reached Darwin
+    # unrouted, a SIGSYS kill — and the loader this bootstraps (ld-linux-x86-64.so.2) does not
+    # exist there. fdlopen_dynlib_decline.tcyr's x86 non-Linux arm claimed this decline
+    # ("decline on macOS/PE already") and asserted nothing; it asserts it now. CHANGELOG [6.6.8]
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0;
+    #endif
     var tls = alloc(4096);
     if (tls == 0) { return 0; }
     var i = 0;
     while (i < 4096) { store8(tls + i, 0); i = i + 1; }
     store64(tls, tls);            # tcb->self
     store64(tls + 16, tls);       # NPTL self-pointer
-    # arch_prctl(ARCH_SET_FS=0x1002, tls) — syscall 158
+    # arch_prctl(ARCH_SET_FS=0x1002, tls) — x86_64 syscall 158, and x86-only: the aarch64
+    # arm declined above, and this guard keeps the raw number out of arch-neutral code (the
+    # raw_syscall_literals_routed gate).
+    # ⚠ The #ifndef MACOS is what keeps the NUMBER out of a macOS build; the early return
+    # above alone would leave an unreachable-but-compiled 158 warning on every x86-macOS build
+    # that includes this file.
+    #ifndef CYRIUS_TARGET_MACOS
+    #ifdef CYRIUS_ARCH_X86
     var rc = syscall(158, 0x1002, tls);
     if (rc != 0) { return 0; }
     return tls;
+    #endif
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    return 0;
+    #endif
 }
 
 # Populate `__libc_stack_end` (exported from ld-linux) with a sensible
@@ -1036,7 +1090,7 @@ fn dynlib_bootstrap_locale(hc): i64 {
 # Intermediate step: getenv + simple env-query work post-call, but
 # NSS-dispatching (getpwuid / getgrouplist / pam_authenticate / etc.)
 # + strerror still SIGSEGV — needs deeper libc init, pinned forward.
-# See CHANGELOG [5.5.24] + docs/development/issues/dynlib-nss-bootstrap.md.
+# See CHANGELOG [5.5.24] + docs/development/issues/archived/dynlib-nss-bootstrap.md.
 fn dynlib_bootstrap_environ(hc): i64 {
     if (hc == 0) { return 1; }
     var fp_env  = dynlib_sym(hc, "__environ");

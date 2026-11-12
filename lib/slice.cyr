@@ -21,6 +21,9 @@
 # `slice bounds violation\n` to stderr and exit 134.
 
 include "lib/syscalls.cyr"
+# 6.6.9: slice_copy_bytes / slice_eq_bytes call memcpy / memeq (string.cyr); this file included
+# only syscalls.cyr, so a bare include left both undefined. CHANGELOG [6.6.9]
+include "lib/string.cyr"
 #
 # All helpers take a slice POINTER (`&s`), mirroring the u128 /
 # struct-by-pointer convention that pervades cyrius's stdlib.

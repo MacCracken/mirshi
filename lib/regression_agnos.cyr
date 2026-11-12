@@ -1,45 +1,476 @@
-# regression_agnos.cyr — AGNOS (ring-3) stubs for regression.cyr's fork+exec
-# process/SSH helpers.
+# regression_agnos.cyr — AGNOS (ring-3) peers of regression.cyr's process / SSH helpers.
 # Usage: included by lib/regression.cyr under #ifdef CYRIUS_TARGET_AGNOS.
-# Requires: alloc.cyr (only for exec_capture_status status_out writes).
+# Requires: the agnos syscall peer (its _agnos_blob_* / _agnos_wait_poll / _agnos_kill_reap child
+# helpers and the _agnos_dl_* deadline), string.cyr (memcpy), io.cyr (file_open), and
+# regression.cyr's SHARED deadline knobs, deadline-kill counters and _regression_store_status —
+# all of which regression.cyr defines BEFORE it includes this file.
 #
-# AGNOS's frozen syscall surface has no fork/dup2/execve/chdir/wait4 — the
-# POSIX fork+redirect+execve model these helpers use can't map onto agnos's
-# in-memory-ELF SYS_SPAWN (#3) primitive (no stdin/stdout redirect, no /bin
-# paths). So every fork+exec verb is UNSUPPORTED on agnos and fail-closed here,
-# exactly as lib/process_agnos.cyr fail-closes its run_capture/exec_capture
-# ("capture unsupported on agnos" → -1). Each stub returns the same sentinel
-# its host counterpart returns on a fork failure, so callers' existing
-# `< 0` / `== 0` error paths stay correct. The PORTABLE regression verbs
-# (display, buffer-scan, regression_network_probe, regression_ssh_target) are
-# NOT here — they stay shared in regression.cyr (network_probe has its own
-# agnos branch over the net.cyr socket adapter). Resolves the regression.cyr
-# layer of issue 2026-06-15-cyrius-thread-agnos-clone-dispatch.md.
+# ⭐ THE VERBS RUN REAL CHILDREN (6.6.10). They were v6.2.7 constant stubs — "not run" — although
+# agnos can spawn from disk with an argv and a clean fd table (spawn_path#43, 1.57.6), redirect a
+# child's fds at spawn time (#62), report a real wait status (1.57.7) and end a process tree
+# (kill_tree, 1.57.7). The POSIX verbs are fork + dup2 + execve with /dev/null, TEMP FILES and
+# poll(2); agnos has none of those, so the same contract is met differently:
+#   * EVERY CHILD FD IS A PIPE. fd 0 is a pipe whose write end we close at once (the child reads
+#     EOF, as from /dev/null) or feed; fd 1 and fd 2 are pipes we DRAIN — into the caller's
+#     buffer, into the output file, or into a scratch buffer that is thrown away. ⛔ Not through
+#     a closed read end: the child's writes would then FAIL (-1: agnos has no SIGPIPE) where a
+#     /dev/null write succeeds, and a child that checks its writes would behave differently here.
+#     ⛔ And never a FILE fd redirected into the child: vfs_fd_inherit copies fd entries BY VALUE,
+#     and a FAT/exFAT write entry releases its pool block when the parent closes ITS copy while
+#     the child's copy still names it. The parent writes the output file itself.
+#   * ONE INTERLEAVED, NON-BLOCKING PUMP (_rga_pump). A pipe ring is 4080 B: a child that writes
+#     more than that before it has read all of its stdin BLOCKS on its write, so a parent that
+#     writes all of stdin before it reads blocks on ITS write — a deadlock until the deadline.
+#     The pump alternates sys_write_nb of a stdin chunk with sys_read_nb of each output.
+#   * THE SOURCE IS STREAMED in chunks (the POSIX verb reads up to 1 MB into an alloc first).
+#   * THE DEADLINE is the same CYRIUS_CHECK_TIMEOUT bound, over the whole run (pump + wait), on the
+#     peer's clock (_agnos_dl_*: uptime_us#95, the RTC, a spin backstop). At the deadline the
+#     child's tree is ended with kill_tree(9) AT ONCE — SIGTERM has no default action on agnos, so
+#     the POSIX TERM -> grace -> KILL sequence would end nothing — reaped, COUNTED (the shared
+#     regression_deadline_kills / regression_last_deadline_ms) and reported as -2.
+#   * THE WAIT POLLS #4: WAIT_BLOCK has no timeout and takes only pids 0..15.
+# Differences from the POSIX verbs, stated: argv[0] must be an ABSOLUTE path on the ext2 root (no
+# PATH search, no shell); an EMPTY envp runs the child with the kernel's default environment
+# (agnos cannot say "no environment"); a death by a ring-3 fault reads as exit code 128 + vector
+# (a #PF is 142) with [1] = 0, because that is the status the kernel reports; and an argv or env
+# over the #43 limits (16 entries, 1024 bytes) is refused, never truncated.
+# KERNEL FLOOR: 1.57.7 (a real wait status, kill_tree; an older kernel is killed pid-alone), and
+# 1.57.9 for the stdin-feeding pipe_to_bin verbs (sys_write_nb). An agnos older than 1.57.6
+# answers -1 to every #43: nothing runs and each verb reports its failure value.
+# The ssh / scp / codesign / exec-in-dir verbs have nothing to port to on agnos (no ssh, no scp,
+# no codesign, no cwd) and stay fail-closed. The PORTABLE verbs (display, buffer-scan,
+# regression_network_probe, regression_ssh_target) are NOT here — they stay shared.
 #
-# Stdlib convention these mirror: 0..127 normal exit; -1 fork/exec failure;
-# -2 timeout. On agnos there is no child, so the "fork failed" sentinel is the
-# honest result.
+# Stdlib convention these mirror: 0..127 normal exit; 128+sig on a signal; -1 spawn failure or no
+# status; -2 the deadline. CHANGELOG [6.6.10]
 
-# Pipe a source file to a binary's stdin, capture stdout — unsupported on agnos.
-fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 { return 0 - 1; }
-# Pipe a source file to a binary's stdin, discard output — unsupported on agnos.
-fn regression_pipe_to_bin(bin_path, src_path, envp): i64 { return 0 - 1; }
-# Fork+exec with a wall-clock timeout — unsupported on agnos.
-fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 { return 0 - 1; }
-# Exec + capture stdout with exit-status detail — unsupported on agnos; marks
-# status_out failure ([0]=-1, [1]=0) and returns 0 bytes captured.
-fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 {
-    if (status_out != 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); }
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/io.cyr"
+# The shared deadline knobs, counters and _regression_store_status. Through lib/regression.cyr
+# (the normal way in) this include is already open and is skipped; included ALONE, it pulls them
+# in BEFORE the code below, which is what keeps this module self-sufficient.
+include "lib/regression.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+# ── one child: its pipes, its pump, its end ──
+# A job is 11 i64 slots on the caller's stack (`var j[88]`):
+#   +0 pid · +8 stdin write end · +16 stdout read end · +24 stderr read end (-1 = none / closed)
+#   +32 the file streamed to stdin (-1: none) · +40 the file stdout is written to (-1: none)
+#   +48 capture buffer · +56 its size · +64 bytes captured · +72 1 once the deadline fired
+#   +80 1 once a write to the output file failed or came up short
+
+# Close `fd` when it is open. Returns -1, the "closed" marker a slot is set back to.
+fn _rga_close(fd): i64 {
+    if (fd >= 0) { sys_close(fd); }
+    return 0 - 1;
+}
+
+# A fresh job: every fd slot -1, nothing captured.
+fn _rga_job_init(j): i64 {
+    var i = 0;
+    while (i < 10) { store64(j + i * 8, 0 - 1); i = i + 1; }
+    store64(j + 48, 0);
+    store64(j + 56, 0);
+    store64(j + 64, 0);
+    store64(j + 72, 0);
+    store64(j + 80, 0);
     return 0;
 }
-# Exec + capture stdout — unsupported on agnos; returns 0 bytes captured.
-fn regression_exec_capture(bin_path, buf, buflen, envp): i64 { return 0; }
-# Exec a binary, discard output — unsupported on agnos.
-fn regression_exec_run(bin_path, envp): i64 { return 0 - 1; }
-# Exec binary with one arg, capture stdout — unsupported on agnos; 0 captured.
-fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 { return 0; }
-# Exec binary with one arg, capture stdout+stderr — unsupported on agnos; 0 captured.
-fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 { return 0; }
+
+# The #43 argv blob for `bin [arg]` into `b` (SPAWN_ARGV_MAX bytes). Length, or -1 (a null or
+# empty path, or it does not fit).
+fn _rga_argv(b, bin, arg): i64 {
+    var off = _agnos_blob_put(b, 0, SPAWN_ARGV_MAX, bin);
+    if (off < 2) { return 0 - 1; }
+    if (arg != 0) { off = _agnos_blob_put(b, off, SPAWN_ARGV_MAX, arg); }
+    return off;
+}
+
+# The env blob for the POSIX `envp` array into `e` (1024 bytes). Length (0 = the kernel's default
+# env, for a null or empty envp), or -1 (more than 16 entries, over 1024 bytes, or not KEY=VALUE).
+fn _rga_env(e, envp): i64 {
+    return _agnos_blob_ptrs(e, 0, 1024, envp, 0, 1);
+}
+
+# Close every pipe end a failed setup opened (`p` holds up to three pipes, 16 bytes each, with
+# -1 in the slots of pipes never made), then clear the redirect arms the way the kernel does:
+# through a #43 (_agnos_spawn_refuse), so no arm made for THIS call reaches the NEXT child.
+fn _rga_setup_fail(p): i64 {
+    var i = 0;
+    while (i < 6) { _rga_close(load64(p + i * 8)); i = i + 1; }
+    _agnos_spawn_refuse();
+    return 0 - 1;
+}
+
+# Spawn argv blob `b` (`blen`) with env blob `e` (`elen`) as job `j`: child fd 0 <- a pipe (its
+# write end kept at j+8 when `feed` is 1, closed at once otherwise), fd 1 -> a pipe (read end
+# j+16), fd 2 -> its own pipe (j+24), or onto fd 1 when `merge` is 1. SPAWN_F_CLEANFD, so the
+# child holds exactly those three. The pipes are made in that order: stdin, stdout, stderr.
+# Returns the pid (also at j+0), or -1 / -SPAWN_E_*; on any failure nothing is left open.
+fn _rga_spawn(j, b, blen, e, elen, feed, merge): i64 {
+    var p[48];
+    var i = 0;
+    while (i < 6) { store64(&p + i * 8, 0 - 1); i = i + 1; }
+    if (blen < 0 || elen < 0) { return _rga_setup_fail(&p); }
+    if (sys_pipe(&p) < 0) { store64(&p, 0 - 1); store64(&p + 8, 0 - 1); return _rga_setup_fail(&p); }
+    if (sys_pipe(&p + 16) < 0) { store64(&p + 16, 0 - 1); store64(&p + 24, 0 - 1); return _rga_setup_fail(&p); }
+    if (merge == 0) {
+        if (sys_pipe(&p + 32) < 0) { store64(&p + 32, 0 - 1); store64(&p + 40, 0 - 1); return _rga_setup_fail(&p); }
+    }
+    if (sys_exec_redirect(0, load64(&p)) < 0) { return _rga_setup_fail(&p); }
+    if (sys_exec_redirect_add(1, load64(&p + 24)) < 0) { return _rga_setup_fail(&p); }
+    var ra = 0;
+    if (merge == 1) { ra = sys_exec_redirect_add(2, 1); }
+    else { ra = sys_exec_redirect_add(2, load64(&p + 40)); }
+    if (ra < 0) { return _rga_setup_fail(&p); }
+    var ep = e;
+    if (elen == 0) { ep = 0; }
+    var pid = sys_spawn_argv(b, blen, ep, elen, SPAWN_F_CLEANFD);   # every #43 return clears the arms
+    _rga_close(load64(&p));          # the child's ends: ours are closed so EOF can come
+    _rga_close(load64(&p + 24));
+    _rga_close(load64(&p + 40));
+    if (feed == 0) { _rga_close(load64(&p + 8)); store64(&p + 8, 0 - 1); }
+    if (pid < 0) {
+        _rga_close(load64(&p + 8));
+        _rga_close(load64(&p + 16));
+        _rga_close(load64(&p + 32));
+        return pid;
+    }
+    store64(j, pid);
+    store64(j + 8, load64(&p + 8));
+    store64(j + 16, load64(&p + 16));
+    store64(j + 24, load64(&p + 32));
+    return pid;
+}
+
+# Hand `n` bytes of the child's stdout at `src` on: into the capture buffer while it has room,
+# then to the output file; the rest is discarded (the pump still drained it, so the child never
+# blocks on a full pipe). The file write is looped over short writes; a write that fails (or takes
+# nothing) sets j+80 and stops further writes — the pump still drains — so the verb can report the
+# truncated file instead of the child's exit code. On POSIX the CHILD writes the file, so this
+# failure exists only here. CHANGELOG [6.6.10]
+fn _rga_deliver(j, src, n): i64 {
+    var room = load64(j + 56) - load64(j + 64);
+    var c = n;
+    if (c > room) { c = room; }
+    if (c > 0) {
+        memcpy(load64(j + 48) + load64(j + 64), src, c);
+        store64(j + 64, load64(j + 64) + c);
+    }
+    if (load64(j + 40) < 0 || load64(j + 80) != 0) { return 0; }
+    var off = 0;
+    while (off < n) {
+        var w = sys_write(load64(j + 40), src + off, n - off);
+        if (w <= 0) { store64(j + 80, 1); return 0; }
+        off = off + w;
+    }
+    return 0;
+}
+
+# One non-blocking read of the output pipe in slot `slot` (16 stdout, 24 stderr); stdout's bytes
+# go to _rga_deliver, stderr's nowhere. Returns 1 on progress, 0 when nothing is there yet, and
+# closes the slot (-1) at EOF or on an error.
+fn _rga_take(j, slot): i64 {
+    var fd = load64(j + slot);
+    if (fd < 0) { return 0; }
+    var tmp[1024];
+    var r = sys_read_nb(fd, &tmp, 1024);
+    if (r == 0 - 2 || r == 0 - 3) { return 0; }
+    if (r <= 0) { store64(j + slot, _rga_close(fd)); return 0; }
+    if (slot == 16) { _rga_deliver(j, &tmp, r); }
+    return 1;
+}
+
+# One step of feeding stdin: refill `chunk` (at `cst`: +0 length, +8 offset) from the source file
+# when it is used up — closing the write end at the source's end, so the child reads EOF — then
+# write what the pipe will take. Returns 1 on progress. A -1 from the write means the child closed
+# its stdin: feeding stops.
+fn _rga_feed(j, chunk, cst): i64 {
+    var w_fd = load64(j + 8);
+    if (w_fd < 0) { return 0; }
+    if (load64(cst + 8) >= load64(cst)) {
+        var got = 0;
+        if (load64(j + 32) >= 0) { got = sys_read(load64(j + 32), chunk, 2048); }
+        if (got <= 0) { store64(j + 8, _rga_close(w_fd)); return 1; }
+        store64(cst, got);
+        store64(cst + 8, 0);
+    }
+    var off = load64(cst + 8);
+    var w = sys_write_nb(w_fd, chunk + off, load64(cst) - off);
+    if (w < 0) { store64(j + 8, _rga_close(w_fd)); return 1; }
+    if (w == 0) { return 0; }
+    store64(cst + 8, off + w);
+    return 1;
+}
+
+# Pump job `j` until both of its outputs have reached EOF, or the deadline in `dl` passes
+# (`bounded` 1). ⛔ ONE interleaved loop, never "write all, then read": see the header. Sleeps
+# 1 ms only when no fd made progress. Sets j+72 to 1 when the deadline fired.
+fn _rga_pump(j, dl, bounded): i64 {
+    var chunk[2048];
+    var cst[16];
+    store64(&cst, 0);
+    store64(&cst + 8, 0);
+    while (load64(j + 16) >= 0 || load64(j + 24) >= 0) {
+        var prog = _rga_feed(j, &chunk, &cst);
+        prog = prog + _rga_take(j, 16);
+        prog = prog + _rga_take(j, 24);
+        if (bounded == 1) {
+            if (_agnos_dl_over(dl) == 1) { store64(j + 72, 1); return 0; }
+        }
+        if (prog == 0) { sys_sleep_ms(1); }
+    }
+    store64(j + 8, _rga_close(load64(j + 8)));
+    return 0;
+}
+
+# Run job `j` (already spawned) to its end under `timeout_ms` (<= 0: no deadline): pump, then reap
+# within the same deadline; at the deadline end the child's tree with SIGKILL, reap it and count
+# the kill. Every fd the job holds is closed. Returns 1 (reaped: status at `stp`), 0 (the
+# deadline fired), or -1 (no status: the child was not ours to reap).
+fn _rga_finish(j, timeout_ms, stp): i64 {
+    store64(stp, 0 - 1);
+    var bounded = 0;
+    if (timeout_ms > 0) { bounded = 1; }
+    var dl[32];
+    _agnos_dl_start(&dl, timeout_ms * 1000);
+    _rga_pump(j, &dl, bounded);
+    var st = 0 - 2;
+    if (load64(j + 72) == 0) { st = _agnos_wait_poll(load64(j), &dl, bounded); }
+    store64(j + 8, _rga_close(load64(j + 8)));
+    store64(j + 16, _rga_close(load64(j + 16)));
+    store64(j + 24, _rga_close(load64(j + 24)));
+    if (st == 0 - 2) {
+        _regression_deadline_kills = _regression_deadline_kills + 1;
+        _regression_last_deadline = timeout_ms;
+        _agnos_kill_reap(load64(j));
+        return 0;
+    }
+    if (st < 0) { return 0 - 1; }
+    store64(stp, st);
+    return 1;
+}
+
+# A finished job as the POSIX exit-code verbs answer: the exit code, 128 + signal, -2 (the
+# deadline) or -1 (no status).
+fn _rga_code(reaped, st): i64 {
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
+    if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
+    return WEXITSTATUS(st);
+}
+
+# Run `bin [arg]` with every output DISCARDED (drained, never closed on the child) and no stdin;
+# the exit-code verbs' shared body.
+fn _rga_run_discard(bin, arg, envp, timeout_ms): i64 {
+    var b[1024];
+    var e[1024];
+    var j[88];
+    _rga_job_init(&j);
+    if (_rga_spawn(&j, &b, _rga_argv(&b, bin, arg), &e, _rga_env(&e, envp), 0, 1) < 0) { return 0 - 1; }
+    var st[8];
+    var reaped = _rga_finish(&j, timeout_ms, &st);
+    return _rga_code(reaped, load64(&st));
+}
+
+# Run `bin [arg]` capturing stdout (and stderr too when `merge` is 1; otherwise stderr is drained
+# and discarded) into `buf`, and store how it ended in `status_out` (_regression_store_status).
+# Returns the bytes captured; 0 with [-1, 0] when nothing could be spawned.
+fn _rga_run_capture(bin, arg, buf, buflen, envp, status_out, merge): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
+    var b[1024];
+    var e[1024];
+    var j[88];
+    _rga_job_init(&j);
+    if (_rga_spawn(&j, &b, _rga_argv(&b, bin, arg), &e, _rga_env(&e, envp), 0, merge) < 0) { return 0; }
+    store64(&j + 48, buf);
+    if (buflen > 0) { store64(&j + 56, buflen); }
+    var st[8];
+    var reaped = _rga_finish(&j, _regression_timeout_ms(), &st);
+    _regression_store_status(status_out, reaped, load64(&st));
+    return load64(&j + 64);
+}
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+# Pipe `src_path`'s bytes to `bin_path`'s stdin and write its stdout to `out_path` (0: discard);
+# stderr is discarded. Returns the exit code, 128 + signal, -2 (the deadline) or -1 (the output
+# file could not be opened or fully written — a truncated output file is never reported as the
+# child's exit code — or nothing could be spawned). An unreadable source feeds nothing, as
+# the POSIX verb sends 0 bytes. The source is STREAMED in chunks and interleaved with the output.
+fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
+    var out_fd = 0 - 1;
+    if (out_path != 0) {
+        out_fd = file_open(out_path, 577, 420);
+        if (out_fd < 0) { return 0 - 1; }
+    }
+    var src_fd = 0 - 1;
+    if (src_path != 0) { src_fd = file_open(src_path, 0, 0); }
+    var b[1024];
+    var e[1024];
+    var j[88];
+    _rga_job_init(&j);
+    if (_rga_spawn(&j, &b, _rga_argv(&b, bin_path, 0), &e, _rga_env(&e, envp), 1, 0) < 0) {
+        _rga_close(src_fd);
+        _rga_close(out_fd);
+        return 0 - 1;
+    }
+    store64(&j + 32, src_fd);
+    store64(&j + 40, out_fd);
+    var st[8];
+    var reaped = _rga_finish(&j, _regression_timeout_ms(), &st);
+    _rga_close(src_fd);
+    _rga_close(out_fd);
+    if (load64(&j + 80) != 0) { return 0 - 1; }
+    return _rga_code(reaped, load64(&st));
+}
+# Pipe a source file to a binary's stdin and discard its output.
+fn regression_pipe_to_bin(bin_path, src_path, envp): i64 {
+    return regression_pipe_to_bin_capture(bin_path, src_path, 0, envp);
+}
+# Run a binary with every output discarded and end it (and its tree) after `timeout_ms`.
+# Returns the exit code, 128 + signal, -2 (the timeout) or -1.
+fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
+    var t = timeout_ms;
+    if (t <= 0) { t = 1; }                  # the POSIX loop: no time at all is an immediate kill
+    return _rga_run_discard(bin_path, 0, envp, t);
+}
+# Run `bin_path`, capture stdout into `buf`, discard stderr, and report how it ended in
+# `status_out` ([0] exit code · 128+sig · -2 the deadline · -1 no status; [1] 1 iff a signal).
+fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 {
+    return _rga_run_capture(bin_path, 0, buf, buflen, envp, status_out, 0);
+}
+# Run `bin_path` and capture stdout; the exit status is discarded.
+fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
+    var st[16];
+    return regression_exec_capture_status(bin_path, buf, buflen, envp, &st);
+}
+# Run `bin_path` with every output discarded. Returns the exit code, 128 + signal, -2 or -1.
+fn regression_exec_run(bin_path, envp): i64 {
+    return _rga_run_discard(bin_path, 0, envp, _regression_timeout_ms());
+}
+# Run `bin_path arg` and capture stdout; the exit status is discarded.
+fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
+    var st[16];
+    return regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, &st);
+}
+# Run `bin_path arg` and capture stdout AND stderr into `buf`; the exit status is discarded.
+fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 {
+    var st[16];
+    return regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, &st);
+}
+# Run `bin_path arg`, capture stdout AND stderr into `buf`, and report how it ended in `status_out`.
+fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
+    return _rga_run_capture(bin_path, arg, buf, buflen, envp, status_out, 1);
+}
+# Run `bin_path arg`, capture stdout (stderr discarded), and report how it ended in `status_out`.
+fn regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
+    return _rga_run_capture(bin_path, arg, buf, buflen, envp, status_out, 0);
+}
+
+# End every child of this process, and its tree: each direct child that is still RUNNING (read
+# from proclist#99 — agnos has no /proc) is ended with kill_tree(9) at once, then everything is
+# reaped. Returns how many direct children were running when it started. `grace_ms` is not used:
+# SIGTERM has no default action on agnos, so there is nothing a grace period would let finish —
+# only SIGKILL ends a process there. An agnos without #99 (< 1.56.47) reaps what has ended and
+# returns 0, as the POSIX verb does off Linux.
+fn regression_terminate_children(grace_ms): i64 {
+    regression_reap_orphans();
+    var me = sys_getpid();
+    var recs[1024];                                 # 16 records of 64 bytes: the whole table
+    var n = sys_proclist(&recs, 16);
+    var live = 0;
+    var i = 0;
+    while (i < n) {
+        var r = &recs + i * 64;
+        var state = load64(r + 8);
+        if (load64(r + 16) == me && load64(r) != me) {
+            if (state != PROCLIST_ZOMBIE && state != PROCLIST_DYING) {
+                live = live + 1;
+                if (sys_kill_tree(load64(r), 9) < 0) { sys_kill(load64(r), 9); }
+            }
+        }
+        i = i + 1;
+    }
+    var rounds = 0;
+    while (rounds < 5000) {                         # ~5 s: a SIGKILLed child is reaped at once
+        var w = sys_waitpid(0 - 1);
+        if (w == 0 - 1) { return live; }            # no children left
+        if (w == 0 - 2) { sys_sleep_ms(1); rounds = rounds + 1; }
+    }
+    return live;
+}
+# Reap, without waiting, every child of this process that has already ended; returns how many.
+# (WAIT-ANY poll, #4 with pid -1: a status per ended child, -2 while the rest live, -1 when none.)
+fn regression_reap_orphans(): i64 {
+    var n = 0;
+    while (sys_waitpid(0 - 1) >= 0) { n = n + 1; }
+    return n;
+}
+#endif
+
+# The two public pumps (for a caller's own pipes). Like everything above they call agnos-only
+# wrappers (the O_NONBLOCK read/write, and the socket adapter's deadline _agnos_dl_start /
+# _agnos_dl_over — uptime_us#95 with its refused-calibration fallback, the one clock rule
+# agnos_monotonic_clock_rdtsc enforces), so they are guarded: this module still compiles alone
+# on any host (stdlib_modules_self_sufficient).
+#ifdef CYRIUS_TARGET_AGNOS
+# Write all `n` bytes of `buf` to `fd`. Returns the bytes written — short means the reader
+# stopped draining (or is gone: agnos has no SIGPIPE, the write answers -1). `timeout_ms > 0`
+# gives up after that long WITHOUT PROGRESS, as the POSIX pump does; agnos has no poll(2), so
+# it uses the O_NONBLOCK write (0 = no room yet), a 1 ms sleep and the peer's deadline clock. `timeout_ms <= 0` is the
+# blocking write. These two pumps were MISSING here (CHANGELOG [6.6.8]).
+fn regression_pipe_write_all(fd, buf, n, timeout_ms): i64 {
+    var written = 0;
+    var dl[32];
+    _agnos_dl_start(&dl, timeout_ms * 1000);
+    while (written < n) {
+        var w = 0;
+        if (timeout_ms > 0) { w = sys_write_nb(fd, buf + written, n - written); }
+        else { w = sys_write(fd, buf + written, n - written); }
+        if (w < 0) { return written; }
+        if (w == 0) {
+            if (timeout_ms <= 0) { return written; }
+            if (_agnos_dl_over(&dl) == 1) { return written; }
+            sys_sleep_ms(1);
+        } else {
+            written = written + w;
+            _agnos_dl_start(&dl, timeout_ms * 1000);   # progress: the idle bound starts again
+        }
+    }
+    return written;
+}
+
+# Drain `fd` into `buf` (at most `cap`) until EOF. Returns the bytes read. `timeout_ms > 0`
+# gives up after that long without progress (O_NONBLOCK read: -2 / -3 = nothing yet); with
+# `timeout_ms <= 0` the read blocks, and a -2 from a pre-1.57.8 kernel (which answered it for
+# an empty pipe instead of blocking) is retried, never taken as EOF.
+fn regression_pipe_read_all(fd, buf, cap, timeout_ms): i64 {
+    var total = 0;
+    var dl[32];
+    _agnos_dl_start(&dl, timeout_ms * 1000);
+    while (total < cap) {
+        var r = 0;
+        if (timeout_ms > 0) { r = sys_read_nb(fd, buf + total, cap - total); }
+        else { r = sys_read(fd, buf + total, cap - total); }
+        if (r == 0 - 2) { r = 0 - 3; }
+        if (r == 0 - 3) {
+            if (timeout_ms > 0) { if (_agnos_dl_over(&dl) == 1) { return total; } }
+            sys_sleep_ms(1);
+        } else {
+            if (r <= 0) { return total; }
+            total = total + r;
+            _agnos_dl_start(&dl, timeout_ms * 1000);
+        }
+    }
+    return total;
+}
+#endif
+
 # SSH reachability skip-check — unsupported on agnos; reports not reachable.
 fn regression_ssh_skip_check(target): i64 { return 0; }
 # scp a local file to a remote host — unsupported on agnos.

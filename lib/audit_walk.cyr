@@ -1,26 +1,47 @@
-# audit_walk.cyr — shared fmt/lint walkers for cyrius audit + check.
+# audit_walk.cyr — shared fmt/lint/doc walkers for `cyrius audit` + the check driver.
 #
-# Cyrius port of scripts/lib/audit-walk.sh shipped at v5.9.1 as the
-# first slot of the v5.9.x sovereignty pass (bash-toolchain → cyrius
-# conversion). Used by programs/checks/ (the cyrius-native audit
-# dispatcher that replaces scripts/check.sh).
-#
-# scripts/lib/audit-walk.sh stays bash for now — it is still consumed
-# by the bash scripts/cyrius dispatcher (also queued for cyrius
-# conversion at v5.9.5; the two scripts retire together as one unit
-# because audit-walk's logic doesn't move until both consumers are
-# cyrius-native).
+# Consumers: programs/checks/ (the check driver's fmt + lint suites) and cbt/commands.cyr
+# (`cyrius audit`). This is the only implementation — the bash twin it was ported from,
+# scripts/lib/audit-walk.sh, had no caller left and was deleted at 6.6.7.
 #
 # Public functions:
 #   audit_fmt_walk(cyrfmt_path, dirs_vec)
 #       Run cyrfmt on every non-symlink, non-distlib-bundle *.cyr
 #       file in the given dirs. Sets globals AW_FMT_FAIL (0/1),
-#       AW_FMT_SKIPPED, AW_FMT_FAIL_FILES (vec<str>).
+#       AW_FMT_SKIPPED, AW_FMT_FAIL_FILES (vec<str>), and — 6.6.8 —
+#       AW_FMT_ERRORS / AW_FMT_ERROR_FILES (files cyrfmt did not finish on).
 #
 #   audit_lint_walk(cyrlint_path, dirs_vec)
 #       Run cyrlint on every non-symlink, non-distlib-bundle *.cyr
 #       file in the given dirs. Sets globals AW_LINT_TOTAL (warning
-#       count), AW_LINT_SKIPPED.
+#       count), AW_LINT_SKIPPED, and AW_LINT_ERRORS / AW_LINT_ERROR_FILES
+#       (files cyrlint did not finish on — see "FAIL CLOSED" below).
+#
+#   audit_doc_walk(cyrdoc_path, dirs_vec)
+#       Run `cyrdoc --check` likewise. Sets AW_DOC_TOTAL (undocumented
+#       public fns), AW_DOC_SKIPPED, AW_DOC_ERRORS / AW_DOC_ERROR_FILES.
+#
+#   audit_print_errors(notes_vec)
+#       Print an AW_*_ERROR_FILES list, one "path: reason" per line, capped.
+#
+# ⛔ FAIL CLOSED (6.6.7). The lint and doc walkers used to take the tool's summary trailer
+# as their ONLY signal, through a capture verb that threw the exit status away, and a
+# missing trailer parsed as ZERO. So a cyrlint that crashed, hung, refused the file
+# (`file too large to lint`, rc 1, no trailer) or did not exist at all scored "0 warnings",
+# and `cyrius audit` printed "ok: lint clean" over rekha's 1.65 MB fonts/face_data.cyr,
+# which cyrlint had never linted. A file now counts as linted only when the run exited on
+# its own with the status its trailer implies
+# AND printed that trailer; anything else is an ERROR that names the file and the reason.
+# Callers must fail on AW_*_ERRORS, not only on the totals. CHANGELOG [6.6.7]
+#
+# ⛔ 6.6.10 — A DIRECTORY THE WALK COULD NOT LIST IS AN ERROR TOO. The listers folded an open
+# or getdents failure into "an empty directory" (lib/fs.cyr had the same fold), so a
+# `chmod 000 src/bad` made `cyrius audit` print "ok: format clean" / "ok: lint clean" over a
+# subtree it never saw. Each walker now records "<dir>: cannot list directory …" in its
+# AW_*_ERROR_FILES. And the non-Linux lister marks directories and symlinks (it marked every
+# entry a regular file, so on macOS, Windows and agnos the walk never descended at all).
+# An EMPTY .cyr is an ordinary file since 6.6.10 — cyrfmt/cyrlint/cyrdoc treat it as an empty
+# module (clean) and only an unreadable one as an error. CHANGELOG [6.6.10]
 #
 # Symlinked files are treated as dep files (they belong to upstream
 # and may track a different formatter baseline) and are skipped in
@@ -34,22 +55,44 @@
 #   2. "# Bundled distribution of " — scripts/bundle.sh output
 #      (sakshi only, predates cyrius distlib).
 #
-# Requires: lib/string.cyr, lib/fmt.cyr, lib/alloc.cyr, lib/io.cyr,
-#           lib/vec.cyr, lib/str.cyr, lib/fs.cyr, lib/process.cyr,
-#           lib/syscalls.cyr.
+# 6.6.9: the includes below were a "Requires:" note for the caller; a bare include was a hard error
+# (`undefined variable 'O_RDONLY'`) plus ~25 undefined functions.
+# CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/process.cyr"
 
 # Globals exposed to caller after audit_fmt_walk runs.
 var AW_FMT_FAIL = 0;
 var AW_FMT_SKIPPED = 0;
 var AW_FMT_FAIL_FILES = 0;   # vec<str> of basenames
+# ⛔ 6.6.8 — THE FMT WALKER FAILS CLOSED TOO. It compared cyrfmt's stdout with the file and
+# threw the exit status away, so a cyrfmt that crashed (or hung to the deadline) with no
+# output on an EMPTY .cyr gave 0 == 0 bytes and the file read as formatted — and a refusal
+# that did print (its "cannot read file" went to stdout until 6.6.10) was reported as "needs
+# reformatting", the wrong reason. A run that did not exit 0 on its own is now an ERROR that
+# names the file and why; callers fail on AW_FMT_ERRORS as on the lint/doc ones.
+var AW_FMT_ERRORS = 0;
+var AW_FMT_ERROR_FILES = 0;  # vec<Str> of "path: reason" notes
 
 # Globals exposed to caller after audit_lint_walk runs.
 var AW_LINT_TOTAL = 0;
 var AW_LINT_SKIPPED = 0;
+# 6.6.7: files cyrlint did not FINISH on (crash, deadline kill, refusal, missing tool, no
+# trailer). A count and a vec<Str> of "path: reason" notes. Non-zero is a failure.
+var AW_LINT_ERRORS = 0;
+var AW_LINT_ERROR_FILES = 0;
 
 # Globals exposed after audit_doc_walk (v6.2.25 — for `cyrius audit`'s doc sweep).
 var AW_DOC_TOTAL = 0;
 var AW_DOC_SKIPPED = 0;
+var AW_DOC_ERRORS = 0;        # 6.6.7 — as AW_LINT_ERRORS, for cyrdoc --check
+var AW_DOC_ERROR_FILES = 0;
 
 # d_type byte for symlink in struct dirent64 from getdents64.
 var _AW_DT_LNK = 10;
@@ -69,8 +112,45 @@ var _AW_MARKER_VENDORED = "-- bundled distribution";
 # Returns 1 if the file at `path` starts with either of the two
 # distlib bundle markers within its first 512 bytes (matches the
 # bash `head -n 5 | grep -qE` head-of-file check tightly enough).
+# ⛔ v6.5.42 — SKIP AUTO-GENERATED SOURCE. Reformatting or linting a generator's output is
+# meaningless: the next regeneration overwrites it, so a "fix" there is guaranteed to be lost
+# and the warning is guaranteed to come back. These files say so themselves in their header.
+#
+# This became load-bearing when the walkers learned to descend: `lib/unicode/` had never been
+# reached before, and three of its seven files are 60-157 KB of generated Unicode tables
+# (`_casefold_data.cyr`, `_categories_data.cyr`, `_normalize_data.cyr`).
+#
+# ⚠ Keyed on the file's OWN self-declaration, not on a path or a filename convention — a
+# hardcoded `lib/unicode/` skip would silently stop covering it the day the layout moved, and a
+# `_`-prefix rule would wrongly skip hand-written internals like `_decode.cyr`.
+fn _aw_is_generated(path): i64 {
+    var sbuf[512];                  # STACK (6.6.10): an unchecked alloc per walked file
+    var buf = &sbuf;
+    var n = file_read_all(str_data(path), buf, 512);
+    if (n <= 0) { return 0; }
+    var i = 0;
+    while (i < n - 14) {
+        if (load8(buf + i) == 65) {            # 'A'
+            if (load8(buf + i + 1) == 85) {    # 'U'
+                if (load8(buf + i + 2) == 84) {        # 'T'
+                    if (load8(buf + i + 3) == 79) {    # 'O'
+                        if (load8(buf + i + 4) == 45) {        # '-'
+                            if (load8(buf + i + 5) == 71) {    # 'G'
+                                if (load8(buf + i + 6) == 69) { return 1; }   # 'E'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn _aw_is_distlib_bundle(path): i64 {
-    var buf = alloc(512);
+    var sbuf[512];                  # STACK (6.6.10): an unchecked alloc per walked file
+    var buf = &sbuf;
     var n = file_read_all(str_data(path), buf, 512);
     if (n <= 0) { return 0; }
     if (str_starts_with_buf(buf, n, _AW_MARKER_DISTLIB) == 1) { return 1; }
@@ -116,20 +196,28 @@ fn str_starts_with_buf(buf, n, prefix): i64 {
     return 0;
 }
 
-# Portable (non-Linux) dir lister: delegate to fs.cyr's cross-platform
-# dir_list (FindFirstFileW on Windows, getdirentries on macOS, agnos getdents)
-# and mark every entry DT_REG (8). No d_type, so the DT_LNK skip is dropped —
-# that is a Linux `cyrius deps` vendored-symlink concern, and the audit sweep is
-# read-only (fmt --check / lint / doc --check), so there is no write-through-
-# symlink risk; _aw_is_distlib_bundle still skips vendored bundles by content.
+# Portable (non-Linux) dir lister: fs.cyr's cross-platform checked lister (FindFirstFileW on
+# Windows, getdirentries on macOS, agnos getdents), with each entry's type asked of the
+# filesystem: DT_LNK (10) for a symlink, DT_DIR (4) for a directory, else DT_REG (8).
+# ⛔ 6.6.10: this marked EVERY entry DT_REG, so the walkers' recursive descent (which keys on
+# DT_DIR) never fired off Linux — `cyrius audit` on macOS and Windows checked the top level of
+# src/ and tests/ and nothing below — and it read an unlistable directory as empty. Returns 0,
+# or the lister's negative error. CHANGELOG [6.6.10]
 fn _aw_dir_list_portable(path, out_names, out_dtypes): i64 {
-    var names = dir_list(path);
+    var names = vec_new();
+    var lr = dir_list_checked(path, names);
     var i = 0;
     while (i < vec_len(names)) {
-        vec_push(out_names, vec_get(names, i));
-        vec_push(out_dtypes, 8);   # DT_REG
+        var nm = vec_get(names, i);
+        var full = path_join(path, nm);
+        var dt = 8;                                   # DT_REG
+        if (is_symlink(full) == 1) { dt = 10; }       # DT_LNK
+        elif (is_dir(full) == 1) { dt = 4; }          # DT_DIR
+        vec_push(out_names, nm);
+        vec_push(out_dtypes, dt);
         i = i + 1;
     }
+    if (lr < 0) { return lr; }
     return 0;
 }
 
@@ -139,6 +227,8 @@ fn _aw_dir_list_portable(path, out_names, out_dtypes): i64 {
 # (and the Linux dirent byte offsets differ from macOS), so Windows / macOS /
 # agnos route through the portable lister above. (Added cross-platform at v6.2.25
 # when `cyrius audit` began including this walker — the CLI cross-compiles to PE.)
+# Returns 0 when the whole directory was listed, or a NEGATIVE error (the open's or the
+# getdents' errno) — 6.6.10: both used to end the listing as if the directory were empty.
 fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     # Linux x86/aarch64 only — the getdents64 block (and SYS_GETDENTS64) must be
     # #ifndef'd OUT of the PE / Mach-O / agnos compiles, since the early-`return`
@@ -147,12 +237,14 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     #ifndef CYRIUS_TARGET_MACOS
     #ifndef CYRIUS_TARGET_AGNOS
     var fd = sys_open(str_data(path), O_RDONLY, 0);
-    if (fd < 0) { return 0; }
-    var buf = alloc(4096);
+    if (fd < 0) { return fd; }
+    var sbuf[4096];                 # STACK (6.6.10): was an unchecked alloc per directory
+    var buf = &sbuf;
     var rgo = 1;
     while (rgo == 1) {
         var n = syscall(SYS_GETDENTS64, fd, buf, 4096);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return n; }
+        if (n == 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
@@ -167,7 +259,16 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
                     }
                 }
                 if (skip == 0) {
-                    vec_push(out_names, str_from(name));
+                    var nstr = str_clone(str_from(name));
+                    # DT_UNKNOWN (0): the filesystem does not fill d_type — ask it, so the
+                    # descent still happens there. CHANGELOG [6.6.10]
+                    if (dtype == 0) {
+                        var ufull = path_join(path, nstr);
+                        dtype = 8;
+                        if (is_symlink(ufull) == 1) { dtype = 10; }
+                        elif (is_dir(ufull) == 1) { dtype = 4; }
+                    }
+                    vec_push(out_names, nstr);
                     vec_push(out_dtypes, dtype);
                 }
                 pos = pos + reclen;
@@ -183,7 +284,18 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     return _aw_dir_list_portable(path, out_names, out_dtypes);
 }
 
-# Returns 1 if `name` (Str) ends with ".cyr".
+# The AW_*_ERROR_FILES note for a directory a walker could not list. CHANGELOG [6.6.10]
+fn _aw_unlisted_note(dir, err): i64 {
+    return _aw_note(dir, "cannot list directory (subtree NOT checked), error ", 0 - err);
+}
+
+var _AW_DT_DIR = 4;
+
+# Returns 1 if `name` (Str) is a cyrius source file — `.cyr`, `.tcyr`, `.bcyr` or `.fcyr`.
+# ⛔ v6.5.42: this accepted ONLY `.cyr`, which is half of why `cyrius audit` never saw the
+# test suite. The suffixes differ by one leading letter, so a `.cyr` check silently skips
+# every `.tcyr`/`.bcyr`/`.fcyr` — the audit reported a clean verdict over a tree it had not
+# looked at. Generalised at this one choke point; its three callers are unchanged.
 fn _aw_is_cyr(name): i64 {
     var len = str_len(name);
     if (len < 4) { return 0; }
@@ -196,6 +308,32 @@ fn _aw_is_cyr(name): i64 {
     return 1;
 }
 
+# Returns 1 for `.tcyr` / `.bcyr` / `.fcyr` — the test, bench and fuzz suffixes. Kept separate
+# from `_aw_is_cyr` because the tail scan there is anchored at len-4 and "foo.tcyr" ends in
+# "tcyr", not ".cyr", so it does NOT fall out of the same check.
+fn _aw_is_cyr_variant(name): i64 {
+    var len = str_len(name);
+    if (len < 5) { return 0; }
+    var s = str_data(name);
+    var tail = s + len - 5;
+    if (load8(tail) != 46) { return 0; }        # '.'
+    var k = load8(tail + 1);
+    if (k != 116 && k != 98 && k != 102) { return 0; }   # 't' | 'b' | 'f'
+    if (load8(tail + 2) != 99) { return 0; }    # 'c'
+    if (load8(tail + 3) != 121) { return 0; }   # 'y'
+    if (load8(tail + 4) != 114) { return 0; }   # 'r'
+    return 1;
+}
+
+# ⛔ v6.5.42 — SKIP-LIST for the recursive descent below. `build/` holds generated binaries and
+# `.git/` an object store; walking either is pure cost, and `build/` in particular contains
+# copies of sources that would be double-counted.
+fn _aw_skip_dir(name): i64 {
+    if (str_eq(name, str_from("build")) == 1) { return 1; }
+    if (str_eq(name, str_from(".git")) == 1) { return 1; }
+    return 0;
+}
+
 # Run cyrfmt on every non-symlink, non-distlib-bundle *.cyr file in
 # each directory of `dirs_vec`. Captures cyrfmt's stdout into a tmp
 # buffer and compares against the file content; mismatch ⇒ FAIL.
@@ -203,34 +341,70 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     AW_FMT_FAIL = 0;
     AW_FMT_SKIPPED = 0;
     AW_FMT_FAIL_FILES = vec_new();
+    AW_FMT_ERRORS = 0;
+    AW_FMT_ERROR_FILES = vec_new();
+    var st[16];
     var cap = 2000000;
     var orig_buf = alloc(cap);
     var fmt_buf  = alloc(cap);
+    if (orig_buf == 0 || fmt_buf == 0) {   # 6.6.10: were stored through unchecked
+        AW_FMT_ERRORS = 1;
+        vec_push(AW_FMT_ERROR_FILES, str_from("audit_fmt_walk: out of memory — nothing was checked"));
+        return 1;
+    }
 
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+            vec_push(AW_FMT_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);
-            if (_aw_is_cyr(name) == 1) {
+            # ⛔ v6.5.42 — RECURSIVE DESCENT. These walkers listed each directory in `dirs_vec`
+            # and nothing beneath it, so `cyrius audit` saw `tests/` (once it was added to the
+            # scope) but none of `tests/tcyr/**`, where the entire suite lives. The loop above
+            # re-reads `vec_len(dirs_vec)` every iteration, so pushing a subdirectory onto it IS
+            # the descent — a worklist, no recursion, and identical in all three walkers.
+            # ⚠ Symlinked directories are NOT followed: v6.5.12 shipped a tree walk that did,
+            # and it reported "41 passed" for a corpus of ONE.
+            var _awdt = vec_get(dtypes, ni);
+            if (_awdt == _AW_DT_DIR) {
+                if (_aw_skip_dir(name) == 0) {
+                    vec_push(dirs_vec, path_join(dir, name));
+                }
+            }
+            if (_aw_is_cyr(name) == 1 || _aw_is_cyr_variant(name) == 1) {
                 var dtype = vec_get(dtypes, ni);
                 var full = path_join(dir, name);
                 if (dtype == _AW_DT_LNK) {
                     AW_FMT_SKIPPED = AW_FMT_SKIPPED + 1;
                 } else {
-                    if (_aw_is_distlib_bundle(full) == 1) {
+                    if (_aw_is_distlib_bundle(full) == 1 || _aw_is_generated(full) == 1) {
                         AW_FMT_SKIPPED = AW_FMT_SKIPPED + 1;
                     } else {
                         var orig_n = file_read_all(str_data(full), orig_buf, cap);
+                        # 6.6.10: an unreadable file is an ERROR by name, whatever cyrfmt says.
+                        if (orig_n < 0) {
+                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+                            vec_push(AW_FMT_ERROR_FILES, _aw_note(full, "cannot read the file, error ", 0 - orig_n));
+                            ni = ni + 1;
+                            continue;
+                        }
                         var args = vec_new();
                         vec_push(args, cyrfmt_path);
                         vec_push(args, str_data(full));
-                        var fmt_n = exec_capture(args, fmt_buf, cap);
-                        if (fmt_n != orig_n) {
+                        var fmt_n = exec_capture_status(args, fmt_buf, cap, &st);
+                        var bad = _aw_exit_verdict(full, &st);
+                        if (bad != 0) {
+                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+                            vec_push(AW_FMT_ERROR_FILES, bad);
+                        } elif (fmt_n != orig_n) {
                             AW_FMT_FAIL = 1;
                             vec_push(AW_FMT_FAIL_FILES, name);
                         } else {
@@ -258,23 +432,41 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     return 0;
 }
 
-# Parse the trailing summary line from cyrlint's stdout to extract
-# the warning count (first integer at start of last line; matches
-# the bash `tail -1 | grep -o '^[0-9]*'` form). Returns 0 on no
-# match.
+# Parse cyrlint's canonical last stdout line, "<n> warnings", and return n — or -1 when the
+# last line is anything else (or there is no output). ⛔ -1, not 0: a missing trailer means
+# cyrlint did not finish (it refused the file, crashed, timed out or never ran), and reading
+# that as "0 warnings" is the 6.6.7 false GREEN. The line must be EXACTLY digits + " warnings".
 fn _aw_parse_lint_warnings(buf, n): i64 {
-    if (n <= 0) { return 0; }
-    # Find start of last line.
-    var start = n;
-    if (load8(buf + n - 1) == 10) { start = n - 1; }   # ignore trailing \n
-    var i = start;
-    while (i > 0) {
-        if (load8(buf + i - 1) == 10) { i = i; return _aw_parse_leading_int(buf + i, start - i); }
-        i = i - 1;
+    if (n <= 0) { return 0 - 1; }
+    var end = n;
+    if (load8(buf + end - 1) == 10) { end = end - 1; }
+    var start = end;
+    var sgo = 1;
+    while (sgo == 1) {
+        if (start == 0) { sgo = 0; }
+        elif (load8(buf + start - 1) == 10) { sgo = 0; }
+        else { start = start - 1; }
     }
-    return _aw_parse_leading_int(buf, start);
+    var i = start;
+    var v = 0;
+    var dgo = 1;
+    while (dgo == 1) {
+        if (i >= end) { dgo = 0; }
+        else {
+            var c = load8(buf + i);
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); i = i + 1; }
+            else { dgo = 0; }
+        }
+    }
+    if (i == start) { return 0 - 1; }
+    if (end - i != 9) { return 0 - 1; }
+    if (memeq(buf + i, " warnings", 9) != 1) { return 0 - 1; }
+    return v;
 }
 
+# Leading unsigned decimal of p[0..len), 0 when there is none — so it CANNOT tell "0" from
+# "no number", which is why the lint walker no longer uses it (see above). Kept for the
+# check driver's own parsers (programs/checks/selfhost.cyr, lint_fmt.cyr, codegen_regress.cyr).
 fn _aw_parse_leading_int(p, len): i64 {
     var v = 0;
     var i = 0;
@@ -293,39 +485,132 @@ fn _aw_parse_leading_int(p, len): i64 {
     return v;
 }
 
+# Build the "path: reason[N]" note an AW_*_ERROR_FILES entry holds. `num` < 0 = no number.
+fn _aw_note(full, why, num): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, full);
+    str_builder_add_cstr(sb, ": ");
+    str_builder_add_cstr(sb, why);
+    if (num >= 0) { str_builder_add_int(sb, num); }
+    return str_builder_build(sb);
+}
+
+# Decide whether one tool run can be TRUSTED. `st` is exec_capture_status's two-slot status,
+# `parsed` the trailer value (-1 = no trailer) and `want` the exit status that trailer
+# implies. Returns 0 when trustworthy, else a note naming the file and the reason. The order
+# is the specific-before-general one: "it never ran" and "it was killed" are more useful
+# than "no trailer", which every one of them also produces.
+fn _aw_run_verdict(full, st, parsed, want): i64 {
+    var code = load64(st);
+    if (code == 0 - 1) { return _aw_note(full, "the tool could not be run", 0 - 1); }
+    if (code == 0 - 2) { return _aw_note(full, "timed out and was killed at the deadline", 0 - 1); }
+    if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
+    if (parsed < 0) { return _aw_note(full, "the tool refused or failed (no summary line), exit ", code); }
+    if (code != want) { return _aw_note(full, "exit status disagrees with the summary line, exit ", code); }
+    return 0;
+}
+
+# The exit-status half of `_aw_run_verdict`, for a tool with no summary trailer (cyrfmt):
+# trustworthy only when it exited 0 on its own. 0 or a note naming the file and the reason.
+# CHANGELOG [6.6.8]
+fn _aw_exit_verdict(full, st): i64 {
+    var code = load64(st);
+    if (code == 0 - 1) { return _aw_note(full, "the tool could not be run", 0 - 1); }
+    if (code == 0 - 2) { return _aw_note(full, "timed out and was killed at the deadline", 0 - 1); }
+    if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
+    if (code != 0) { return _aw_note(full, "the tool refused or failed, exit ", code); }
+    return 0;
+}
+
+# Print an AW_LINT_ERROR_FILES / AW_DOC_ERROR_FILES list, one note per line, capped at 20
+# so a large project cannot bury the rest of the report.
+fn audit_print_errors(notes): i64 {
+    if (notes == 0) { return 0; }
+    var tot = vec_len(notes);
+    var i = 0;
+    while (i < tot) {
+        if (i >= 20) {
+            sys_write(1, "    … and ", 12);
+            print_num(tot - 20);
+            println(" more");
+            i = tot;
+        } else {
+            var nt = vec_get(notes, i);
+            sys_write(1, "    ", 4);
+            sys_write(1, str_data(nt), str_len(nt));
+            println("");
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
 # Run cyrlint on every non-symlink, non-distlib-bundle *.cyr file in
-# each directory of `dirs_vec`. Sums the leading-integer of cyrlint's
-# trailing summary line into AW_LINT_TOTAL.
+# each directory of `dirs_vec`. Sums the "<n> warnings" trailer into AW_LINT_TOTAL; a run
+# that did not finish cleanly goes to AW_LINT_ERRORS instead (see the header).
 fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
     AW_LINT_TOTAL = 0;
     AW_LINT_SKIPPED = 0;
-    var cap = 200000;
+    AW_LINT_ERRORS = 0;
+    AW_LINT_ERROR_FILES = vec_new();
+    # 1 MB: on Windows the capture pipe carries stderr too (every per-line warning), and an
+    # output that overflows the buffer loses its trailer — which now reads as an ERROR.
+    var cap = 1048576;
     var lint_buf = alloc(cap);
+    if (lint_buf == 0) {                    # 6.6.10: was handed to the capture unchecked
+        AW_LINT_ERRORS = 1;
+        vec_push(AW_LINT_ERROR_FILES, str_from("audit_lint_walk: out of memory — nothing was linted"));
+        return 1;
+    }
+    var st[16];
 
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_LINT_ERRORS = AW_LINT_ERRORS + 1;
+            vec_push(AW_LINT_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);
-            if (_aw_is_cyr(name) == 1) {
+            # ⛔ v6.5.42 — RECURSIVE DESCENT. These walkers listed each directory in `dirs_vec`
+            # and nothing beneath it, so `cyrius audit` saw `tests/` (once it was added to the
+            # scope) but none of `tests/tcyr/**`, where the entire suite lives. The loop above
+            # re-reads `vec_len(dirs_vec)` every iteration, so pushing a subdirectory onto it IS
+            # the descent — a worklist, no recursion, and identical in all three walkers.
+            # ⚠ Symlinked directories are NOT followed: v6.5.12 shipped a tree walk that did,
+            # and it reported "41 passed" for a corpus of ONE.
+            var _awdt = vec_get(dtypes, ni);
+            if (_awdt == _AW_DT_DIR) {
+                if (_aw_skip_dir(name) == 0) {
+                    vec_push(dirs_vec, path_join(dir, name));
+                }
+            }
+            if (_aw_is_cyr(name) == 1 || _aw_is_cyr_variant(name) == 1) {
                 var dtype = vec_get(dtypes, ni);
                 var full = path_join(dir, name);
                 if (dtype == _AW_DT_LNK) {
                     AW_LINT_SKIPPED = AW_LINT_SKIPPED + 1;
                 } else {
-                    if (_aw_is_distlib_bundle(full) == 1) {
+                    if (_aw_is_distlib_bundle(full) == 1 || _aw_is_generated(full) == 1) {
                         AW_LINT_SKIPPED = AW_LINT_SKIPPED + 1;
                     } else {
                         var args = vec_new();
                         vec_push(args, cyrlint_path);
                         vec_push(args, str_data(full));
-                        var n = exec_capture(args, lint_buf, cap);
+                        var n = exec_capture_status(args, lint_buf, cap, &st);
                         var w = _aw_parse_lint_warnings(lint_buf, n);
-                        AW_LINT_TOTAL = AW_LINT_TOTAL + w;
+                        var bad = _aw_run_verdict(full, &st, w, 0);
+                        if (bad != 0) {
+                            AW_LINT_ERRORS = AW_LINT_ERRORS + 1;
+                            vec_push(AW_LINT_ERROR_FILES, bad);
+                        } else {
+                            AW_LINT_TOTAL = AW_LINT_TOTAL + w;
+                        }
                     }
                 }
             }
@@ -336,30 +621,50 @@ fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
     return 0;
 }
 
-# Parse cyrdoc's stdout summary "X documented, Y undocumented (Z total)" and
-# return Y. cyrdoc writes the per-fn "undocumented: <name>" markers to STDERR
-# (which exec_capture does not see); only the summary lands on stdout. The
-# "documented, " (comma+space) prefix is unique to the real summary field — the
-# "undocumented (" token is followed by " (", never ", ".
+# Read an unsigned decimal at buf[q..n). Returns the value, or -1 when there is no digit;
+# the index just past it goes to *qout.
+fn _aw_read_uint(buf, q, n, qout): i64 {
+    var v = 0;
+    var got = 0;
+    var go = 1;
+    while (go == 1) {
+        if (q >= n) { go = 0; }
+        else {
+            var c = load8(buf + q);
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); got = 1; q = q + 1; }
+            else { go = 0; }
+        }
+    }
+    store64(qout, q);
+    if (got == 0) { return 0 - 1; }
+    return v;
+}
+
+# Parse cyrdoc's stdout summary "X documented, Y undocumented (Z total)" and return Y — or
+# -1 when no complete summary is present (6.6.7: this returned 0, so a cyrdoc that refused
+# the file, crashed or never ran read as "fully documented"). cyrdoc writes the per-fn
+# "undocumented: <name>" markers to STDERR; only the summary lands on stdout (on Windows the
+# capture pipe carries both, and no marker line matches the whole summary shape).
 fn _aw_parse_undoc(buf, n): i64 {
+    var qb[8];
     var p = 0;
     while (p + 12 <= n) {
         if (memeq(buf + p, "documented, ", 12) == 1) {
-            var q = p + 12;
-            var val = 0;
-            var got = 0;
-            while (q < n) {
-                var c = load8(buf + q);
-                if (c >= 48) {
-                    if (c <= 57) { val = val * 10 + (c - 48); got = 1; q = q + 1; }
-                    else { q = n; }
-                } else { q = n; }
+            var y = _aw_read_uint(buf, p + 12, n, &qb);
+            var q = load64(&qb);
+            if (y >= 0 && q + 15 <= n) {
+                if (memeq(buf + q, " undocumented (", 15) == 1) {
+                    var z = _aw_read_uint(buf, q + 15, n, &qb);
+                    var r = load64(&qb);
+                    if (z >= 0 && r + 7 <= n) {
+                        if (memeq(buf + r, " total)", 7) == 1) { return y; }
+                    }
+                }
             }
-            if (got == 1) { return val; }
         }
         p = p + 1;
     }
-    return 0;
+    return 0 - 1;
 }
 
 # v6.2.25: doc-coverage walk for `cyrius audit`'s project sweep. Runs
@@ -369,32 +674,67 @@ fn _aw_parse_undoc(buf, n): i64 {
 fn audit_doc_walk(cyrdoc_path, dirs_vec): i64 {
     AW_DOC_TOTAL = 0;
     AW_DOC_SKIPPED = 0;
-    var cap = 200000;
+    AW_DOC_ERRORS = 0;
+    AW_DOC_ERROR_FILES = vec_new();
+    var cap = 1048576;   # see audit_lint_walk: stderr shares the pipe on Windows
     var doc_buf = alloc(cap);
+    if (doc_buf == 0) {                     # 6.6.10: was handed to the capture unchecked
+        AW_DOC_ERRORS = 1;
+        vec_push(AW_DOC_ERROR_FILES, str_from("audit_doc_walk: out of memory — nothing was checked"));
+        return 1;
+    }
+    var st[16];
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_DOC_ERRORS = AW_DOC_ERRORS + 1;
+            vec_push(AW_DOC_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);
-            if (_aw_is_cyr(name) == 1) {
+            # ⛔ v6.5.42 — RECURSIVE DESCENT. These walkers listed each directory in `dirs_vec`
+            # and nothing beneath it, so `cyrius audit` saw `tests/` (once it was added to the
+            # scope) but none of `tests/tcyr/**`, where the entire suite lives. The loop above
+            # re-reads `vec_len(dirs_vec)` every iteration, so pushing a subdirectory onto it IS
+            # the descent — a worklist, no recursion, and identical in all three walkers.
+            # ⚠ Symlinked directories are NOT followed: v6.5.12 shipped a tree walk that did,
+            # and it reported "41 passed" for a corpus of ONE.
+            var _awdt = vec_get(dtypes, ni);
+            if (_awdt == _AW_DT_DIR) {
+                if (_aw_skip_dir(name) == 0) {
+                    vec_push(dirs_vec, path_join(dir, name));
+                }
+            }
+            if (_aw_is_cyr(name) == 1 || _aw_is_cyr_variant(name) == 1) {
                 var dtype = vec_get(dtypes, ni);
                 var full = path_join(dir, name);
                 if (dtype == _AW_DT_LNK) {
                     AW_DOC_SKIPPED = AW_DOC_SKIPPED + 1;
                 } else {
-                    if (_aw_is_distlib_bundle(full) == 1) {
+                    if (_aw_is_distlib_bundle(full) == 1 || _aw_is_generated(full) == 1) {
                         AW_DOC_SKIPPED = AW_DOC_SKIPPED + 1;
                     } else {
                         var args = vec_new();
                         vec_push(args, cyrdoc_path);
                         vec_push(args, "--check");
                         vec_push(args, str_data(full));
-                        var n = exec_capture(args, doc_buf, cap);
-                        AW_DOC_TOTAL = AW_DOC_TOTAL + _aw_parse_undoc(doc_buf, n);
+                        var n = exec_capture_status(args, doc_buf, cap, &st);
+                        var u = _aw_parse_undoc(doc_buf, n);
+                        # `cyrdoc --check` exits with the undocumented count, clamped to 255.
+                        var want = u;
+                        if (want > 255) { want = 255; }
+                        var bad = _aw_run_verdict(full, &st, u, want);
+                        if (bad != 0) {
+                            AW_DOC_ERRORS = AW_DOC_ERRORS + 1;
+                            vec_push(AW_DOC_ERROR_FILES, bad);
+                        } else {
+                            AW_DOC_TOTAL = AW_DOC_TOTAL + u;
+                        }
                     }
                 }
             }

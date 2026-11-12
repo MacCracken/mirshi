@@ -35,6 +35,7 @@ include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/syscalls.cyr"
 include "lib/fnptr.cyr"
+include "lib/io.cyr"      # file_read_all (6.6.9 — it was called, never included)
 
 var SHADOW_BUF_MAX = 0x20000;
 
@@ -83,7 +84,7 @@ fn _shadow_stash(p, n, strbuf, soff_ptr, strbufsz): i64 {
 }
 
 fn _shadow_parse_line(line_start, line_end, sprec, strbuf, strbufsz): i64 {
-    var soff_store[1];
+    var soff_store[8];
     store64(&soff_store, 0);
 
     # /etc/shadow has 9 fields (8 colons). We only parse 0 (name),

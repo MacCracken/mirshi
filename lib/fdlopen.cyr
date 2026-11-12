@@ -1,12 +1,12 @@
 # fdlopen.cyr — foreign-dlopen: full-libc access for static cyrius binaries
 # Usage: include "lib/fdlopen.cyr"
-# Requires: string.cyr, syscalls.cyr, mmap.cyr, dynlib.cyr, fnptr.cyr
+# Includes its own definers (6.6.9): alloc.cyr, string.cyr, mmap.cyr, dynlib.cyr, fnptr.cyr.
 #
 # The pattern pfalcon/foreign-dlopen + Cosmopolitan libc use to get
 # a fully-initialised glibc into a static binary's address space
 # without shelling out. Ships v5.5.28 as the real fix for the NSS
 # dispatch problem the v5.5.23–v5.5.25 auxv-synthesis attempt could
-# not solve (see docs/development/issues/dynlib-nss-bootstrap.md +
+# not solve (see docs/development/issues/archived/dynlib-nss-bootstrap.md +
 # vidya :: static_dlopen_and_nss_bootstrap_limits).
 #
 # ARCHITECTURE
@@ -48,8 +48,10 @@
 #         `dl_longjmp` to return to the caller's setjmp frame.
 #
 #   3. Post-`fdlopen_init`, `state_buf` holds real fn pointers into
-#      a fully-initialised glibc. `fdlopen_sym(state, "getaddrinfo")`
-#      returns the pointer; caller invokes via `fncallN`.
+#      a fully-initialised glibc. `fdlopen_getaddrinfo(state)` returns
+#      the pointer (each slot has such an accessor, over
+#      `fdlopen_slot(state, off)`; `fdlopen_dlsym(state)` is glibc's own
+#      dlsym, for any other symbol); caller invokes via `fncallN`.
 #
 # RISKS & MITIGATIONS
 # ===================
@@ -104,6 +106,14 @@
 # Darwin + Windows stubbed (foreign-dlopen is inherently glibc-shaped —
 # Darwin uses dyld, Windows uses its own PE loader, both work
 # differently).
+
+# 6.6.9: alloc / memcpy / cyr_munmap / the dynlib_auxv_* helpers were all called and none
+# included. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/mmap.cyr"
+include "lib/dynlib.cyr"
+include "lib/fnptr.cyr"
 
 # Error codes — cyrius enums don't accept negative literals, so these
 # live as plain constants. Returned as negative values from init:
@@ -163,9 +173,17 @@ var _fdlopen_state_global = 0;
 #   +24  r13
 #   +32  r14
 #   +40  r15
-#   +48  caller_rsp  (rbp + 16 = pre-`call dl_setjmp` rsp)
-#   +56  caller_rip  (return address — stored at [rbp+8] inside callee)
+#   +48  caller_rsp  (rsp + 8 at naked entry = pre-`call dl_setjmp` rsp)
+#   +56  caller_rip  (return address — [rsp] at naked entry)
 #   +64..+127  reserved
+#
+# aarch64 / AAPCS64 uses the SAME buffer, 104 B of 128 (v6.5.18: now live on
+# macOS-arm64 as well as Linux). The layout is deliberately INTERLEAVED so that
+# +48 and +56 land on the same offsets as the x86 arm — that is what lets the
+# test read load64(buf+48) / load64(buf+56) without an arch switch:
+#   +0/+8 x19,x20   +16/+24 x21,x22   +32/+40 x23,x24
+#   +48  caller sp (via x9)          +56  x30 (return address)
+#   +64/+72 x25,x26  +80/+88 x27,x28  +96 x29 (caller fp)
 #
 # Return value: 0 on direct call, non-zero on return-via-longjmp. If
 # longjmp was called with val==0, returns 1 (POSIX convention).
@@ -179,7 +197,22 @@ var _fdlopen_state_global = 0;
 # `#`-prefixed lines, so this keeps the `fn` visible to them.)
 #naked
 fn dl_setjmp(buf): i64 {
-    #ifdef CYRIUS_TARGET_LINUX
+    # v6.5.18: gated by ABI, not by OS. This is pure callee-saved register
+    # save/restore — it issues no syscall and touches nothing kernel-owned, so
+    # it is correct on EVERY target sharing the ABI it was written against:
+    #   x86 arm     -> SysV AMD64  (Linux, macOS/Darwin, agnos)
+    #   aarch64 arm -> AAPCS64     (Linux, macOS/Darwin)
+    # Darwin-arm64 specifics hold: x18 (reserved) is never touched, the temp is
+    # the caller-saved x9, and SP stays 16-byte aligned across mov x9,sp /
+    # mov sp,x9. Neither OS has a red zone and nothing is written below SP.
+    # Win64 is the ONE genuinely different ABI (arg1 = rcx not rdi, callee-saved
+    # adds rdi/rsi/xmm6-15, 32-byte shadow space) so it keeps the stub below.
+    # KNOWN GAP, deliberate and identical to the Linux behaviour this replaces:
+    # the FP callee-saved state (aarch64 d8-d15, x86 x87/MXCSR control words) is
+    # NOT saved. glibc setjmp does save it. Do not "fix" that here without a
+    # matching buf-size review — the buffer is 128 B and the aarch64 arm already
+    # uses 104 of it.
+    #ifndef CYRIUS_TARGET_WIN
     #ifdef CYRIUS_ARCH_X86
     asm {
         0x48; 0x89; 0xF8;          # mov rax, rdi       (buf)
@@ -213,12 +246,29 @@ fn dl_setjmp(buf): i64 {
     }
     #endif
     #endif
-    #ifndef CYRIUS_TARGET_LINUX
-    #ifdef CYRIUS_ARCH_X86
-    asm { 0x31; 0xC0; 0xC3; }      # xor eax,eax; ret  (no foreign dlopen off-Linux)
+    # --- STUBBED TARGETS ------------------------------------------------
+    # Windows/PE — Win64 is a genuinely different ABI (see above), so the SysV
+    # encoding would read the wrong register for `buf`. STUB CONTRACT: dl_setjmp
+    # always returns 0 and writes nothing to `buf`; dl_longjmp returns 0
+    # NORMALLY instead of branching. #naked IS armed on PE as of v6.5.18, so
+    # this is a true naked `ret` — before that the fn was framed and the `ret`
+    # popped a stack local (silent wrong answer). Asserted, not skipped, by
+    # tests/tcyr/crossos/setjmp_naked.tcyr.
+    #ifdef CYRIUS_TARGET_WIN
+    asm { 0x31; 0xC0; 0xC3; }      # xor eax,eax; ret
     #endif
-    #ifdef CYRIUS_ARCH_AARCH64
-    asm { 0x00; 0x00; 0x80; 0xD2; 0xC0; 0x03; 0x5F; 0xD6; }  # mov x0,#0; ret
+    # cyrius-x bytecode — main_cx.cyr predefines NEITHER CYRIUS_ARCH_X86 nor
+    # CYRIUS_ARCH_AARCH64, so both arms above vanish. setjmp is not expressible
+    # on a bytecode VM: cxvm owns no machine registers, no native return address
+    # on a stack it controls, and no sp to restore, and it would decode the raw
+    # machine bytes above as opcodes. PERMANENTLY stubbed here — and #naked must
+    # NOT be armed on cx, because a naked empty body would fall straight through
+    # into the next fn. Kept as ordinary cyrius code so it gets a real framed
+    # epilogue and a deterministic 0 (rather than the previous empty body, which
+    # returned whatever happened to be in the return register).
+    #ifndef CYRIUS_ARCH_X86
+    #ifndef CYRIUS_ARCH_AARCH64
+    return 0;
     #endif
     #endif
 }
@@ -227,7 +277,8 @@ fn dl_setjmp(buf): i64 {
 # return address). If `val` is 0, setjmp sees 1 (POSIX). #naked — see dl_setjmp.
 #naked
 fn dl_longjmp(buf, val): i64 {
-    #ifdef CYRIUS_TARGET_LINUX
+    # v6.5.18: ABI-gated, not OS-gated — see the note on dl_setjmp.
+    #ifndef CYRIUS_TARGET_WIN
     #ifdef CYRIUS_ARCH_X86
     asm {
         0x48; 0x89; 0xF0;          # mov rax, rsi       (val)
@@ -265,12 +316,15 @@ fn dl_longjmp(buf, val): i64 {
     }
     #endif
     #endif
-    #ifndef CYRIUS_TARGET_LINUX
-    #ifdef CYRIUS_ARCH_X86
+    # --- STUBBED TARGETS: Windows/PE + cyrius-x. See dl_setjmp for the full
+    # reasoning and the exact stub contract. dl_longjmp RETURNS NORMALLY here
+    # (it does not branch), which is what the crossos test asserts on cass.
+    #ifdef CYRIUS_TARGET_WIN
     asm { 0x31; 0xC0; 0xC3; }      # xor eax,eax; ret
     #endif
-    #ifdef CYRIUS_ARCH_AARCH64
-    asm { 0x00; 0x00; 0x80; 0xD2; 0xC0; 0x03; 0x5F; 0xD6; }  # mov x0,#0; ret
+    #ifndef CYRIUS_ARCH_X86
+    #ifndef CYRIUS_ARCH_AARCH64
+    return 0;
     #endif
     #endif
 }
@@ -374,6 +428,11 @@ fn fdlopen_helper_available(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: fdlopen_init* already return -6 off x86-Linux; the availability gate must
+    # agree, or a consumer (lib/tls.cyr:218) sees "available" and then fails to init.
+    return 0;
+    #endif
     var pathbuf = alloc(512);
     if (pathbuf == 0) { return 0; }
     var pl = _fdlopen_helper_path(pathbuf, 512);
@@ -387,7 +446,7 @@ fn fdlopen_helper_available(): i64 {
 }
 
 # ================================================================
-# fdlopen_init / fdlopen_sym / helpers
+# fdlopen_init / fdlopen_slot + the slot accessors / helpers
 # ================================================================
 
 # Returns the size in bytes that caller must allocate for the
@@ -414,6 +473,13 @@ fn fdlopen_state_size(): i64 { return 256; }
 fn _fdlopen_mmap_elf(path, out_info): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;   # Linux-host-only (raw open/fstat/mmap mis-dispatch on agnos)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: an x86_64-Linux facility (ld-linux-x86-64.so.2 + the x86 asm trampoline in
+    # _fdlopen_enter_ldso) — declined BY DECISION, not accidentally dead. Its raw fstat(5)
+    # reached aarch64 as setxattr and failed closed; now that 5→80 is routed the load would
+    # proceed into x86-only code. CHANGELOG [6.6.4]
+    return 0 - 1;
     #endif
     var fd = syscall(2, path, 0, 0);   # O_RDONLY
     if (fd < 0) { return 0 - 1; }
@@ -581,7 +647,7 @@ fn _fdlopen_hex64(v, out): i64 {
 # RSP must be 16-byte aligned at ld.so entry.
 # ---------------------------------------------------------------
 fn _fdlopen_build_stack(region, region_size, helper_info, ldso_info,
-auxv_buf, auxv_len, state_addr, cb_addr) {
+  auxv_buf, auxv_len, state_addr, cb_addr) {
     var region_top = region + region_size;
 
     # String table at the high end
@@ -748,9 +814,9 @@ fn _fdlopen_run_loader(state): i64 {
     # Build startup stack layout
     var cb_addr = &_fdlopen_cb;
     var new_rsp = _fdlopen_build_stack(stk_region, stack_sz,
-    helper_info, ldso_info,
-    auxv, auxv_len,
-    state, cb_addr);
+      helper_info, ldso_info,
+      auxv, auxv_len,
+      state, cb_addr);
     if (new_rsp == 0) { return 0 - 3; }
 
     # Capture return state — longjmp from callback comes back here
@@ -805,7 +871,7 @@ fn fdlopen_init(state): i64 {
 # prot-bit encoding bug in `_fdlopen_mmap_elf` (PF_R / PF_X are
 # swapped relative to PROT_READ / PROT_EXEC); v5.5.34 fixed the
 # extraction and the full round-trip works — see the per-byte
-# reasoning at lines 405-413. `tests/tcyr/fdlopen.tcyr` exercises
+# reasoning at lines 405-413. `tests/tcyr/platform/fdlopen.tcyr` exercises
 # the full path end-to-end (real `dlopen("libc.so.6")` →
 # `dlsym("getpid")` → `fncall0(...) == syscall(39)` round-trip).
 fn fdlopen_init_full(state): i64 {
@@ -840,6 +906,23 @@ fn fdlopen_init_full(state): i64 {
 fn _fdlopen_verify_trusted(path): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;   # Linux-host-only (raw lstat mis-dispatches on agnos)
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    # v6.5.16: same reason as the agnos arm, and now load-bearing. The field offsets
+    # below (st_mode @24, st_uid @28) are x86_64-LINUX; Darwin's legacy struct stat puts
+    # mode @8 and uid @12. Until this release raw `syscall(6)` was unrouted on x86-macOS
+    # so the call SIGSYS'd; now that lstat 6→190 is routed the call would SUCCEED and this
+    # trust check would read the wrong words — a security predicate silently misreading
+    # mode/uid is strictly worse than one that fails. fdlopen is an ELF/Linux facility, so
+    # decline rather than port the offsets.
+    return 0;
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: same reasoning as the macOS arm. aarch64-Linux struct stat puts st_mode @16
+    # and st_uid @24, so the @24/@28 reads below would be st_uid/st_gid; and the raw
+    # lstat(6) that used to reach the kernel as lsetxattr (fail-closed) is now routed to
+    # fstatat(AT_SYMLINK_NOFOLLOW), so without this the check would SUCCEED and misread.
+    return 0;
     #endif
     var st[144];
     var r = syscall(6, path, &st);              # lstat(path, &st)

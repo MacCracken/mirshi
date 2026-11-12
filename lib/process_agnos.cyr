@@ -1,148 +1,418 @@
 # process_agnos.cyr — process management on agnos (ring-3 x86_64)
 # Usage: include "lib/process.cyr" (dispatches here under CYRIUS_TARGET_AGNOS)
+# Requires: the agnos syscall peer, alloc.cyr, tagged.cyr (Result), vec.cyr + str.cyr for
+# the vec verbs — the same set lib/process.cyr names.
 #
-# agnos has no fork/exec/dup2 in the frozen 0-33 syscall surface. It spawns an
-# IN-MEMORY ELF image: `sys_spawn(elf_addr, elf_size)` → pid, then
-# `sys_waitpid(pid)` → exit_code DIRECTLY (not a Linux wait-status word). So
-# "run the program at PATH" = read the ELF file into memory, sys_spawn it,
-# wait. The W* wait-status decoders are trivial on agnos (the agnos peer
-# defines them: WEXITSTATUS = the code itself).
+# How a child is run here (agnos >= 1.57.6; CHANGELOG [6.6.8]):
+#   * SPAWN FROM DISK with a real argv — spawn_path#43 with SPAWN_F_ARGV, through
+#     sys_spawn_argv — and SPAWN_F_CLEANFD, so the child holds fds 0/1/2 (after any
+#     redirect) and nothing else of ours. argv[0] is the path the kernel opens: an absolute
+#     path on the ext2 root. There is no PATH search and no shell.
+#   * WAIT with WAIT_BLOCK (sys_waitpid_block, 1.57.7). A plain #4 is a POLL that answers -2
+#     while the child lives; this module used to take that -2 as the result, so `run`
+#     returned Err before the child had finished and every `exec_*` reported "-2" as an
+#     exit code.
+#   * CAPTURE through a pipe: arm #62 (child fd 1 -> the pipe's write end), spawn, close our
+#     write end, READ TO EOF, and only then reap. The ring is 4080 B and a full-ring write
+#     BLOCKS (1.57.9), so reaping first would deadlock on any child with more to say.
 #
-# TWO agnos ABI limitations (frozen 0-33 — flag-back to the agnos owner, not
-# cyrius gaps; see docs/development/issues/2026-06-03-agnos-followup-after-boot.md):
-#   1. `sys_spawn(elf, size)` takes NO argv/envp → arguments to the spawned
-#      program are NOT passed (only the program itself runs).
-#   2. `sys_dup` is a stub → the spawned program's stdout CANNOT be redirected,
-#      so the capture variants run the program (output goes to the terminal)
-#      and report 0 captured bytes rather than buffering it.
+# What this replaced (v6.0.56): the whole ELF was read into an 8 MB buffer that was never
+# freed (8 MB per spawn) and handed to spawn#3 — which refuses any image over 16 KB, so a
+# println hello (15 KB) was about the largest thing it could start. No argument reached
+# the child and no capture variant captured.
+#
+# ⚠ KERNEL FLOOR: 1.57.6 (flagged #43, #62 ops). An older kernel answers -1 to every spawn
+# here: nothing runs, and each verb reports its failure value. On 1.57.6 itself (no
+# WAIT_BLOCK) the wait falls back to polling #4 — a -1 from WAIT_BLOCK on a pid we just
+# spawned can only mean the kernel predates it, because nobody else can reap our child.
+# That is also why this does NOT probe with sched_yield_to#108: #108 arrived in 1.57.9
+# and would misread 1.57.7 / 1.57.8 as lacking WAIT_BLOCK.
+#
+# Limits, all REFUSED up front, never truncated: argv <= SPAWN_ARGV_MAX (1024) bytes
+# including one NUL per entry and <= SPAWN_ARGC_MAX (16) entries; an env <= 1024 bytes and
+# 16 `KEY=VALUE` entries. An entry cannot carry a NUL byte. The argv/env blobs are built on
+# the stack: a spawn allocates nothing. A refusal still makes ONE #43 — the kernel's refusal
+# (_agnos_spawn_refuse) — because every #43 return clears the caller's spawn arms: a #62
+# redirect or endowment armed for a call this module refused must not reach the next child.
+#
+# Differences from the POSIX module, stated: there is no deadline (proc_set_timeout_ms is
+# POSIX-only, so calling it fails to compile here), so -2 is never returned; a capture
+# leaves the child's stderr on the terminal (agnos has no /dev/null); and an EMPTY env
+# vec runs the child with the kernel's default environment, because agnos has no way to
+# say "no environment".
 
-var _AGNOS_ELF_MAX = 8388608;   # 8 MB ELF read cap (covers agnsh-class programs)
+# How many children this process has ended at a deadline — always 0 here: agnos has no
+# deadline (above). A real peer rather than a POSIX-only exemption, because callers ask it
+# AROUND any call (sigil's cryptsetup, deps' git) and must compile on agnos. CHANGELOG [6.6.8]
+fn proc_deadline_kills(): i64 { return 0; }
 
-# Read the ELF file at `cmd` (a cstr path) into a fresh heap buffer and
-# sys_spawn it. Returns the child pid, or -1 on open/read/spawn failure.
-fn _agnos_spawn_path(cmd): i64 {
-    var namelen = 0;
-    while (load8(cmd + namelen) != 0) { namelen = namelen + 1; }
-    var fd = sys_open(cmd, namelen, 0);          # AO_RDONLY
-    if (fd < 0) { return 0 - 1; }
-    var buf = alloc(_AGNOS_ELF_MAX);
-    if (buf == 0) { sys_close(fd); return 0 - 1; }
+# errno ECHILD — `run` / `wait_pid` answer Err(PROC_ECHILD) when the wait saw no child to
+# reap (a pid that is not ours), so there is no status to report. Same value and meaning as
+# the POSIX module. CHANGELOG [6.6.8]
+var PROC_ECHILD = 10;
+
+# errno ETIMEDOUT — defined so a portable caller that compares a Result against it compiles
+# here (6.6.7 put it in the POSIX block only, so `PROC_ETIMEDOUT` was an undefined variable —
+# a hard error — on agnos). No verb here RETURNS it: agnos has no deadline (see the header).
+# Same value as the POSIX and Windows modules. CHANGELOG [6.6.10]
+var PROC_ETIMEDOUT = 110;
+
+# -- argv / env blobs --
+
+# Length of the NUL-terminated string at `p`.
+fn _agp_cstrlen(p): i64 {
+    var n = 0;
+    while (load8(p + n) != 0) { n = n + 1; }
+    return n;
+}
+
+# Append `n` bytes at `p` and one NUL to the blob `b` at offset `off` (capacity `cap`).
+# Returns the new offset, or -1 when it does not fit or `p` holds a NUL — the kernel reads
+# a NUL as an entry boundary, so an embedded one would silently become another argument.
+fn _agp_put(b, off, cap, p, n): i64 {
+    if (n < 0) { return 0 - 1; }
+    if (off + n + 1 > cap) { return 0 - 1; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if (c == 0) { return 0 - 1; }
+        store8(b + off + i, c);
+        i = i + 1;
+    }
+    store8(b + off + n, 0);
+    return off + n + 1;
+}
+
+# Append one vec element — a cstr (`is_str` 0) or a Str (`is_str` 1). A null element is -1.
+fn _agp_put_elem(b, off, cap, e, is_str): i64 {
+    if (e == 0) { return 0 - 1; }
+    if (is_str == 1) { return _agp_put(b, off, cap, str_data(e), str_len(e)); }
+    return _agp_put(b, off, cap, e, _agp_cstrlen(e));
+}
+
+# Build the argv blob for `cmd arg1 arg2` (0 = absent, as the POSIX _exec3). Length or -1.
+fn _agp_argv3(b, cmd, arg1, arg2): i64 {
+    if (cmd == 0) { return 0 - 1; }
+    var off = _agp_put(b, 0, SPAWN_ARGV_MAX, cmd, _agp_cstrlen(cmd));
+    if (off < 2) { return 0 - 1; }                       # an empty path
+    if (arg1 != 0) { off = _agp_put(b, off, SPAWN_ARGV_MAX, arg1, _agp_cstrlen(arg1)); }
+    if (off < 0) { return 0 - 1; }
+    if (arg2 != 0) { off = _agp_put(b, off, SPAWN_ARGV_MAX, arg2, _agp_cstrlen(arg2)); }
+    return off;
+}
+
+# Build the argv blob from a vec (cstr or Str elements). Length, or -1 for an empty vec,
+# more than SPAWN_ARGC_MAX entries, an empty argv[0], or more than SPAWN_ARGV_MAX bytes.
+fn _agp_argv_vec(b, args, is_str): i64 {
+    var argc = vec_len(args);
+    if (argc < 1) { return 0 - 1; }
+    if (argc > SPAWN_ARGC_MAX) { return 0 - 1; }
+    var off = 0;
+    var i = 0;
+    while (i < argc) {
+        off = _agp_put_elem(b, off, SPAWN_ARGV_MAX, vec_get(args, i), is_str);
+        if (off < 0) { return 0 - 1; }
+        if (off < 2) { return 0 - 1; }                   # argv[0] was empty
+        i = i + 1;
+    }
+    return off;
+}
+
+# Build the argv blob from a command LINE: split on runs of spaces, exactly the kernel's
+# line-form rule, but into the 1024-byte flagged form (the line form stops at 127 bytes).
+# Length, or -1 for an empty line, more than SPAWN_ARGC_MAX tokens or SPAWN_ARGV_MAX bytes.
+fn _agp_argv_line(b, line): i64 {
+    var off = 0;
+    var argc = 0;
+    var i = 0;
+    while (1 == 1) {
+        while (load8(line + i) == 32) { i = i + 1; }
+        if (load8(line + i) == 0) { break; }
+        var s = i;
+        while (load8(line + i) != 0) {
+            if (load8(line + i) == 32) { break; }
+            i = i + 1;
+        }
+        argc = argc + 1;
+        if (argc > SPAWN_ARGC_MAX) { return 0 - 1; }
+        off = _agp_put(b, off, SPAWN_ARGV_MAX, line + s, i - s);
+        if (off < 0) { return 0 - 1; }
+    }
+    if (argc == 0) { return 0 - 1; }
+    return off;
+}
+
+# 1 iff the entry b[s, e) has a '=' at index >= 1 (what the kernel's env gate requires).
+fn _agp_has_eq(b, s, e): i64 {
+    var j = s + 1;
+    while (j < e) {
+        if (load8(b + j) == 61) { return 1; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# Build the env blob (`KEY=VALUE\0…`) from a vec. Length (0 for an empty vec: the kernel's
+# default env), or -1 for more than 16 entries, more than 1024 bytes, or an entry that is
+# not KEY=VALUE — refused here rather than by the kernel, so the reason is ours to state.
+fn _agp_env_vec(b, env, is_str): i64 {
+    var n = vec_len(env);
+    if (n > 16) { return 0 - 1; }
+    var off = 0;
+    var i = 0;
+    while (i < n) {
+        var s = off;
+        off = _agp_put_elem(b, off, 1024, vec_get(env, i), is_str);
+        if (off < 0) { return 0 - 1; }
+        if (_agp_has_eq(b, s, off - 1) == 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return off;
+}
+
+# -- spawn / wait / capture --
+
+# End a verb that will NOT reach a spawn the way the kernel ends a refused one: through a #43
+# (_agnos_spawn_refuse), whose return clears every spawn arm the caller set — #62 redirects,
+# the channel endowment, the limits. ⛔ A bare `return` here would leave an arm the caller made
+# for THIS call armed for its NEXT child (agnos issue 2026-09-23 §3's class). Returns `code`.
+# CHANGELOG [6.6.8]
+fn _agp_refuse(code): i64 {
+    _agnos_spawn_refuse();
+    return code;
+}
+
+# Spawn the argv blob `b` (`len` bytes; < 0 = the builder refused it) with env blob `e`
+# (`elen`, 0 = default env) and a clean fd table. Returns the pid, or a negative code:
+# -SPAWN_E_* from the kernel, -SPAWN_E_ARGS for a blob the builder refused (still one #43 —
+# see _agp_refuse), or -1 (a pre-1.57.6 kernel).
+fn _agp_spawn(b, len, e, elen): i64 {
+    if (len < 0) { return _agp_refuse(0 - SPAWN_E_ARGS); }
+    if (elen < 0) { return _agp_refuse(0 - SPAWN_E_ARGS); }
+    if (elen == 0) { e = 0; }
+    return sys_spawn_argv(b, len, e, elen, SPAWN_F_CLEANFD);
+}
+
+# Block until `pid` exits and reap it. Returns its wait status (>= 0), or -1 when there is
+# nothing of ours to reap. WAIT_BLOCK first; its -1 means a pre-1.57.7 kernel (see the
+# header) and its -2 means this caller cannot block right now — both fall back to polling
+# #4, which answers the status, -2 while the child lives, or -1 for a pid that is not ours.
+fn _agp_wait(pid): i64 {
+    var st = sys_waitpid_block(pid);
+    if (st >= 0) { return st; }
+    while (1 == 1) {
+        st = sys_waitpid(pid);
+        if (st != 0 - 2) { return st; }
+        sys_sleep_ms(1);
+    }
+    return 0 - 1;
+}
+
+# A wait status as one exit code: the code for an exit (a fault is already 128 + vector),
+# 128 + signal for a death by signal — the POSIX module's convention.
+fn _agp_code(st): i64 {
+    if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
+    return WEXITSTATUS(st);
+}
+
+# End child `pid` and its whole descendant tree, and reap `pid` into `stbuf` (its wait status,
+# stored as 4 bytes; left untouched when there was nothing of ours to reap). Returns 0; the
+# caller must not wait for `pid` again. The agnos peer of lib/process.cyr's `proc_kill_tree`:
+# kill#16 with the tree bit (agnos 1.57.7) ENDS the root and every descendant in one snapshot.
+# There is no TERM-then-grace step because agnos gives SIGTERM no default action — a TERM here
+# would only set a pending bit. When the tree kill is REFUSED (-1: a pre-1.57.7 kernel does not
+# know the tree bit) the root is killed alone before the wait — the WAIT_BLOCK below would
+# otherwise wait for a child nothing had signalled, for ever. The tree is lost then, never the
+# bound. CHANGELOG [6.6.10]
+fn proc_kill_tree(pid, stbuf): i64 {
+    if (sys_kill_tree(pid, 9) != 0) { sys_kill(pid, 9); }
+    var st = _agp_wait(pid);
+    if (st >= 0) { store32(stbuf, st); }
+    return 0;
+}
+
+# Wait for `pid` and answer the i64 verbs' way: the exit code, or -1 when it died of a
+# signal or could not be waited for (the POSIX exec_* contract).
+fn _agp_wait_exit(pid): i64 {
+    if (pid < 0) { return 0 - 1; }
+    var st = _agp_wait(pid);
+    if (st < 0) { return 0 - 1; }
+    if (WIFSIGNALED(st) == 1) { return 0 - 1; }
+    return WEXITSTATUS(st);
+}
+
+# Read `fd` into `buf` until EOF or `buflen` bytes. Returns the bytes read. A -2 is "nothing
+# yet": a pre-1.57.8 kernel answers it for an empty pipe instead of blocking, so it is
+# retried, never taken as EOF.
+fn _agp_drain(fd, buf, buflen): i64 {
     var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = sys_read(fd, buf + total, _AGNOS_ELF_MAX - total);
-        if (n <= 0) { rgo = 0; }
+    while (total < buflen) {
+        var n = sys_read(fd, buf + total, buflen - total);
+        if (n == 0 - 2) { sys_sleep_ms(1); }
         else {
+            if (n <= 0) { break; }
             total = total + n;
-            if (total >= _AGNOS_ELF_MAX) { rgo = 0; }
         }
     }
-    sys_close(fd);
-    if (total <= 0) { return 0 - 1; }
-    return sys_spawn(buf, total);
+    return total;
 }
 
-# Run `cmd` (args not passable on agnos) and wait. Returns Result(exit_code).
+# Spawn argv blob `b` (env `e`/`elen`) with its stdout captured into `buf` (at most `buflen`
+# bytes). Returns the bytes captured with the child's wait status (or -1) stored at `stp`, or
+# a negative spawn code (see _agp_spawn; -1 also for a pipe/redirect failure) with `stp` = -1.
+# ⛔ ORDER IS THE CONTRACT: read to EOF BEFORE reaping (a full 4080 B ring blocks the child's
+# write, so a reap-first parent deadlocks), and close our write end BEFORE reading (with it
+# open there is always a live writer, so the read never sees EOF). A full `buf` stops the
+# read and closes the read end — the child's further writes then fail (-1: agnos has no
+# SIGPIPE) and it runs to its end. Every exit that does not reach a spawn goes through
+# _agp_refuse, or an arm (ours or the caller's) would redirect whatever this process spawns next.
+fn _agp_capture(b, len, e, elen, buf, buflen, stp): i64 {
+    store64(stp, 0 - 1);
+    if (len < 0) { return _agp_refuse(0 - SPAWN_E_ARGS); }
+    if (elen < 0) { return _agp_refuse(0 - SPAWN_E_ARGS); }
+    var fds[16];
+    if (sys_pipe(&fds) < 0) { return _agp_refuse(0 - 1); }
+    var rfd = load64(&fds);
+    var wfd = load64(&fds + 8);
+    if (sys_exec_redirect(1, wfd) < 0) {
+        _agp_refuse(0 - 1);
+        sys_close(rfd);
+        sys_close(wfd);
+        return 0 - 1;
+    }
+    var pid = _agp_spawn(b, len, e, elen);   # every #43 return clears the arm
+    sys_close(wfd);
+    if (pid < 0) { sys_close(rfd); return pid; }
+    var total = _agp_drain(rfd, buf, buflen);
+    sys_close(rfd);
+    store64(stp, _agp_wait(pid));
+    return total;
+}
+
+# Store a wait status in `status_out`'s two slots (the POSIX exec_capture_status shape):
+# [0] exit code · 128 + signal · -1 when there was no status; [1] 1 iff a signal ended it.
+fn _agp_store_status(status_out, st): i64 {
+    var code = 0 - 1;
+    var sig = 0;
+    if (st >= 0) {
+        code = _agp_code(st);
+        if (WIFSIGNALED(st) == 1) { sig = 1; }
+    }
+    store64(status_out, code);
+    store64(status_out + 8, sig);
+    return 0;
+}
+
+# -- the public surface (same names and arities as lib/process.cyr) --
+
+# Run `cmd arg1 arg2` (0 = no argument) and wait. Returns Result(exit code, or 128 + signal);
+# Err(SPAWN_E_*) when it could not be started (Err(1) on a pre-1.57.6 kernel), Err(PROC_ECHILD)
+# when it could not be waited for.
 fn run(cmd, arg1, arg2): Result {
-    var pid = _agnos_spawn_path(cmd);
-    if (pid < 0) { return Err(1); }
-    var code = sys_waitpid(pid);
-    if (code < 0) { return Err(1); }
-    return Ok(code);
+    var b[1024];
+    var pid = _agp_spawn(&b, _agp_argv3(&b, cmd, arg1, arg2), 0, 0);
+    if (pid < 0) { return Err(0 - pid); }
+    var st = _agp_wait(pid);
+    if (st < 0) { return Err(PROC_ECHILD); }
+    return Ok(_agp_code(st));
 }
 
-# Capture is unsupported on agnos (no working dup → can't redirect the child's
-# stdout). Run the program (its output goes to the terminal) + report 0 bytes.
+# Run `cmd arg1 arg2` and capture its stdout into `buf`. Returns Result(bytes captured), or
+# Err(SPAWN_E_*) / Err(1) when nothing ran. The exit status is discarded (POSIX parity).
 fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
-    var pid = _agnos_spawn_path(cmd);
-    if (pid < 0) { return Err(1); }
-    sys_waitpid(pid);
-    return Ok(0);
+    var b[1024];
+    var st[16];
+    var n = _agp_capture(&b, _agp_argv3(&b, cmd, arg1, arg2), 0, 0, buf, buflen, &st);
+    if (n < 0) { return Err(0 - n); }
+    return Ok(n);
 }
 
-# Spawn `cmd` without waiting. Returns Result(pid).
+# Spawn `cmd arg1 arg2` without waiting. Returns Result(pid); reap it with wait_pid.
 fn spawn(cmd, arg1, arg2): Result {
-    var pid = _agnos_spawn_path(cmd);
-    if (pid < 0) { return Err(1); }
+    var b[1024];
+    var pid = _agp_spawn(&b, _agp_argv3(&b, cmd, arg1, arg2), 0, 0);
+    if (pid < 0) { return Err(0 - pid); }
     return Ok(pid);
 }
 
-# Wait for a pid. agnos sys_waitpid returns the exit code directly.
+# Wait for child `pid`. Returns Result(exit code, or 128 + signal), or Err(PROC_ECHILD) when
+# `pid` is not a child of ours to reap.
 fn wait_pid(pid): Result {
-    var code = sys_waitpid(pid);
-    if (code < 0) { return Err(0 - code); }
-    return Ok(code);
+    var st = _agp_wait(pid);
+    if (st < 0) { return Err(PROC_ECHILD); }
+    return Ok(_agp_code(st));
 }
 
 # Current process id.
 fn getpid(): i64 { return sys_getpid(); }
-# Parent process id — agnos has no getppid in the frozen 0-33 surface; returns 0.
+# Parent process id — agnos has no getppid syscall (the parent is only readable through
+# proclist#99's records); returns 0.
 fn getppid(): i64 { return 0; }
 
-# vec-of-cstr argv variants. cmd = args[0]; args[1..] cannot be passed.
+# Run a cstr argv vec (args[0] = the path) and wait. Returns the exit code, or -1 when it
+# could not be run, died of a signal, or could not be waited for.
 fn exec_vec(args): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var pid = _agnos_spawn_path(vec_get(args, 0));
-    if (pid < 0) { return 0 - 1; }
-    return sys_waitpid(pid);
+    var b[1024];
+    return _agp_wait_exit(_agp_spawn(&b, _agp_argv_vec(&b, args, 0), 0, 0));
 }
 
-# Capture variant — unsupported on agnos (no stdout redirect): runs the
-# program (its output goes to the terminal) and reports 0 captured bytes.
+# Run a cstr argv vec, capture stdout, and REPORT HOW IT ENDED. Returns the bytes captured,
+# or -1 when nothing ran. `status_out` = two i64 slots: [0] exit code · 128 + signal · -1
+# (nothing ran, or no status); [1] 1 iff a signal ended the child. No deadline on agnos, so
+# never the POSIX -2. CHANGELOG [6.6.8]
+fn exec_capture_status(args, buf, buflen, status_out): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
+    var b[1024];
+    var st[16];
+    var n = _agp_capture(&b, _agp_argv_vec(&b, args, 0), 0, 0, buf, buflen, &st);
+    if (n < 0) { return 0 - 1; }
+    _agp_store_status(status_out, load64(&st));
+    return n;
+}
+
+# Run a cstr argv vec and capture stdout. Returns the bytes captured, or -1 when nothing ran.
+# The exit status is DISCARDED — use exec_capture_status when a failed run must not read as
+# short output.
 fn exec_capture(args, buf, buflen): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var pid = _agnos_spawn_path(vec_get(args, 0));
-    if (pid < 0) { return 0 - 1; }
-    sys_waitpid(pid);
-    return 0;                       # capture unsupported on agnos
+    var _st[16];
+    return exec_capture_status(args, buf, buflen, &_st);
 }
 
-# Run with an env block — agnos can't pass envp, so identical to exec_vec.
-fn exec_env(args, env): i64 { return exec_vec(args); }
+# Run a cstr argv vec with a cstr env vec ("KEY=VALUE"). Exit code or -1, as exec_vec.
+fn exec_env(args, env): i64 {
+    var b[1024];
+    var e[1024];
+    return _agp_wait_exit(_agp_spawn(&b, _agp_argv_vec(&b, args, 0), &e, _agp_env_vec(&e, env, 0)));
+}
 
-# vec-of-Str argv variants. cmd = str_data(args[0]).
+# Run a Str argv vec and wait. Exit code or -1, as exec_vec.
 fn exec_vec_str(args): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var pid = _agnos_spawn_path(str_data(vec_get(args, 0)));
-    if (pid < 0) { return 0 - 1; }
-    return sys_waitpid(pid);
+    var b[1024];
+    return _agp_wait_exit(_agp_spawn(&b, _agp_argv_vec(&b, args, 1), 0, 0));
 }
 
-# Str-argv capture variant — also unsupported on agnos (see exec_capture).
+# Run a Str argv vec and capture stdout. Returns the bytes captured, or -1 when nothing ran.
 fn exec_capture_str(args, buf, buflen): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var pid = _agnos_spawn_path(str_data(vec_get(args, 0)));
-    if (pid < 0) { return 0 - 1; }
-    sys_waitpid(pid);
-    return 0;
+    var b[1024];
+    var st[16];
+    var n = _agp_capture(&b, _agp_argv_vec(&b, args, 1), 0, 0, buf, buflen, &st);
+    if (n < 0) { return 0 - 1; }
+    return n;
 }
 
-# Str-argv env variant — agnos can't pass envp, so identical to exec_vec_str.
-fn exec_env_str(args, env): i64 { return exec_vec_str(args); }
+# Run a Str argv vec with a Str env vec. Exit code or -1, as exec_vec.
+fn exec_env_str(args, env): i64 {
+    var b[1024];
+    var e[1024];
+    return _agp_wait_exit(_agp_spawn(&b, _agp_argv_vec(&b, args, 1), &e, _agp_env_vec(&e, env, 1)));
+}
 
-# Run a single cmdline string. agnos has no shell and sys_spawn takes no
-# argv/pipe, so shell pipelines (`a | b`, `$(...)`, `VAR=val cmd`) are NOT
-# representable here — unlike the POSIX /bin/sh -c and Windows cmd /s /c
-# paths. Best effort: spawn just the first token (the program path), up to
-# the first space; returns -1 if that isn't a spawnable ELF. cyriusly's
-# heavy verbs (install/update/setup) therefore aren't available on agnos.
+# Run a command LINE and wait. agnos has no /bin/sh, so the line is split on spaces into argv
+# (the kernel's own line rule, up to 16 tokens and 1024 bytes) and argv[0] must be a path:
+# pipes, redirects, quoting, `$(...)` and `VAR=val cmd` are NOT interpreted — they arrive as
+# literal arguments. Exit code or -1, as exec_vec.
 fn exec_cmd(cmdline): i64 {
-    var pathlen = 0;
-    var done = 0;
-    while (done == 0) {
-        var c = load8(cmdline + pathlen);
-        if (c == 0) { done = 1; }
-        else { if (c == 32) { done = 1; } else { pathlen = pathlen + 1; } }
-    }
-    var path = alloc(pathlen + 1);
-    var i = 0;
-    while (i < pathlen) { store8(path + i, load8(cmdline + i)); i = i + 1; }
-    store8(path + i, 0);
-    var pid = _agnos_spawn_path(path);
-    if (pid < 0) { return 0 - 1; }
-    return sys_waitpid(pid);
+    var b[1024];
+    return _agp_wait_exit(_agp_spawn(&b, _agp_argv_line(&b, cmdline), 0, 0));
 }

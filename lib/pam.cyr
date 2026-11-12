@@ -16,7 +16,7 @@
 #   exit status: 0 = password correct, non-zero = fail.
 #
 # This is the Path-B escape hatch documented in
-# docs/development/issues/dynlib-nss-bootstrap.md: consumers that
+# docs/development/issues/archived/dynlib-nss-bootstrap.md: consumers that
 # can't shell out to `/usr/bin/su` and can't read /etc/shadow
 # directly (because they're not root) use this helper. Works
 # against any NSS backend the system is configured for (files,
@@ -43,6 +43,9 @@ var PAM_AUTH_EXEC_FAILED    = 0 - 5;
 
 # Locate the unix_chkpwd helper. Returns the absolute path or 0.
 fn _pam_find_chkpwd(): i64 {
+    #ifndef CYRIUS_TARGET_LINUX
+    return 0;    # Linux-PAM only — see pam_unix_authenticate
+    #endif
     # /usr/sbin is the documented Linux-PAM location; Arch and some
     # others unify to /usr/bin via the usr-merge. Probe both.
     var p1 = "/usr/sbin/unix_chkpwd";
@@ -61,17 +64,30 @@ fn _pam_find_chkpwd(): i64 {
 # Returns:
 #    PAM_AUTH_OK (0)            — password verified
 #    PAM_AUTH_FAIL (1)          — rejected (wrong password, locked,
-#                                  disabled, …)
+#                                  disabled, …), or the helper's verdict
+#                                  was never observed (waitpid failed —
+#                                  e.g. an inherited SIGCHLD = SIG_IGN)
 #    PAM_AUTH_HELPER_MISSING    — unix_chkpwd not on system
 #    PAM_AUTH_PIPE_FAILED       — syscall(pipe) errored
 #    PAM_AUTH_FORK_FAILED       — syscall(fork) errored
 #    PAM_AUTH_EXEC_FAILED       — child's execve returned (helper
 #                                  present but couldn't run)
+#
+# ⛔ LINUX ONLY. unix_chkpwd is a Linux-PAM helper, and the fork/pipe/dup2/execve/waitpid
+# sequence below is written against the Linux wrappers: on agnos `sys_waitpid` takes one
+# argument and there is no `sys_dup2` / `sys_execve`, so the body was a hard compile error
+# there, and on PE `sys_pipe` did not exist. Every other target fails CLOSED with
+# PAM_AUTH_HELPER_MISSING (and pam_unix_available() reports 0 there too) — never a guess
+# that a password is good. CHANGELOG [6.6.9]
 fn pam_unix_authenticate(user, password): i64 {
     var helper = _pam_find_chkpwd();
     if (helper == 0) { return PAM_AUTH_HELPER_MISSING; }
+    #ifndef CYRIUS_TARGET_LINUX
+    return PAM_AUTH_HELPER_MISSING;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
 
-    var fds[2];
+    var fds[8];
     var pr = sys_pipe(&fds);
     if (pr < 0) { return PAM_AUTH_PIPE_FAILED; }
     var rfd = load32(&fds);
@@ -111,8 +127,15 @@ fn pam_unix_authenticate(user, password): i64 {
     }
     sys_close(wfd);
 
-    var status_buf[1];
-    sys_waitpid(pid, &status_buf, 0);
+    # Only a wait that returned THIS pid wrote status_buf. Under an inherited SIGCHLD = SIG_IGN
+    # the kernel auto-reaps the helper and waitpid fails ECHILD with the buffer untouched;
+    # decoding that stale stack word read "exit 0" = PAM_AUTH_OK for a WRONG password. A
+    # verdict nobody observed fails CLOSED. EINTR (a handler without SA_RESTART) is retried.
+    # CVE-80, CHANGELOG [6.6.20]
+    var status_buf[4];
+    var w = sys_waitpid(pid, &status_buf, 0);
+    while (w == 0 - 4) { w = sys_waitpid(pid, &status_buf, 0); }
+    if (w != pid) { return PAM_AUTH_FAIL; }
     var status = load32(&status_buf);
 
     if (WIFEXITED(status) == 1) {
@@ -122,6 +145,7 @@ fn pam_unix_authenticate(user, password): i64 {
     }
     # Signalled or stopped: treat as fail.
     return PAM_AUTH_FAIL;
+    #endif
 }
 
 # Returns 1 if the unix_chkpwd helper is present on the system,

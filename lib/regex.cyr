@@ -1,14 +1,34 @@
 # regex.cyr — Thompson NFA / Pike matcher (v5.7.18) + glob helpers.
 # Usage: include "lib/regex.cyr"
-# Requires: string.cyr, alloc.cyr, str.cyr
+# Includes its own definers (6.6.9): string.cyr, alloc.cyr, str.cyr, vec.cyr.
 #
 # Glob helpers (top): glob_match, str_glob, find_all, str_replace, str_replace_all.
 # Full regex engine (below): regex_compile, regex_match, regex_search, regex_group_*.
 
+# 6.6.9: str_replace / find_all / the regex groups call string, alloc, str and vec helpers; a
+# bare include left ten of them undefined. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+
 # Match a glob pattern against a string
 # Supports: * (zero or more chars), ? (exactly one char)
 # Returns 1 if match, 0 if not.
-fn glob_match(pattern, text): i64 {
+# --- v6.5.0: this file is PRIVATE-BY-DEFAULT ---
+# 43 of its 52 fns are `_re_*` implementation detail with no caller outside this
+# file. `private` makes that structural instead of conventional: an external call
+# to one is now a diagnostic rather than something only a reviewer would catch.
+# The 11 fns below carrying `public` are the real API surface. NOTE: 9 have
+# in-tree callers; `regex_search_at` and `str_glob` have none, but the previous
+# non-underscore convention PUBLISHED them, so they stay public — adoption must
+# not silently shrink an API a consumer may already depend on. Verified
+# against every caller in lib/, src/, programs/, cbt/, tests/, benches/
+# and fuzz/.
+private
+
+# Match C string `text` against glob `pattern` (`*` any run, `?` any one byte); 1 or 0.
+public fn glob_match(pattern, text): i64 {
     var pi = 0;
     var ti = 0;
     var plen = strlen(pattern);
@@ -63,10 +83,11 @@ fn glob_match(pattern, text): i64 {
 }
 
 # Match a Str against a glob pattern (C string)
-fn str_glob(s, pattern): i64 {
+public fn str_glob(s, pattern): i64 {
     # Need null-terminated version of Str data
     var slen = str_len(s);
     var buf = alloc(slen + 1);
+    if (buf == 0) { return 0; }
     memcpy(buf, str_data(s), slen);
     store8(buf + slen, 0);
     return glob_match(pattern, buf);
@@ -74,7 +95,7 @@ fn str_glob(s, pattern): i64 {
 
 # Find all occurrences of needle in haystack
 # Returns vec of indices
-fn find_all(haystack, needle): i64 {
+public fn find_all(haystack, needle): i64 {
     var results = vec_new();
     var hlen = strlen(haystack);
     var nlen = strlen(needle);
@@ -91,7 +112,7 @@ fn find_all(haystack, needle): i64 {
 
 # Replace first occurrence of old with new in a Str
 # Returns new Str (or original if not found)
-fn str_replace(s, old, new_str): i64 {
+public fn str_replace(s, old, new_str): i64 {
     var sdata = str_data(s);
     var slen = str_len(s);
     var odata = str_data(old);
@@ -105,6 +126,7 @@ fn str_replace(s, old, new_str): i64 {
             # Found — build replacement
             var newlen = slen - olen + nlen;
             var buf = alloc(newlen + 1);
+            if (buf == 0) { return 0; }
             memcpy(buf, sdata, fi);
             memcpy(buf + fi, ndata, nlen);
             memcpy(buf + fi + nlen, sdata + fi + olen, slen - fi - olen);
@@ -117,7 +139,7 @@ fn str_replace(s, old, new_str): i64 {
 }
 
 # Replace all occurrences
-fn str_replace_all(s, old, new_str): i64 {
+public fn str_replace_all(s, old, new_str): i64 {
     var result = s;
     var changed = 1;
     while (changed == 1) {
@@ -202,8 +224,11 @@ var _re_m_gen = 0;
 fn _re_m_lazy_init(): i64 {
     if (_re_m_init == 1) { return 0; }
     _re_m_cur     = alloc(8 + REGEX_MAX_INSTRS * 168);
+    if (_re_m_cur == 0) { return 0 - 1; }
     _re_m_next    = alloc(8 + REGEX_MAX_INSTRS * 168);
+    if (_re_m_next == 0) { return 0 - 1; }
     _re_m_lastgen = alloc(REGEX_MAX_INSTRS * 8);
+    if (_re_m_lastgen == 0) { return 0 - 1; }
     var i = 0;
     while (i < REGEX_MAX_INSTRS) {
         store64(_re_m_lastgen + i * 8, 0);
@@ -850,11 +875,12 @@ fn _re_parse_alt(): i64 {
 
 # Compile a null-terminated regex pattern. Returns an opaque NFA pointer
 # (heap-allocated) or 0 on syntax error.
-fn regex_compile(pat): i64 {
+public fn regex_compile(pat): i64 {
     var n = strlen(pat);
     var instr_bytes = REGEX_MAX_INSTRS * 16;
     var class_bytes = REGEX_MAX_CLASSES * 32;
     var nfa = alloc(REGEX_NFA_HEADER_SIZE + instr_bytes + class_bytes);
+    if (nfa == 0) { return 0; }
     var instrs = nfa + REGEX_NFA_HEADER_SIZE;
     var classes = instrs + instr_bytes;
     store64(nfa + REGEX_OFF_INSTRS_OFF,  REGEX_NFA_HEADER_SIZE);
@@ -1008,18 +1034,20 @@ fn _re_add_thread(list_base, pc, input, input_len, pos, saves, instrs): i64 {
 # capture saves into nfa's header and return the match-end position.
 # Returns -1 on no match.
 fn _re_pike_run(nfa, input, input_len, start_pos): i64 {
-    _re_m_lazy_init();
+    if (_re_m_lazy_init() != 0) { return 0 - 1; }   # 6.6.10: its buffers could not be allocated
     var instrs = nfa + load64(nfa + REGEX_OFF_INSTRS_OFF);
     var instr_count = load64(nfa + REGEX_OFF_INSTR_COUNT);
     var class_base = nfa + load64(nfa + REGEX_OFF_CLASSES_OFF);
     var matched = 0 - 1;
     var saves_scratch = alloc(REGEX_MAX_SAVES * 8);
+    if (saves_scratch == 0) { return 0 - 1; }
     var k = 0;
     while (k < REGEX_MAX_SAVES) {
         store64(saves_scratch + k * 8, 0 - 1);
         k = k + 1;
     }
     var match_saves = alloc(REGEX_MAX_SAVES * 8);
+    if (match_saves == 0) { return 0 - 1; }
     var k2 = 0;
     while (k2 < REGEX_MAX_SAVES) {
         store64(match_saves + k2 * 8, 0 - 1);
@@ -1138,7 +1166,7 @@ fn _re_class_get_at(class_base, ci, c): i64 {
 # === Public API ======================================================
 
 # regex_match — anchored at position 0. Returns 1 on match, 0 on no match.
-fn regex_match(nfa, s): i64 {
+public fn regex_match(nfa, s): i64 {
     if (nfa == 0) { return 0; }
     var len = strlen(s);
     var r = _re_pike_run(nfa, s, len, 0);
@@ -1147,14 +1175,14 @@ fn regex_match(nfa, s): i64 {
 }
 
 # regex_search — find first match anywhere. Returns start offset, or -1.
-fn regex_search(nfa, s): i64 {
+public fn regex_search(nfa, s): i64 {
     if (nfa == 0) { return 0 - 1; }
     var len = strlen(s);
     return regex_search_at(nfa, s, len, 0);
 }
 
 # regex_search_at — like regex_search but starts at offset `from`.
-fn regex_search_at(nfa, s, len, from): i64 {
+public fn regex_search_at(nfa, s, len, from): i64 {
     if (nfa == 0) { return 0 - 1; }
     var i = from;
     while (i <= len) {
@@ -1166,14 +1194,14 @@ fn regex_search_at(nfa, s, len, from): i64 {
 }
 
 # regex_group_start — capture-group n start (group 0 = whole match).
-fn regex_group_start(nfa, n): i64 {
+public fn regex_group_start(nfa, n): i64 {
     if (nfa == 0)        { return 0 - 1; }
     if (n < 0 || n > 9)  { return 0 - 1; }
     return load64(nfa + REGEX_OFF_SAVES + n * 16);
 }
 
 # regex_group_end — capture-group n end.
-fn regex_group_end(nfa, n): i64 {
+public fn regex_group_end(nfa, n): i64 {
     if (nfa == 0)        { return 0 - 1; }
     if (n < 0 || n > 9)  { return 0 - 1; }
     return load64(nfa + REGEX_OFF_SAVES + n * 16 + 8);

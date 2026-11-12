@@ -5,6 +5,14 @@
 
 ## Version
 
+**1.11.4** — 2026-11-12. **Toolchain `6.6.2` → `6.6.20`, with `lib/` re-vendored to the 6.6.20 bundle**
+(`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle, sha256-locked in the new
+`cyrius.lock`). The one source change: mirshi's local `sys_memfd_create` is gone, because cyrius 6.6.5's
+stdlib grew the identical wrapper and the duplicate made the build warn. Build is warning-free; `cyrius
+test` 329/0; all 27 `scripts/it/*` gates and `docker/smoke.sh` green at the new pin.
+**1.10.1 → 1.11.3** — `spawn_path#43`, `exec_redirect#62`, `symlink#63`, `kbscan#42`, `readlink#70`,
+`AO_NOFOLLOW`/`AO_EXCL`, `uptime_us#95`, the `sysinfo#35` length tiers. Per-release detail is in
+[`../../CHANGELOG.md`](../../CHANGELOG.md).
 **1.10.0** — 2026-07-02. **argv forwarding — the root child gets its command line.** Before this the target
 agnos ELF ran with a hard-coded `argv = [path, NULL]` and every argument past the ELF path was **silently
 dropped** — any arg-taking tool (kii `<image>`, descent `serve <port>`, kriya/dig/cmdrs…) saw none; iam
@@ -131,7 +139,8 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.3.27` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.6.20` (in `cyrius.cyml [package].cyrius`); `lib/` is the full 6.6.20 snapshot,
+  sha256-locked in `cyrius.lock`
 
 ## Source
 
@@ -231,7 +240,7 @@ paths in the child red zone + repack output structs at the exit stop
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
-  **295 assertions**, hermetic)
+  **329 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`

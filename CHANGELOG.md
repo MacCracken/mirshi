@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-11-12
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.20`.** The committed `lib/` snapshot was re-vendored to match
+  (`cyrius lib sync --full`), so the pin is real, not shadowed by a stale vendored stdlib. 90 of
+  the 98 vendored files changed. 6.6.20 adds eight more (`alloc_cx`, `async_macos`, `async_win`,
+  `boxed`, `hashseed`, `poison`, `thread_macos`, `tls_hostid`) and the `lib/unicode/` directory
+  (seven files). All 113 `.cyr` files are now byte-identical to the 6.6.20 bundle. Under 6.6.20,
+  `cyrius deps` also writes `cyrius.lock`, which records a sha256 for each vendored file.
+- **`sys_memfd_create` is now the stdlib's** (`src/intercept.cyr`). cyrius 6.6.5 added the same
+  wrapper, and `SYS_MEMFD_CREATE = 319`, to `lib/syscalls_linux_common.cyr`. mirshi's own copy
+  then became a duplicate definition, and the build warned about it ("last definition wins"). On
+  Linux the two bodies are identical (`syscall(SYS_MEMFD_CREATE, name, flags)`), so the local copy
+  is removed. `spawn#3`'s memfd staging is unchanged, and the build is warning-free again.
+- `docs/development/roadmap.md`: the "Moving the cyrius pin to 6.6.6" item is retired, because this
+  bump goes past it. `docs/development/state.md`: the pin and the test count are current again.
+
+### Tests
+
+- Re-verified at the new pin: `cyrius build`; `cyrius test` (329/0 in `tests/mirshi.tcyr`, 2/0 in
+  `src/test.cyr`); all 27 `scripts/it/*` CI gates; `docker/smoke.sh`. No source or test change
+  beyond the one above.
+
 ## [1.11.3] - 2026-09-30
 
 ### Fixed

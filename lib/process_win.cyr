@@ -17,6 +17,10 @@
 #   0xF003 (61443) SetHandleInformation(handle, mask, flags)
 #   0xF004 (61444) CreatePipe(&rd, &wr, &sa, size)
 #   0xF005 (61445) CreateProcessW(&args10)
+#   0xF01D (61469) TerminateProcess(handle, exitCode)  — v6.4.26, the SIGKILL analogue
+#   0xF040-0xF044  CreateJobObjectW / AssignProcessToJobObject / TerminateJobObject /
+#                  ResumeThread / SetInformationJobObject — 6.6.10, a process TREE (the
+#                  `_win_job_*` helpers in lib/syscalls_windows.cyr)
 #
 # A spawned "pid" (from spawn()) is the process HANDLE, not a Unix PID —
 # treat it opaquely and pass it to wait_pid(). getpid()/getppid() are stubs
@@ -54,14 +58,129 @@ fn _w_terminate(wbuf, woff): i64 {
     return woff + 2;
 }
 
+# v6.6.6 — the heap buffer for a `cmd /s /c` command line, SIZED FROM ITS INPUTS.
+# Returns 0 after a NAMED refusal; the caller adds its own context and fails closed.
+#
+# `_w_append_cstr` above does NOT bound-check — it stores until the source cstr's NUL —
+# so a FIXED buffer here is a heap overwrite waiting for a long enough path, and a
+# SILENT one. `_win_cmdline` (cbt/build.cyr) was changed from exactly this shape at
+# 6.6.5 for that reason, and `_win_wcmdline3` / `_win_wcmdline_vec` above have always
+# sized from their arguments; the two `cmd /s /c` builders in this file and the two in
+# cbt/build.cyr were the last fixed ones. `nchars` is the caller's own content; the
+# margin covers the literal `cmd /s /c ""`/`" < "`/`" > "` scaffolding.
+#
+# The ceiling is Windows' own: a command line maxes at 32,767 characters, past which
+# CreateProcessW fails anyway — so refuse there rather than build something unspawnable.
+# CHANGELOG [6.6.6].
+fn _w_cmdbuf(nchars): i64 {
+    var need = (nchars + 32) * 2 + 8;
+    if (need > 65536) {
+        var m = "error: command line exceeds the Windows 32767-character limit\n";
+        sys_write(2, m, strlen(m));
+        return 0;
+    }
+    return alloc(need);
+}
+
+# ⛔ 6.6.20 (CVE-102) — A SYSTEM PROGRAM IS STARTED BY ITS ABSOLUTE PATH, NEVER BY A BARE NAME.
+# CreateProcessW with no lpApplicationName resolves a bare first token by SEARCHING, and the
+# documented order visits the PARENT'S CURRENT DIRECTORY before System32 (the caller's own
+# directory, the current directory, the system directories, then PATH). Every Windows
+# `cyrius build` started `cmd /s /c …` that way from inside the project, so a `cmd.exe`
+# committed to a checkout ran on its first build, and a committed `certutil.exe` wrote the
+# hashes `cyrius deps --lock` recorded. Measured on cass (Windows 11): both ran. Wine does not
+# search the current directory — no gate could see it there — but it does search the caller's
+# own directory, which is where tests/gates/platform/pe_system_programs_absolute.sh plants.
+# `_win_sys_exe` gives `"<GetSystemDirectoryW>\<name>"`, quoted, as the command line's first
+# token: a token with a directory in it is never searched for. There is no PE reroute for
+# GetSystemDirectoryW; it is resolved through GetModuleHandleA / GetProcAddress (0xF013 /
+# 0xF014) and called with callptr, as cbt/ calls SetEnvironmentVariableA. CHANGELOG [6.6.20]
+var _win_sysdir_s = 0;
+
+# The system directory (`C:\WINDOWS\system32`) as a narrow string, cached. 0 when it cannot be
+# read or is not a drive-rooted printable-ASCII path — the callers refuse; none falls back to
+# the bare name.
+fn _win_sysdir(): i64 {
+    if (_win_sysdir_s != 0) { return _win_sysdir_s; }
+    var k32 = syscall(0xF013, "kernel32.dll");                  # GetModuleHandleA
+    if (k32 == 0) { return 0; }
+    var gsd = syscall(0xF014, k32, "GetSystemDirectoryW");     # GetProcAddress
+    if (gsd == 0) { return 0; }
+    var wb[528];                                                # 264 WCHARs: MAX_PATH + slack
+    var n = callptr(gsd, &wb, 260) & 0xFFFFFFFF;               # UINT: WCHARs, NUL excluded
+    if (n < 3 || n >= 260) { return 0; }                        # failed, or did not fit
+    var s = alloc(n + 1);
+    if (s == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load16(&wb + i * 2);
+        if (c < 32 || c > 126 || c == 34) { return 0; }         # quoted below: no `"`
+        store8(s + i, c);
+        i = i + 1;
+    }
+    store8(s + n, 0);
+    var d = load8(s) | 32;
+    if (d < 97 || d > 122 || load8(s + 1) != 58 || load8(s + 2) != 92) { return 0; }   # `X:\`
+    _win_sysdir_s = s;
+    return s;
+}
+
+# `"<system directory>\<name>"` — a System32 program's quoted absolute path, for the first
+# token of a command line — or 0 after a NAMED refusal (the caller fails closed).
+fn _win_sys_exe(name): i64 {
+    var sd = _win_sysdir();
+    if (sd == 0) {
+        var m1 = "error: could not read the Windows system directory (GetSystemDirectoryW); refusing to start ";
+        sys_write(2, m1, strlen(m1));
+        sys_write(2, name, strlen(name));
+        var m2 = " by a bare name, which Windows would look for in the current directory first\n";
+        sys_write(2, m2, strlen(m2));
+        return 0;
+    }
+    var sl = strlen(sd);
+    var nl = strlen(name);
+    var p = alloc(sl + nl + 4);
+    if (p == 0) { return 0; }
+    store8(p, 34);
+    memcpy(p + 1, sd, sl);
+    store8(p + 1 + sl, 92);
+    memcpy(p + 2 + sl, name, nl);
+    store8(p + 2 + sl + nl, 34);
+    store8(p + 3 + sl + nl, 0);
+    return p;
+}
+
+# 6.6.20 (SEC-02, CVE-97) — 1 when `s` CANNOT be one double-quoted operand of a `cmd /s /c`
+# line. Inside cmd's quotes `& | < > ^ ( )` are literal; three things are not: a `"` ENDS the
+# operand, so the rest of the line runs as cmd's own commands (`out.exe" & echo X> pwned.txt &
+# "y` as cyrius build's output ran its echo under wine); `%NAME%` expands even quoted (`q%OS%z`
+# wrote qWindows_NTz, `%USERPROFILE%\x` wrote into the profile, and `%NAME:~n,1%` lifts any one
+# byte of a variable); and a control byte (a line break) ends the command. `!` expands only under
+# delayed expansion, which `cmd /c` leaves off unless the user's own registry turns it on. Every
+# builder that quotes a path into a cmd line asks this of each one — `_win_compile_spawn` below,
+# and cbt's, which name the refusal (`_w_cmd_operand_ok`).
+fn _w_cmd_operand_bad(s): i64 {
+    var i = 0;
+    var c = load8(s);
+    while (c != 0) {
+        if (c == 34 || c == 37 || c < 32 || c == 127) { return 1; }
+        i = i + 1;
+        c = load8(s + i);
+    }
+    return 0;
+}
+
 # Build a writable UTF-16LE command line "cmd [arg1 [arg2]]" on the heap.
 # (CreateProcessW may modify lpCommandLine in place, so it must be writable
-# heap, never a read-only literal.) Returns the buffer pointer.
+# heap, never a read-only literal.) Returns the buffer pointer, 0 when the heap is exhausted
+# (6.6.10 — the three builders here stored through address 0 before; a 0 command line makes
+# CreateProcessW fail, so every verb reports a failed spawn).
 fn _win_wcmdline3(cmd, arg1, arg2): i64 {
     var total = strlen(cmd) + 1;
     if (arg1 != 0) { total = total + strlen(arg1) + 1; }
     if (arg2 != 0) { total = total + strlen(arg2) + 1; }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = _w_append_cstr(wbuf, 0, cmd);
     if (arg1 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg1); }
     if (arg2 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg2); }
@@ -83,6 +202,7 @@ fn _win_wcmdline_vec(args, is_str): i64 {
         i = i + 1;
     }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = 0;
     var j = 0;
     while (j < argc) {
@@ -110,6 +230,7 @@ fn _win_wenvblock_vec(env, is_str): i64 {
         i = i + 1;
     }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = 0;
     var j = 0;
     while (j < envc) {
@@ -127,12 +248,90 @@ fn _win_wenvblock_vec(env, is_str): i64 {
 # CreateProcessW core
 # ================================================================
 
+# ⛔ 6.6.10 — EVERY CHILD RUNS IN A JOB OBJECT, so a deadline ends its whole TREE.
+# `_win_watchdog` and `_win_wait_handle` could only TerminateProcess the direct child, so a
+# grandchild kept running — and one holding a capture pipe kept the verb blocked until it
+# exited on its own (cass: `exec_capture_status([cmd.exe, /c, "ping -n 20 127.0.0.1"])` under
+# a 2000 ms deadline returned -2 after 19,437 ms). Now the child is created CREATE_SUSPENDED,
+# put in a KILL_ON_JOB_CLOSE job (lib/syscalls_windows.cyr `_win_job_start`) and resumed, and
+# every deadline ends the JOB. A clean exit is not a deadline: the wait clears KILL_ON_JOB_CLOSE
+# before it closes the job, so what the child left running is left alone — the POSIX verbs'
+# contract too. KILL_ON_JOB_CLOSE is live for as long as the child is: if THIS process dies,
+# the kernel closes the job and ends the tree (the PR_SET_PDEATHSIG the POSIX verbs set).
+# The job is found again by process handle in `_win_job_tab` — PROCESS_INFORMATION stays 24
+# bytes, so no caller's buffer changes. `spawn()` makes a job WITHOUT KILL_ON_JOB_CLOSE: its
+# child is meant to outlive us, and only `wait_pid`'s deadline may end its tree.
+# ⚠ Not thread-safe (the table, like the bump allocator): spawn from one thread.
+# CHANGELOG [6.6.10]
+var _win_job_tab[128];          # 64 × {hProcess, hJob}; hProcess 0 = a free slot
+var _WIN_JOB_SLOTS = 64;
+
+# Remember `job` for process handle `hp`. Returns 1, or 0 when the table is full — then the
+# job's KILL_ON_JOB_CLOSE is cleared and its handle closed, so the child runs untracked.
+fn _win_job_put(hp, job): i64 {
+    var i = 0;
+    while (i < _WIN_JOB_SLOTS) {
+        if (load64(&_win_job_tab + i * 16) == 0) {
+            store64(&_win_job_tab + i * 16, hp);
+            store64(&_win_job_tab + i * 16 + 8, job);
+            return 1;
+        }
+        i = i + 1;
+    }
+    _win_job_set_kill(job, 0);
+    syscall(3, job);
+    return 0;
+}
+
+# The job process handle `hp` runs in (0 = none). `take` = 1 also forgets it.
+fn _win_job_find(hp, take): i64 {
+    if (hp == 0) { return 0; }
+    var i = 0;
+    while (i < _WIN_JOB_SLOTS) {
+        if (load64(&_win_job_tab + i * 16) == hp) {
+            var job = load64(&_win_job_tab + i * 16 + 8);
+            if (take == 1) { store64(&_win_job_tab + i * 16, 0); store64(&_win_job_tab + i * 16 + 8, 0); }
+            return job;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# End `hp`'s whole tree with exit code `code`: its job when it has one, else the process alone.
+fn _win_end_tree(hp, code): i64 {
+    var job = _win_job_find(hp, 0);
+    if (job != 0) { return _win_job_kill(job, code); }
+    return _win_terminate(hp, code);
+}
+
+# Forget `hp`'s job and close it. `kill_rest` = 1 ends whatever is still running in it first
+# (the batch runner's "nothing outlives the run"); 0 clears KILL_ON_JOB_CLOSE, so closing the
+# handle leaves the survivors alone (the library verbs' clean exit).
+fn _win_job_release(hp, kill_rest): i64 {
+    var job = _win_job_find(hp, 1);
+    if (job == 0) { return 0; }
+    if (kill_rest == 1) { _win_job_kill(job, 1); }
+    else { _win_job_set_kill(job, 0); }
+    syscall(3, job);
+    return 0;
+}
+
 # Create a process. `wcmdline` = writable UTF-16LE command line.
 # `hStdOut` = write-handle for child stdout+stderr (0 = inherit parent's).
 # `wenv` = UTF-16LE env block (0 = inherit parent's). `pi` = caller's
 # 24-byte PROCESS_INFORMATION (zeroed + filled here). Returns the
-# CreateProcessW BOOL (non-zero = success).
+# CreateProcessW BOOL (non-zero = success). 6.6.10: the child runs in a KILL_ON_JOB_CLOSE job
+# (see above); wait for it with `_win_wait_close` / `_win_wait_timeout` / `_win_wait_tree`,
+# which release the job.
 fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
+    var ok = _win_create_process_job(wcmdline, hStdOut, wenv, pi, 1);
+    return ok;
+}
+
+# `_win_create_process` with the job's KILL_ON_JOB_CLOSE chosen by `kill_on_close` (0 for a
+# child meant to outlive this process — `spawn`).
+fn _win_create_process_job(wcmdline, hStdOut, wenv, pi, kill_on_close): i64 {
     # STARTUPINFOW (104 bytes), zeroed. Offsets: cb=0x00, dwFlags=0x3C,
     # hStdInput=0x50, hStdOutput=0x58, hStdError=0x60.
     var si[104];
@@ -149,8 +348,8 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
     while (pz < 24) { store8(pi + pz, 0); pz = pz + 1; }
     # CreateProcessW argument struct (10 qwords) — see ECREATEPROC_PE.
     var a[80];
-    var flags = 0;
-    if (wenv != 0) { flags = 1024; }            # CREATE_UNICODE_ENVIRONMENT
+    var flags = 4;                               # CREATE_SUSPENDED — resumed once in its job
+    if (wenv != 0) { flags = flags | 1024; }     # CREATE_UNICODE_ENVIRONMENT
     store64(&a + 0, 0);                          # lpApplicationName
     store64(&a + 8, wcmdline);                   # lpCommandLine (writable)
     store64(&a + 16, 0);                         # lpProcessAttributes
@@ -161,21 +360,233 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
     store64(&a + 56, 0);                         # lpCurrentDirectory
     store64(&a + 64, &si);                       # lpStartupInfo
     store64(&a + 72, pi);                        # lpProcessInformation
-    return syscall(61445, &a);                   # CreateProcessW
+    var ok = syscall(61445, &a);                 # CreateProcessW
+    if ((ok & 0xFFFFFFFF) == 0) { return 0; }    # BOOL: only eax is defined (6.6.20)
+    var job = _win_job_start(pi, kill_on_close);
+    if (job < 0) {                               # could not be resumed: it was terminated
+        syscall(3, load64(pi + 8));
+        syscall(3, load64(pi));
+        return 0;
+    }
+    if (job > 0) { _win_job_put(load64(pi), job); }
+    return ok & 0xFFFFFFFF;
 }
 
-# Wait for the process in `pi` to exit, return its exit code, and close
-# both the process and thread handles.
+# ⛔ 6.6.8 — A DEADLINE ON WINDOWS TOO, AND NO "exit 0" FOR A WAIT THAT NEVER HAPPENED.
+# Two defects in the waits below:
+#   * `_win_wait_close` ignored what WaitForSingleObject and GetExitCodeProcess returned. It
+#     zeroed the code buffer first, so a failed GetExitCodeProcess reported "exit 0" — the
+#     fail-open direction — and a WAIT_FAILED read STILL_ACTIVE (259) as an exit code. Both are
+#     now -1 (not observed), like the POSIX verbs' unreaped child.
+#   * nothing here could be bounded: every wait was INFINITE and `proc_set_timeout_ms` was a
+#     POSIX-only symbol, so `cyrius audit` on Windows waited for a hung cyrlint for ever. The
+#     deadline now exists here with the POSIX meaning: 0 (the default) waits for ever; a
+#     positive bound TerminateProcess-es the child when it expires and the verb reports -2
+#     (`run` / `wait_pid`: Err(110), ETIMEDOUT). A CAPTURING verb drains its pipe BEFORE it can
+#     wait, and ReadFile on that pipe blocks until the child exits, so those verbs arm a
+#     watchdog THREAD (CreateThread, 0xF007) that waits on the process with the bound and
+#     terminates it — the child's exit closes the pipe and the drain returns. (6.6.8 said
+#     "Win32 has no process tree to end: a grandchild holding the pipe is outside this bound".
+#     6.6.10: it has one — the child's Job object — and every deadline ends it.)
+# CHANGELOG [6.6.8] [6.6.10]
+var _PROC_DEADLINE_MS = 0;
+var _proc_deadline_kills = 0;
+
+# Bound every child these verbs wait for to `ms` milliseconds (0 = for ever, the default).
+# Returns the previous value. Same contract as lib/process.cyr's POSIX peer.
+fn proc_set_timeout_ms(ms): i64 {
+    var prev = _PROC_DEADLINE_MS;
+    _PROC_DEADLINE_MS = ms;
+    return prev;
+}
+
+# The deadline in force, in ms (0 = none).
+fn proc_timeout_ms(): i64 { return _PROC_DEADLINE_MS; }
+
+# How many children this process has ended at a deadline, ever.
+fn proc_deadline_kills(): i64 { return _proc_deadline_kills; }
+
+# errno ETIMEDOUT / ECHILD — the same names and values as lib/process.cyr's POSIX block:
+# `run` / `wait_pid` answer Err(PROC_ETIMEDOUT) when the deadline ended the child and
+# Err(PROC_ECHILD) when its exit code could not be read. 6.6.7 added both to the POSIX block
+# only, and this peer spelled them as the literals 110 / 10, so a portable caller that
+# compared against the names failed to COMPILE for PE. CHANGELOG [6.6.10]
+var PROC_ETIMEDOUT = 110;
+var PROC_ECHILD = 10;
+
+# Wait for process handle `h` (bounded by the deadline in force) and return its exit code;
+# -2 when the deadline ended it, -1 when the wait or GetExitCodeProcess failed (the code is
+# then UNKNOWN — never a guessed 0). Does not close `h`.
+fn _win_wait_handle(h): i64 {
+    var ms = 4294967295;                          # INFINITE
+    if (_PROC_DEADLINE_MS > 0) { ms = _PROC_DEADLINE_MS; }
+    var wr = syscall(61441, h, ms) & 4294967295;  # WaitForSingleObject
+    var killed = 0;
+    if (wr == 258) {                              # WAIT_TIMEOUT
+        _win_end_tree(h, 1);                      # 6.6.10: its job — the whole tree
+        wr = syscall(61441, h, 4294967295) & 4294967295;
+        killed = 1;
+        _proc_deadline_kills = _proc_deadline_kills + 1;
+    }
+    if (killed == 1) { return 0 - 2; }
+    if (wr != 0) { return 0 - 1; }                # WAIT_FAILED (or anything but signalled)
+    var code[8];
+    store64(&code, 0);
+    if ((syscall(61442, h, &code) & 0xFFFFFFFF) == 0) { return 0 - 1; }   # GetExitCodeProcess failed (BOOL: eax only)
+    return load32(&code);
+}
+
+# Wait for the process in `pi` to exit (bounded by the deadline in force), return its exit
+# code (-2 deadline, -1 unknown — see `_win_wait_handle`), and close both the process and
+# thread handles — and its job, leaving anything it started running (6.6.10).
 fn _win_wait_close(pi): i64 {
     var hProcess = load64(pi + 0);
     var hThread = load64(pi + 8);
-    syscall(61441, hProcess, 4294967295);        # WaitForSingleObject(INFINITE)
-    var code[8];
-    store64(&code, 0);
-    syscall(61442, hProcess, &code);             # GetExitCodeProcess
-    var ec = load32(&code);
+    var ec = _win_wait_handle(hProcess);
+    _win_job_release(hProcess, 0);
     syscall(3, hThread);                          # CloseHandle(hThread)
     syscall(3, hProcess);                         # CloseHandle(hProcess)
+    return ec;
+}
+
+# The watchdog thread body (a cyrius fn compiled for PE is a valid ThreadProc: the one
+# argument arrives in RCX). `a` = {hProcess, ms, fired, hJob, done}. Allocates nothing and
+# never touches `_win_job_tab` — the bump allocator and the table are not thread-safe, so
+# the job handle is handed over in the block.
+# 6.6.10: the bound is on the CAPTURE, not only on the child. The drain ends when EVERY holder
+# of the pipe's write end has gone, and a grandchild holds it as long as the child did — so
+# once the child has exited the watchdog keeps counting until the drain reports `done`
+# (`_win_watch_end`) or the deadline expires, and then ends the child's job, which is what
+# closes the pipe. Before, it waited on the child alone and a grandchild that outlived it
+# blocked the verb for as long as it ran (the POSIX drain's idle deadline cuts the same case).
+fn _win_watchdog(a): i64 {
+    var ms = load64(a + 8);
+    var waited = 0;
+    var exited = 0;
+    while (waited < ms) {
+        if (load64(a + 32) == 1) { return 0; }     # the drain is over
+        var slice = ms - waited;
+        if (slice > 20) { slice = 20; }
+        if (exited == 0) {
+            var wr = syscall(61441, load64(a), slice) & 4294967295;   # WaitForSingleObject
+            if (wr == 0) { exited = 1; }
+            else { waited = waited + slice; }
+        } else {
+            syscall(0xF00F, slice);                 # Sleep — the child is gone, its tree may not be
+            waited = waited + slice;
+        }
+    }
+    if (load64(a + 32) == 1) { return 0; }
+    if (load64(a + 24) != 0) { _win_job_kill(load64(a + 24), 1); }
+    else { _win_terminate(load64(a), 1); }
+    store64(a + 16, 1);
+    return 0;
+}
+
+# Arm a watchdog on `pi`'s process when a deadline is in force. `wd` = the caller's 40-byte
+# block (it must outlive `_win_watch_end`). Returns the thread handle, 0 when none is armed.
+fn _win_watch_start(pi, wd): i64 {
+    store64(wd, load64(pi));
+    store64(wd + 8, _PROC_DEADLINE_MS);
+    store64(wd + 16, 0);
+    store64(wd + 24, _win_job_find(load64(pi), 0));
+    store64(wd + 32, 0);
+    if (_PROC_DEADLINE_MS <= 0) { return 0; }
+    var ta[48];
+    store64(&ta,      0);                         # lpThreadAttributes
+    store64(&ta + 8,  0);                         # dwStackSize (default)
+    store64(&ta + 16, &_win_watchdog);            # lpStartAddress
+    store64(&ta + 24, wd);                        # lpParameter
+    store64(&ta + 32, 0);                         # dwCreationFlags
+    store64(&ta + 40, 0);                         # lpThreadId
+    return syscall(61447, &ta);                   # CreateThread
+}
+
+# Join the watchdog; returns 1 if it had to terminate the child (counted once, here). Call it
+# once the drain has returned: it tells the watchdog so (`done`), which then exits at once.
+fn _win_watch_end(t, wd): i64 {
+    store64(wd + 32, 1);
+    if (t != 0) {
+        syscall(61441, t, 4294967295);
+        syscall(3, t);
+    }
+    if (load64(wd + 16) == 1) {
+        _proc_deadline_kills = _proc_deadline_kills + 1;
+        return 1;
+    }
+    return 0;
+}
+
+# v6.4.26 — force-terminate a spawned process. `hProcess` is the process HANDLE
+# (pi+0 from _win_create_process / the opaque "pid" from spawn()); `exitCode` is
+# the exit code the killed child reports. Returns the TerminateProcess BOOL
+# (nonzero=success). The Windows analogue of kill(pid, SIGKILL) — Win32 has no
+# signals, so a runaway child can only be stopped this way.
+# See 2026-07-08-windows-pe-surface-no-terminateprocess.md.
+# ⚠ Every kernel32 BOOL in this file (CreateProcessW, GetExitCodeProcess, CreatePipe,
+# TerminateProcess) is masked to 32 bits: their PE emitters define only eax, the upper half is
+# the callee's to leave dirty, so a raw `== 0` could read a failure as success. CHANGELOG [6.6.20]
+fn _win_terminate(hProcess, exitCode): i64 {
+    return syscall(61469, hProcess, exitCode) & 0xFFFFFFFF;   # TerminateProcess — BOOL: eax only
+}
+
+# v6.4.26 — wait for the process in `pi` up to `ms` milliseconds; if it does not
+# exit in time, TerminateProcess it and reap. Returns the child exit code (the
+# forced code 137 = 128+SIGKILL when we had to kill, mirroring the POSIX
+# SIGKILL-exit convention so a downstream can treat both lanes uniformly), and
+# sets *killed_out = 1 iff the deadline was enforced (0 iff it exited on its own).
+# Closes both handles either way. This is the timeout-kill primitive thoth's
+# exec_shell_capture needs on Windows (the analogue of the POSIX deadline+SIGKILL).
+fn _win_wait_timeout(pi, ms, killed_out): i64 {
+    var hProcess = load64(pi + 0);
+    var hThread = load64(pi + 8);
+    store64(killed_out, 0);
+    var wr = syscall(61441, hProcess, ms) & 4294967295;   # WaitForSingleObject(hProcess, ms)
+    if (wr == 258) {                              # WAIT_TIMEOUT (0x102) → enforce deadline
+        _win_end_tree(hProcess, 137);             # 6.6.10: its job (the tree), exit code 137
+        wr = syscall(61441, hProcess, 4294967295) & 4294967295;   # INFINITE — reap
+        store64(killed_out, 1);
+    }
+    # 6.6.8: -1 when the wait or GetExitCodeProcess FAILED — the zeroed buffer used to read
+    # as "exit 0" (see `_win_wait_handle`).
+    var ec = 0 - 1;
+    var code[8];
+    store64(&code, 0);
+    if (wr == 0) {
+        if ((syscall(61442, hProcess, &code) & 0xFFFFFFFF) != 0) { ec = load32(&code); }   # GetExitCodeProcess
+    }
+    _win_job_release(hProcess, 0);
+    syscall(3, hThread);                           # CloseHandle(hThread)
+    syscall(3, hProcess);                          # CloseHandle(hProcess)
+    return ec;
+}
+
+# 6.6.10 — the batch runner's wait (cbt `_win_run_timed`: test/tests/bench/fuzz/soak/smoke/
+# doctest): `_win_wait_timeout`'s contract — the exit code, 137 with *killed_out = 1 when the
+# deadline ended it — with `ms` <= 0 meaning no deadline, and then EVERYTHING still running in
+# the child's job is ended too, deadline or not. That is the POSIX runner's subreaper sweep:
+# no descendant of a test outlives it, and one that held the runner's stdout cannot hang
+# `cyrius test f | …`. Closes the handles and the job. CHANGELOG [6.6.10]
+fn _win_wait_tree(pi, ms, killed_out): i64 {
+    var hProcess = load64(pi + 0);
+    store64(killed_out, 0);
+    var tmo = 4294967295;                         # INFINITE
+    if (ms > 0) { tmo = ms; }
+    var wr = syscall(61441, hProcess, tmo) & 4294967295;
+    if (wr == 258) {
+        _win_end_tree(hProcess, 137);
+        wr = syscall(61441, hProcess, 4294967295) & 4294967295;
+        store64(killed_out, 1);
+    }
+    var ec = 0 - 1;
+    var code[8];
+    store64(&code, 0);
+    if (wr == 0) {
+        if ((syscall(61442, hProcess, &code) & 0xFFFFFFFF) != 0) { ec = load32(&code); }
+    }
+    _win_job_release(hProcess, 1);
+    syscall(3, load64(pi + 8));                    # CloseHandle(hThread)
+    syscall(3, hProcess);                          # CloseHandle(hProcess)
     return ec;
 }
 
@@ -184,14 +595,20 @@ fn _win_wait_close(pi): i64 {
 # fork/dup2/execve, so we hand the redirect to cmd.exe via CreateProcessW.
 # `cmd /s /c "<inner>"` strips ONLY the outermost quote pair (the /s rule), so
 # the inner per-path quotes + the `<` / `>` operators reach cmd intact:
-#   cmd /s /c ""C:\...\cycc.exe" < "src.cyr" > "out.exe""
-# Writes directly to `output` (SYS_RENAME is not a PE reroute, so the POSIX
-# atomic tmp+rename can't be used here). Returns the child exit code; 1 if the
-# spawn itself fails.
+#   "C:\WINDOWS\system32\cmd.exe" /s /c ""C:\...\cycc.exe" < "src.cyr" > "out.exe""
+# (cmd.exe by its absolute path — `_win_sys_exe`, 6.6.20). Writes directly to `output`
+# (SYS_RENAME is not a PE reroute, so the POSIX atomic tmp+rename can't be used here).
+# Returns the child exit code; 1 if the spawn itself fails, or (6.6.20) if a path holds a byte
+# cmd.exe reads inside its quotes (`_w_cmd_operand_bad`) — refused rather than spawned.
 fn _win_compile_spawn(cc, source, output): i64 {
-    var wbuf = alloc(16384);
+    if (_w_cmd_operand_bad(cc) + _w_cmd_operand_bad(source) + _w_cmd_operand_bad(output) != 0) { return 1; }
+    var ce = _win_sys_exe("cmd.exe");
+    if (ce == 0) { return 1; }
+    var wbuf = _w_cmdbuf(strlen(ce) + strlen(cc) + strlen(source) + strlen(output));
+    if (wbuf == 0) { return 1; }
     var o = 0;
-    o = _w_append_cstr(wbuf, o, "cmd /s /c \"\"");
+    o = _w_append_cstr(wbuf, o, ce);
+    o = _w_append_cstr(wbuf, o, " /s /c \"\"");
     o = _w_append_cstr(wbuf, o, cc);
     o = _w_append_cstr(wbuf, o, "\" < \"");
     o = _w_append_cstr(wbuf, o, source);
@@ -217,7 +634,7 @@ fn _win_make_pipe(wr_out): i64 {
     store64(&sa + 8, 0);
     store64(&sa + 16, 1);
     var pr = syscall(61444, &pipeh, &pipeh + 8, &sa, 0);   # CreatePipe
-    if (pr == 0) { return 0; }
+    if ((pr & 0xFFFFFFFF) == 0) { return 0; }    # BOOL: only eax is defined (6.6.20)
     var hRead = load64(&pipeh);
     var hWrite = load64(&pipeh + 8);
     syscall(61443, hRead, 1, 0);                  # SetHandleInformation(hRead, INHERIT, 0)
@@ -250,7 +667,10 @@ fn run(cmd, arg1, arg2): Result {
     var pi[24];
     var ok = _win_create_process(wcmd, 0, 0, &pi);
     if (ok == 0) { return Err(1); }
-    return Ok(_win_wait_close(&pi));
+    var ec = _win_wait_close(&pi);
+    if (ec == 0 - 2) { return Err(PROC_ETIMEDOUT); }
+    if (ec == 0 - 1) { return Err(PROC_ECHILD); }   # the exit code is unknown
+    return Ok(ec);
 }
 
 # Run a command and capture stdout (+stderr) into buf. Returns Result(bytes).
@@ -263,8 +683,11 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return Err(1); }
     syscall(3, hWrite);                           # parent drops write end → EOF on child exit
+    var wd[40];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
+    _win_watch_end(wt, &wd);
     _win_wait_close(&pi);
     return Ok(total);
 }
@@ -274,7 +697,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
 fn spawn(cmd, arg1, arg2): Result {
     var wcmd = _win_wcmdline3(cmd, arg1, arg2);
     var pi[24];
-    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    var ok = _win_create_process_job(wcmd, 0, 0, &pi, 0);   # outlives us: no KILL_ON_JOB_CLOSE
     if (ok == 0) { return Err(1); }
     syscall(3, load64(&pi + 8));                  # close hThread (unused)
     return Ok(load64(&pi + 0));                   # hProcess as the pid token
@@ -282,12 +705,11 @@ fn spawn(cmd, arg1, arg2): Result {
 
 # Wait for a previously-spawned process handle. Returns Result(exit_code).
 fn wait_pid(pid): Result {
-    syscall(61441, pid, 4294967295);              # WaitForSingleObject(INFINITE)
-    var code[8];
-    store64(&code, 0);
-    syscall(61442, pid, &code);                   # GetExitCodeProcess
-    var ec = load32(&code);
+    var ec = _win_wait_handle(pid);               # bounded by the deadline in force (6.6.8)
+    _win_job_release(pid, 0);
     syscall(3, pid);                              # CloseHandle
+    if (ec == 0 - 2) { return Err(PROC_ETIMEDOUT); }
+    if (ec == 0 - 1) { return Err(PROC_ECHILD); }
     return Ok(ec);
 }
 
@@ -313,8 +735,15 @@ fn exec_vec(args): i64 {
     return _win_wait_close(&pi);
 }
 
-# Run command with cstr args vec and capture stdout. Returns bytes read.
-fn exec_capture(args, buf, buflen): i64 {
+# Run command with cstr args vec, capture stdout (+stderr — one pipe on Windows), and
+# report how it ended in `status_out`'s two i64 slots, as the POSIX verb does: [0] = the
+# GetExitCodeProcess code (an NTSTATUS such as 0xC0000005 for a crash — never 0), -1 when
+# nothing could be spawned or the code could not be read (6.6.8: it used to read as 0), -2
+# when the deadline (`proc_set_timeout_ms`) ended it; [1] = 0 (Win32 has no signals).
+# Returns bytes read, -1 when nothing ran. CHANGELOG [6.6.7] [6.6.8]
+fn exec_capture_status(args, buf, buflen, status_out): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
     if (vec_len(args) < 1) { return 0 - 1; }
     var hWrite = 0;
     var hRead = _win_make_pipe(&hWrite);
@@ -324,10 +753,22 @@ fn exec_capture(args, buf, buflen): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
+    var wd[40];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
-    _win_wait_close(&pi);
+    var fired = _win_watch_end(wt, &wd);
+    var ec = _win_wait_close(&pi);
+    if (fired == 1) { ec = 0 - 2; }
+    store64(status_out, ec);
     return total;
+}
+
+# Run command with cstr args vec and capture stdout. Returns bytes read; the exit code is
+# discarded (use exec_capture_status to observe it).
+fn exec_capture(args, buf, buflen): i64 {
+    var _st[16];
+    return exec_capture_status(args, buf, buflen, &_st);
 }
 
 # Run command with cstr args vec + cstr "KEY=VALUE" env vec.
@@ -335,6 +776,7 @@ fn exec_env(args, env): i64 {
     if (vec_len(args) < 1) { return 0 - 1; }
     var wcmd = _win_wcmdline_vec(args, 0);
     var wenv = _win_wenvblock_vec(env, 0);
+    if (wcmd == 0 || wenv == 0) { return 0 - 1; }   # out of memory (0 would mean "inherit the env")
     var pi[24];
     var ok = _win_create_process(wcmd, 0, wenv, &pi);
     if (ok == 0) { return 0 - 1; }
@@ -366,8 +808,11 @@ fn exec_capture_str(args, buf, buflen): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
+    var wd[40];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
+    _win_watch_end(wt, &wd);
     _win_wait_close(&pi);
     return total;
 }
@@ -377,6 +822,7 @@ fn exec_env_str(args, env): i64 {
     if (vec_len(args) < 1) { return 0 - 1; }
     var wcmd = _win_wcmdline_vec(args, 1);
     var wenv = _win_wenvblock_vec(env, 1);
+    if (wcmd == 0 || wenv == 0) { return 0 - 1; }   # out of memory (0 would mean "inherit the env")
     var pi[24];
     var ok = _win_create_process(wcmd, 0, wenv, &pi);
     if (ok == 0) { return 0 - 1; }
@@ -391,10 +837,21 @@ fn exec_env_str(args, env): i64 {
 # bare first token via CreateProcessW directly — shell metacharacters became
 # literal argv and nothing piped. See CHANGELOG; mirrors the POSIX
 # /bin/sh -c fix in lib/process.cyr.
+# 6.6.20 (CVE-102): cmd.exe by its absolute path (`_win_sys_exe`), and the command runs with
+# NoDefaultCurrentDirectoryInExePath set, so cmd's OWN search for a bare program in `cmdline`
+# (`git tag …` from `cyrius publish`) skips the current directory as /bin/sh does — measured on
+# cass: a planted `.\git.exe`-shaped program ran without it and "is not recognized" with it. An
+# explicit `.\prog` still runs. `set` sits before the `&` with NO space (a space would be part
+# of the value).
 fn exec_cmd(cmdline): i64 {
-    var wbuf = alloc(16384);
+    var ce = _win_sys_exe("cmd.exe");
+    if (ce == 0) { return 0 - 1; }
+    var pre = " /s /c \"set NoDefaultCurrentDirectoryInExePath=1& ";
+    var wbuf = _w_cmdbuf(strlen(ce) + strlen(pre) + strlen(cmdline));
+    if (wbuf == 0) { return 0 - 1; }
     var o = 0;
-    o = _w_append_cstr(wbuf, o, "cmd /s /c \"");
+    o = _w_append_cstr(wbuf, o, ce);
+    o = _w_append_cstr(wbuf, o, pre);
     o = _w_append_cstr(wbuf, o, cmdline);
     o = _w_append_cstr(wbuf, o, "\"");
     _w_terminate(wbuf, o);

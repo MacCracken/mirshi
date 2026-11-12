@@ -30,6 +30,7 @@ include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/syscalls.cyr"
 include "lib/fnptr.cyr"
+include "lib/io.cyr"      # file_read_all (6.6.9 — it was called, never included)
 
 var GRP_BUF_MAX = 0x20000;
 
