@@ -1,7 +1,7 @@
 # slice.cyr — first-class slice (16-byte {ptr, len}) helpers.
 #
 # v5.8.10 §2: complements parser-side slice<T> / [T] type
-# annotations (parse_decl.cyr's PARSE_VAR scalar_type=16 path).
+# annotations (parse/decl/var.cyr's PARSE_VAR scalar_type=16 path).
 # A slice is a 16-byte stack-local slot:
 #   offset 0: ptr (i64) — pointer to first element
 #   offset 8: len (i64) — element count
@@ -31,27 +31,19 @@ include "lib/string.cyr"
 #
 # All helpers take a slice POINTER (`&s`), mirroring the u128 /
 # struct-by-pointer convention that pervades cyrius's stdlib.
-# Field access via dot syntax (`s.ptr` / `s.len`) is NOT yet
-# wired — that's a future polish slot. For now, use the
-# slice_ptr() / slice_len() accessors.
-#
-# Element-type tracking is intentionally absent in §2: the
-# parser's `slice<T>` / `[T]` annotation accepts any T (i8, i16,
-# i32, i64, u128, *T) but doesn't propagate T to runtime. A
-# slice over u8 looks structurally identical to a slice over
-# i64 — consumers must remember the element width and use
-# load8/load16/load32/load64 accordingly. Element-typed indexing
-# (`s[i]` lowers to load* of correct width) lands in a follow-up
-# slot if a consumer needs it.
+# On a fn-local slice the compiler gives the same surface itself:
+# `s.ptr` / `s.len` (v5.8.16) and `s[i]` read and written at the
+# element's width, bounds-checked in every build (v5.8.15, stores
+# 6.7.8) — the helpers serve a slice reached through a pointer.
 #
 # Usage:
 #   var data[5];
 #   store8(&data, 65);  store8(&data + 1, 66);  ...
 #   var s: [u8] = 0;
 #   slice_set(&s, &data, 5);
-#   var p = slice_ptr(&s);   # &data
-#   var n = slice_len(&s);   # 5
-#   var first = load8(p);    # 65
+#   var p = slice_ptr(&s);   # &data   (s.ptr in the declaring fn)
+#   var n = slice_len(&s);   # 5       (s.len)
+#   var first = s[0];        # 65, checked against s.len
 #
 # Builder convenience:
 #   var s: [u8] = 0;  slice_of(&s, &data, 5);   # same as slice_set
@@ -96,23 +88,19 @@ fn slice_copy(dst, src): i64 {
 # pointer-equality, not content-equality — slice_eq_content is
 # a future addition if a consumer needs it.
 fn slice_eq(a, b): i64 {
-    if (load64(a) != load64(b)) { return 0; }
-    if (load64(a + 8) != load64(b + 8)) { return 0; }
-    return 1;
+    return load64(a) == load64(b) && load64(a + 8) == load64(b + 8);
 }
 
 # True iff the slice has zero length. ptr may still be non-null.
 fn slice_is_empty(s): i64 {
-    if (load64(s + 8) == 0) { return 1; }
-    return 0;
+    return load64(s + 8) == 0;
 }
 
 # True iff the slice is null-pointer (ptr == 0). Distinct from
 # is_empty: a non-null slice with len=0 is "empty but allocated";
 # a null slice is "no allocation at all".
 fn slice_is_null(s): i64 {
-    if (load64(s) == 0) { return 1; }
-    return 0;
+    return load64(s) == 0;
 }
 
 # v5.8.11 §3: Str ↔ slice<u8> structural equivalence.
@@ -135,12 +123,7 @@ fn slice_is_null(s): i64 {
 # Mirrors `str_from(cstr)` (lib/str.cyr) but writes into the
 # pre-allocated `dst` slot instead of heap-allocing 16 bytes.
 fn slice_from_cstr(dst, cstr): i64 {
-    # Inline strlen — avoid pulling lib/string.cyr just for this.
-    var n = 0;
-    while (load8(cstr + n) != 0) { n = n + 1; }
-    store64(dst, cstr);
-    store64(dst + 8, n);
-    return 0;
+    return slice_set(dst, cstr, strlen(cstr));
 }
 
 # Initialize stack slice from a (buf, len) pair.
@@ -205,33 +188,25 @@ fn _slice_bounds_trap(): i64 {
 # Width-1: u8 elements. Returns zero-extended byte value (an [i8]
 # read goes through _slice_idx_addr, sign-extended — 6.7.8).
 fn _slice_idx_get_1(s_addr, idx): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load8(load64(s_addr) + idx);
 }
 
 # Width-2: u16 elements (an [i16] read: _slice_idx_addr, 6.7.8).
 fn _slice_idx_get_2(s_addr, idx): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load16(load64(s_addr) + idx * 2);
 }
 
 # Width-4: u32 elements (an [i32] read: _slice_idx_addr, 6.7.8).
 fn _slice_idx_get_4(s_addr, idx): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load32(load64(s_addr) + idx * 4);
 }
 
 # Width-8: i64 / u64 / pointer elements.
 fn _slice_idx_get_8(s_addr, idx): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load64(load64(s_addr) + idx * 8);
 }
 
@@ -239,9 +214,7 @@ fn _slice_idx_get_8(s_addr, idx): i64 {
 # 16-byte slot (consumer uses load64 / u128_* ops to read it).
 # u128 can't be returned by-value through cyrius's i64-only ABI.
 fn _slice_idx_get_16(s_addr, idx): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load64(s_addr) + idx * 16;
 }
 
@@ -250,10 +223,23 @@ fn _slice_idx_get_16(s_addr, idx): i64 {
 # it (the compiler emits the call), so a slice write is bounds-checked in every mode, as a read is;
 # an [i8] / [i16] / [i32] read loads through it too, sign-extended (6.7.8, C2-6c).
 fn _slice_idx_addr(s_addr, idx, w): i64 {
-    var len = load64(s_addr + 8);
-    if (idx < 0) { _slice_bounds_trap(); }
-    if (idx >= len) { _slice_bounds_trap(); }
+    if (idx < 0 || idx >= load64(s_addr + 8)) { _slice_bounds_trap(); }
     return load64(s_addr) + idx * w;
+}
+
+# 6.7.18 (the user's D1): the `w`-byte (1..8) BIG-ENDIAN unsigned field at element `i` of the
+# [u8] slice at `s` (a slice POINTER, `&s`), every byte of it checked as `s[i]` checks one: an `i`
+# below 0, a field that reaches past `s.len`, or a width outside 1..8 is `slice bounds violation`,
+# exit 134, in every build. The one checked read the network parsers take a multi-byte length or
+# type field through (a DNS RR's TYPE / RDLENGTH, a WebSocket frame's extended length), so a parser
+# whose own bounds check is wrong stops at the slice instead of reading past the buffer.
+# CHANGELOG [6.7.18]
+fn slice_get_be(s, i, w): i64 {
+    if (w < 1 || w > 8 || i < 0 || i > load64(s + 8) - w) { _slice_bounds_trap(); }
+    var p = load64(s) + i;
+    var v = 0;
+    for (var k = 0; k < w; k += 1) { v = (v << 8) | load8(p + k); }
+    return v;
 }
 
 # Unchecked variants — same shape, no bounds check. Caller's
@@ -340,7 +326,6 @@ fn slice_copy_bytes(dst, src): i64 {
 # helper if that's the intent).
 fn slice_eq_bytes(a, b): i64 {
     var an = load64(a + 8);
-    var bn = load64(b + 8);
-    if (an != bn) { return 0; }
+    if (an != load64(b + 8)) { return 0; }
     return memeq(load64(a), load64(b), an);
 }

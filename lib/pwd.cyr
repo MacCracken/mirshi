@@ -72,22 +72,33 @@ fn _pwd_load(): i64 {
     return _pwd_buf;
 }
 
-# Parse a decimal digit run at `p`. Writes parsed integer to
-# *out_val (actually caller reads return). Returns the number of
-# bytes consumed.
-fn _pwd_atoi_span(p, end): i64 {
-    var v = 0;
+# Parse the uid / gid field [p, end): one optional '-', then decimal digits that run to `end`.
+# Writes the value to `out` and returns 1; returns 0 — `out` untouched — for a field that is not
+# one number end to end (empty, a lone '-', any other byte), and the caller skips the line.
+# ⛔ 6.7.12 — this read a digit run and stopped at the first non-digit, unchecked, so Darwin's
+# first record `nobody:*:-2:-2:…` parsed as uid 0 gid 0 and answered `pwd_getpwuid(0)` on both
+# Macs; nobody keeps its own -2 now (`id -u nobody` there). The value travels through `out`: the
+# old packed `(v << 32) | span` return could not carry a negative value. CHANGELOG [6.7.12]
+fn _pwd_id_field(p, end, out): i64 {
     var i = 0;
+    var neg = 0;
+    if (p < end) {
+        if (load8(p) == 45) { neg = 1; i = 1; }     # '-'
+    }
+    var v = 0;
+    var nd = 0;
     while (p + i < end) {
         var c = load8(p + i);
-        if (c < 48) { break; }      # '0'
-        if (c > 57) { break; }      # '9'
+        if (c < 48) { return 0; }                   # '0'
+        if (c > 57) { return 0; }                   # '9'
         v = v * 10 + (c - 48);
+        nd = nd + 1;
         i = i + 1;
     }
-    # Return value in high 32 bits, span in low 32 bits so a single
-    # i64 carries both — callers destructure with & / >>.
-    return (v << 32) | i;
+    if (nd == 0) { return 0; }
+    if (neg == 1) { v = 0 - v; }
+    store64(out, v);
+    return 1;
 }
 
 # Copy bytes [p, p+n) to strbuf at offset *soff, null-terminate,
@@ -147,11 +158,11 @@ fn _pwd_parse_line(line_start, line_end, pwrec, strbuf, strbufsz): i64 {
     var f6_s = load64(&field_starts + 48);
     var f6_e = line_end;                           # shell
 
-    # Parse uid / gid
-    var uid_pack = _pwd_atoi_span(f2_s, f2_e);
-    var gid_pack = _pwd_atoi_span(f3_s, f3_e);
-    var uid = uid_pack >> 32;
-    var gid = gid_pack >> 32;
+    # Parse uid / gid — a field that is not one number is a malformed line (6.7.12)
+    var uid = 0;
+    var gid = 0;
+    if (_pwd_id_field(f2_s, f2_e, &uid) == 0) { return 0; }
+    if (_pwd_id_field(f3_s, f3_e, &gid) == 0) { return 0; }
 
     # Stash strings
     var name_p  = _pwd_stash(f0_s, f0_e - f0_s, strbuf, soff_ptr, strbufsz);

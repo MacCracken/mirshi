@@ -4,7 +4,7 @@
 #   CYRIUS_KERNEL=1) that includes it now FAILS with a clear error instead of
 #   compiling silently and faulting at runtime inside the kernel. `#` opens a comment
 #   in cyrius, so this line is inert for every host target. See PP_IS_HOST_ONLY in
-#   src/frontend/lex_pp.cyr; remove the marker if this module is ever made
+#   src/frontend/lex/pp/include.cyr; remove the marker if this module is ever made
 #   freestanding.
 # fs.cyr — filesystem operations
 # Usage: include "lib/fs.cyr"
@@ -49,7 +49,7 @@ fn _fs_cpath(path: Str, dst, cap): i64 {
         var c = load8(pd + i);
         if (c == 0) { return 0 - 1; }
         store8(dst + i, c);
-        i = i + 1;
+        i += 1;
     }
     store8(dst + n, 0);
     return n;
@@ -67,30 +67,26 @@ fn path_join(dir: Str, name: Str): i64 {
     return str_builder_build(sb);
 }
 
+# The index of the last '/' in `path`, or -1 (the scan path_basename and path_dirname share).
+fn _fs_last_slash(path: Str): i64 {
+    var sd = str_data(path);
+    var last = 0 - 1;
+    for (var pi = 0; pi < str_len(path); pi += 1) {
+        if (load8(sd + pi) == 47) { last = pi; }
+    }
+    return last;
+}
+
 # Get basename (last component after /)
 fn path_basename(path: Str): i64 {
-    var slen = str_len(path);
-    var sd = str_data(path);
-    var last_slash = 0 - 1;
-    var pi = 0;
-    while (pi < slen) {
-        if (load8(sd + pi) == 47) { last_slash = pi; }
-        pi = pi + 1;
-    }
+    var last_slash = _fs_last_slash(path);
     if (last_slash < 0) { return path; }
-    return str_sub(path, last_slash + 1, slen - last_slash - 1);
+    return str_sub(path, last_slash + 1, str_len(path) - last_slash - 1);
 }
 
 # Get dirname (everything before last /)
 fn path_dirname(path: Str): i64 {
-    var slen = str_len(path);
-    var sd = str_data(path);
-    var last_slash = 0 - 1;
-    var pi = 0;
-    while (pi < slen) {
-        if (load8(sd + pi) == 47) { last_slash = pi; }
-        pi = pi + 1;
-    }
+    var last_slash = _fs_last_slash(path);
     if (last_slash <= 0) { return str_from("/"); }
     return str_sub(path, 0, last_slash);
 }
@@ -180,7 +176,7 @@ fn _dir_list_into_vec(path: Str, entries): i64 {
                     # (the agnos record's name has no terminator of its own).
                     vec_push(entries, str_from_buf(name, namelen));
                 }
-                pos = pos + reclen;
+                pos += reclen;
             }
         }
     }
@@ -192,7 +188,10 @@ fn _dir_list_into_vec(path: Str, entries): i64 {
 fn _dir_list_into_vec(path: Str, entries): i64 {
     var cpath[4096];
     if (_fs_cpath(path, &cpath, 4096) < 0) { return 0 - 1; }   # 6.6.11: exactly the Str's bytes
-    var fd = sys_open(&cpath, O_RDONLY, 0);
+    # O_DIRECTORY: the kernel refuses a non-directory at path resolution (-ENOTDIR). With
+    # O_RDONLY alone a FIFO at `path` blocked in open(2) until a writer came, so the listing
+    # never returned. CHANGELOG [6.7.11]
+    var fd = sys_open(&cpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0) { return fd; }
     # ⛔ v6.5.11: STACK scratch, not alloc(). Both buffers are dead the moment this fn
     # returns, but the default allocator is a BUMP allocator — it has no free — so each
@@ -245,7 +244,7 @@ fn _dir_list_into_vec(path: Str, entries): i64 {
                 if (skip == 0) {
                     vec_push(entries, str_clone(str_from(name)));
                 }
-                pos = pos + reclen;
+                pos += reclen;
             }
         }
     }
@@ -347,10 +346,10 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
                     store64(offs + count * 8, npos);
                     memcpy(names + npos, name, namelen);
                     store8(names + npos + namelen, 0);
-                    npos = npos + namelen + 1;
-                    count = count + 1;
+                    npos += namelen + 1;
+                    count += 1;
                 }
-                pos = pos + reclen;
+                pos += reclen;
             }
         }
     }
@@ -360,7 +359,7 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
     #ifndef CYRIUS_TARGET_AGNOS
     var cpath[4096];
     if (_fs_cpath(path, &cpath, 4096) < 0) { return 0 - 1; }   # 6.6.11: exactly the Str's bytes
-    var fd2 = sys_open(&cpath, O_RDONLY, 0);
+    var fd2 = sys_open(&cpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);   # a FIFO must not block: see _dir_list_into_vec
     if (fd2 < 0) { return 0 - 1; }
     var basep[8];
     store64(&basep, 0);
@@ -393,10 +392,10 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
                     store64(offs + count * 8, npos);
                     memcpy(names + npos, name2, nl2);
                     store8(names + npos + nl2, 0);
-                    npos = npos + nl2 + 1;
-                    count = count + 1;
+                    npos += nl2 + 1;
+                    count += 1;
                 }
-                pos2 = pos2 + reclen2;
+                pos2 += reclen2;
             }
         }
     }
@@ -413,7 +412,7 @@ fn dir_list_full(path: Str): i64 {
     var di = 0;
     while (di < vec_len(names)) {
         vec_push(full, path_join(path, vec_get(names, di)));
-        di = di + 1;
+        di += 1;
     }
     return full;
 }
@@ -561,18 +560,32 @@ fn _dir_walk_unlisted(path: Str, failed, depth, err): i64 {
     var en = 0 - err;
     var el = 0;
     if (en <= 0) { store8(&eb, 63); el = 1; }   # '?'
-    while (en > 0 && el < 20) { store8(&eb + el, 48 + en % 10); en = en / 10; el = el + 1; }
-    while (el > 0) { el = el - 1; syscall(SYS_WRITE, 2, &eb + el, 1); }
+    while (en > 0 && el < 20) { store8(&eb + el, 48 + en % 10); en = en / 10; el += 1; }
+    while (el > 0) { el -= 1; syscall(SYS_WRITE, 2, &eb + el, 1); }
     syscall(SYS_WRITE, 2, ") — subtree NOT walked; use dir_walk_checked to fail on it\n", 61);
     return 0;
 }
 
-fn _dir_walk_d(path: Str, results, depth, failed): i64 {
+# Whether entry `name` is a member of `prunes` (a vec of Str, exact match; 0 = none).
+fn _fs_pruned(name, prunes): bool {
+    if (prunes == 0) { return false; }
+    for (var pi = 0; pi < vec_len(prunes); pi += 1) {
+        if (str_eq(name, vec_get(prunes, pi)) == 1) { return true; }
+    }
+    return false;
+}
+
+# The one walker under dir_walk, dir_walk_checked, find_files*, and dir_walk_with_prunes:
+# `failed` (a vec, or 0) — see _dir_walk_unlisted; `prunes` (a vec of Str, or 0) — an entry
+# named in it is skipped with its whole subtree. Returns vec_len(results). The pruning walk was a
+# second copy of this body (_dir_walk_prunes_d) until 6.7.18. CHANGELOG [6.7.18]
+fn _dir_walk_d(path: Str, results, depth, failed, prunes = 0): i64 {
     # Stop, but do NOT pretend the tree ended: a silent truncation here would be the
     # same lie as the inflated count, one level down.
     if (depth > DIR_WALK_MAX_DEPTH) {
         if (failed != 0) { vec_push(failed, path); return vec_len(results); }
-        syscall(SYS_WRITE, 2, "warning: dir_walk depth cap (64) hit at: ", 41);
+        if (prunes != 0) { syscall(SYS_WRITE, 2, "warning: dir_walk_with_prunes depth cap (64) hit at: ", 53); }
+        else { syscall(SYS_WRITE, 2, "warning: dir_walk depth cap (64) hit at: ", 41); }
         syscall(SYS_WRITE, 2, str_data(path), str_len(path));
         syscall(SYS_WRITE, 2, "\n  a symlink loop or a pathologically deep tree — subtree NOT walked.\n", 72);
         return vec_len(results);
@@ -580,21 +593,32 @@ fn _dir_walk_d(path: Str, results, depth, failed): i64 {
     var entries = vec_new();
     var lr = _dir_list_into_vec(path, entries);
     if (lr < 0) { _dir_walk_unlisted(path, failed, depth, lr); }
-    var wi = 0;
-    while (wi < vec_len(entries)) {
-        var full = path_join(path, vec_get(entries, wi));
-        # v6.5.12: a symlinked DIRECTORY is recorded but never DESCENDED (loop guard);
-        # a symlinked FILE is recorded exactly as before. See is_symlink.
-        if (is_dir(full) == 1 && is_symlink(full) == 1) {
-            vec_push(results, full);
-        } elif (is_dir(full) == 1) {
-            _dir_walk_d(full, results, depth + 1, failed);
-        } else {
-            vec_push(results, full);
+    for (var wi = 0; wi < vec_len(entries); wi += 1) {
+        var name = vec_get(entries, wi);
+        if (!_fs_pruned(name, prunes)) {
+            var full = path_join(path, name);
+            # v6.5.12: a symlinked DIRECTORY is recorded but never DESCENDED (loop guard);
+            # a symlinked FILE is recorded exactly as before. See is_symlink.
+            if (is_dir(full) == 1 && is_symlink(full) == 1) {
+                vec_push(results, full);
+            } elif (is_dir(full) == 1) {
+                _dir_walk_d(full, results, depth + 1, failed, prunes);
+            } else {
+                vec_push(results, full);
+            }
         }
-        wi = wi + 1;
     }
     return vec_len(results);
+}
+
+# The paths in `all` that end in `ext` — a new vec (find_files* filter their walk through it).
+fn _fs_with_ext(all, ext: Str): i64 {
+    var matched = vec_new();
+    for (var fi = 0; fi < vec_len(all); fi += 1) {
+        var fp = vec_get(all, fi);
+        if (path_has_ext(fp, ext) == 1) { vec_push(matched, fp); }
+    }
+    return matched;
 }
 
 # Walk a directory tree, pushing every file path found into `results`.
@@ -648,16 +672,7 @@ fn find_files(path: Str, ext: Str): i64 {
 fn find_files_checked(path: Str, ext: Str, failed): i64 {
     var all = vec_new();
     _dir_walk_d(path, all, 0, failed);
-    var matched = vec_new();
-    var fi = 0;
-    while (fi < vec_len(all)) {
-        var fp = vec_get(all, fi);
-        if (path_has_ext(fp, ext) == 1) {
-            vec_push(matched, fp);
-        }
-        fi = fi + 1;
-    }
-    return matched;
+    return _fs_with_ext(all, ext);
 }
 
 # Walk a directory tree, push all file paths to `results`,
@@ -667,57 +682,22 @@ fn find_files_checked(path: Str, ext: Str, failed): i64 {
 # ( -path '*/X/*' -o ... ) -prune -o -print` with X drawn
 # from `prunes`.
 #
-# Pinned at v5.9.17 for the TS corpus regression gates which
-# walk `~/Repos/secureyeoman` for *.ts / *.tsx while skipping
-# node_modules, dist, build, .next, coverage. Signature picked
+# Added at v5.9.17 for walking a TypeScript tree for *.ts / *.tsx
+# while skipping node_modules, dist, build, .next, coverage
+# (programs/ts_test_runner.cyr; no gate walks another project since 6.7.16). Signature picked
 # to mirror `dir_walk(path, results)` so callers can use the
 # same shape.
 # v6.5.12: depth-bounded, same reasoning as `_dir_walk_d` above — pruning by NAME does
 # not stop a loop, because the symlink that closes it need not be named in `prunes`.
-fn _dir_walk_prunes_d(path: Str, results, prunes, depth): i64 {
-    if (depth > DIR_WALK_MAX_DEPTH) {
-        syscall(SYS_WRITE, 2, "warning: dir_walk_with_prunes depth cap (64) hit at: ", 53);
-        syscall(SYS_WRITE, 2, str_data(path), str_len(path));
-        syscall(SYS_WRITE, 2, "\n  a symlink loop or a pathologically deep tree — subtree NOT walked.\n", 72);
-        return vec_len(results);
-    }
-    # 6.6.10: an unlistable SUBdirectory is named on stderr, as in dir_walk.
-    var entries = vec_new();
-    var lr = _dir_list_into_vec(path, entries);
-    if (lr < 0) { _dir_walk_unlisted(path, 0, depth, lr); }
-    var wi = 0;
-    while (wi < vec_len(entries)) {
-        var name = vec_get(entries, wi);
-        var pruned = 0;
-        var pi = 0;
-        while (pi < vec_len(prunes)) {
-            if (str_eq(name, vec_get(prunes, pi)) == 1) {
-                pruned = 1;
-            }
-            pi = pi + 1;
-        }
-        if (pruned == 0) {
-            var full = path_join(path, name);
-            # v6.5.12: symlinked DIRECTORIES recorded, not descended — see is_symlink.
-            if (is_dir(full) == 1 && is_symlink(full) == 1) {
-                vec_push(results, full);
-            } elif (is_dir(full) == 1) {
-                _dir_walk_prunes_d(full, results, prunes, depth + 1);
-            } else {
-                vec_push(results, full);
-            }
-        }
-        wi = wi + 1;
-    }
-    return vec_len(results);
-}
-
+# 6.6.10: an unlistable SUBdirectory is named on stderr, as in dir_walk. 6.7.18: the walk is
+# _dir_walk_d's, with `prunes`.
+#
 # Walk a directory tree like `dir_walk`, skipping any subtree whose entry
 # name matches a member of `prunes` (a vec of Str; exact match, no glob).
 # Depth-bounded identically — pruning by name cannot stop a symlink loop,
 # because the link that closes it need not be named in `prunes`.
 fn dir_walk_with_prunes(path: Str, results, prunes): i64 {
-    return _dir_walk_prunes_d(path, results, prunes, 0);
+    return _dir_walk_d(path, results, 0, 0, prunes);
 }
 
 # Find files matching an extension under `path`, pruning any
@@ -732,14 +712,5 @@ fn dir_walk_with_prunes(path: Str, results, prunes): i64 {
 fn find_files_with_prunes(path: Str, ext: Str, prunes): i64 {
     var all = vec_new();
     dir_walk_with_prunes(path, all, prunes);
-    var matched = vec_new();
-    var fi = 0;
-    while (fi < vec_len(all)) {
-        var fp = vec_get(all, fi);
-        if (path_has_ext(fp, ext) == 1) {
-            vec_push(matched, fp);
-        }
-        fi = fi + 1;
-    }
-    return matched;
+    return _fs_with_ext(all, ext);
 }

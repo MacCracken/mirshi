@@ -316,6 +316,90 @@ fn _procstat_fields(buf, n, j, out): i64 {
     return 1;
 }
 
+# ----------------------------------------------------------------------------
+# The agnos 1.57.13 band (1.12.1) — PURE helpers for fd_kind#111, console_mode#110 and
+# sock_send_dl#109, the three numbers the cyrius 6.7.11+ agnos stdlib issues. Each is
+# supervisor-EMULATE (src/dispatch.cyr). Values are the kernel's (agnos
+# kernel/core/syscall.cyr: enum FdKind, enum ConsoleMode, the #109 arm; net_tcp.cyr
+# TCP_PROGRESS_US). ⚠ Linux #109/#110/#111 are setpgid/getppid/getpgrp — the EMULATE
+# skip (orig_rax = -1) keeps them from ever running in the child.
+# ----------------------------------------------------------------------------
+enum MirshiAgnos5713 {
+    FDK_CONSOLE = 1;           # the console character device (under mirshi: a terminal)
+    FDK_FILE = 2;              # a regular file on any backend
+    FDK_DIR = 3;               # a directory fd
+    FDK_PIPE = 4;              # either end of a pipe#25
+    FDK_CHAN = 5;              # a #97 channel endpoint (mirshi has none)
+    FDK_SOCKET = 6;            # a kernel socket fd
+    FDK_SIGNALFD = 7;
+    FDK_EPOLL = 8;
+    FDK_TIMERFD = 9;
+    FDK_DEVICE = 10;           # another character device (under mirshi: a non-tty char dev, /dev/null)
+    FDK_FD_MAX = 32;           # the kernel's per-process fd table: fd >= 32 is always -1
+    ST_IFMT = 0xF000;          # st_mode file-type mask, and the five types fd_kind tells apart
+    ST_IFCHR = 0x2000;
+    ST_IFDIR = 0x4000;
+    ST_IFREG = 0x8000;
+    ST_IFIFO = 0x1000;
+    ST_IFSOCK = 0xC000;
+    CM_NOECHO = 1;             # the console's MODE: readers store and edit, but nothing is echoed
+    CM_FLUSH = 2;              # an ACTION, set only: discard the typeahead (tcflush TCIFLUSH)
+    CM_NOSERIAL = 4;           # PER-PROCESS (agnos 1.57.18): don't mirror this process's writes to COM1
+    CM_SET_OK = 7;             # the bits `set` may carry
+    CM_CLEAR_OK = 5;           # the bits `clear` may carry (FLUSH is no mode: nothing to clear)
+    SEND_DL_D6_US = 8000000;   # the kernel's D6 window (TCP_PROGRESS_US): #109 waits at most this long
+}
+
+# fd_kind#111 for a REAL fd, from its Linux st_mode and whether TCGETS succeeds on it. A char
+# device is the CONSOLE when it is a terminal (glibc isatty's own test) and a plain DEVICE
+# otherwise (/dev/null, which a container's stdin often is). A block device or an anonymous
+# inode (no type bits) has no agnos kind -> -1, as the kernel answers for a tag it does not know.
+fn fdk_from_mode(mode, is_tty): i64 {
+    var t = mode & ST_IFMT;
+    if (t == ST_IFCHR) {
+        if (is_tty == 1) { return FDK_CONSOLE; }
+        return FDK_DEVICE;
+    }
+    if (t == ST_IFREG) { return FDK_FILE; }
+    if (t == ST_IFDIR) { return FDK_DIR; }
+    if (t == ST_IFIFO) { return FDK_PIPE; }
+    if (t == ST_IFSOCK) { return FDK_SOCKET; }
+    return 0 - 1;
+}
+
+# console_mode#110's argument check: 1 when `set` lies in CM_SET_OK and `clear` in CM_CLEAR_OK,
+# else 0 (the kernel then answers -1 with NOTHING changed, so a newer program asking for a mode
+# this ABI lacks hears -1, never a silent 0). A TTY_SELFTEST knob bit (0x700) is refused here too,
+# as a production kernel refuses it.
+fn cm_args_ok(set, clear): i64 {
+    if ((set & (0 - 1 - CM_SET_OK)) != 0) { return 0; }
+    if ((clear & (0 - 1 - CM_CLEAR_OK)) != 0) { return 0; }
+    return 1;
+}
+
+# The console's next mode from its effective `prev` mode: new = (prev & ~clear) | (set & NOECHO).
+# FLUSH is an action and NOSERIAL is per-process, so neither is ever stored in the console's mode.
+fn cm_mode_next(prev, set, clear): i64 {
+    return (prev & (0 - 1 - clear)) | (set & CM_NOECHO);
+}
+
+# The caller's next CM_NOSERIAL cell (0 / 1) from its `old` one: `set` wins over `clear`.
+fn cm_noser_next(old, set, clear): i64 {
+    var n = old;
+    if ((clear & CM_NOSERIAL) != 0) { n = 0; }
+    if ((set & CM_NOSERIAL) != 0) { n = 1; }
+    return n;
+}
+
+# How long sock_send_dl#109 may wait for send space, in µs, for a caller ceiling `dl` > 0: the
+# ceiling, capped by the kernel's D6 window (a stalled peer returns at min(dl, ~8 s)). 0 for dl <= 0
+# (dl < 0 is a spent ceiling, no wait; dl == 0 is plain #48, which the dispatcher routes to #48).
+fn send_dl_wait_us(dl): i64 {
+    if (dl <= 0) { return 0; }
+    if (dl > SEND_DL_D6_US) { return SEND_DL_D6_US; }
+    return dl;
+}
+
 # Synthesize the Linux 6-arg mmap registers into a caller-owned regs buffer from
 # agnos's single-arg mmap(length). Linux mmap(addr, len, prot, flags, fd, off)
 # rides the kernel syscall ABI a1..a6 = rdi/rsi/rdx/r10/r8/r9 (a4=r10 NOT rcx).

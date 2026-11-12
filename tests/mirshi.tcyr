@@ -26,6 +26,9 @@ fn main() {
     assert_streq(agnos_nr_name(60), "winsize", "nr 60 = winsize (NOT exit)");
     assert_streq(agnos_nr_name(61), "net_config", "nr 61 = net_config");
     assert_streq(agnos_nr_name(95), "uptime_us", "nr 95 = uptime_us (NOT Linux umask)");
+    assert_streq(agnos_nr_name(109), "sock_send_dl", "nr 109 = sock_send_dl (NOT Linux setpgid)");
+    assert_streq(agnos_nr_name(110), "console_mode", "nr 110 = console_mode (NOT Linux getppid)");
+    assert_streq(agnos_nr_name(111), "fd_kind", "nr 111 = fd_kind (NOT Linux getpgrp)");
     assert_streq(agnos_nr_name(36), "unknown", "nr 36 = unknown (unmirrored)");
     assert_streq(agnos_nr_name(99), "unknown", "nr 99 = unknown (out of surface)");
 
@@ -52,6 +55,12 @@ fn main() {
     assert_eq(agnos_argc(1), 3, "write arity 3");
     assert_eq(agnos_argc(31), 4, "rename arity 4 (a4=r10)");
     assert_eq(agnos_argc(95), 0, "uptime_us arity 0");
+    assert_eq(agnos_argc(109), 4, "sock_send_dl arity 4 (timeout_us a4=r10)");
+    assert_eq(agnos_argc(110), 2, "console_mode arity 2");
+    assert_eq(agnos_argc(111), 1, "fd_kind arity 1");
+    assert_eq(agnos_ptrmask(109), 2, "sock_send_dl buf is arg1");
+    assert_eq(agnos_ptrmask(110), 0, "console_mode has no pointer args");
+    assert_eq(agnos_ptrmask(111), 0, "fd_kind has no pointer args");
     assert_eq(agnos_ptrmask(1), 2, "write buf is arg1");
     assert_eq(agnos_ptrmask(33), 5, "stat path+statbuf are arg0+arg2");
     assert_eq(agnos_ptrmask(2), 0, "getpid has no pointer args");
@@ -236,6 +245,9 @@ fn main() {
     assert_eq(agnos_to_linux_nr(61), 0 - 1, "net_config#61 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(62), 0 - 1, "out-of-range#62 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(95), 0 - 1, "uptime_us#95 -> no peer (v1.11.3: EMULATE at the dispatcher; Linux #95 is umask)");
+    assert_eq(agnos_to_linux_nr(109), 0 - 1, "sock_send_dl#109 -> no peer (v1.12.1: net-band EMULATE; Linux #109 is setpgid)");
+    assert_eq(agnos_to_linux_nr(110), 0 - 1, "console_mode#110 -> no peer (v1.12.1: EMULATE; Linux #110 is getppid)");
+    assert_eq(agnos_to_linux_nr(111), 0 - 1, "fd_kind#111 -> no peer (v1.12.1: EMULATE; Linux #111 is getpgrp)");
     assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
 
     test_group("fs-ao-to-o");
@@ -546,6 +558,80 @@ fn main() {
     assert_eq(_timer_ticks(1099, 1000, 100), 1, "periodic <1 interval past -> 1");
     assert_eq(_timer_ticks(1100, 1000, 100), 2, "periodic exactly 1 interval past -> 2");
     assert_eq(_timer_ticks(1350, 1000, 100), 4, "periodic 3.5 intervals past -> 1+3 = 4");
+
+    # --- the agnos 1.57.13 band (1.12.1): fd_kind#111 / console_mode#110 / sock_send_dl#109 ---
+    test_group("fd-kind");
+    # the FdKind values are the kernel's frozen enum (agnos kernel/core/syscall.cyr)
+    assert_eq(FDK_CONSOLE, 1, "FDK_CONSOLE = 1");
+    assert_eq(FDK_FILE, 2, "FDK_FILE = 2");
+    assert_eq(FDK_DIR, 3, "FDK_DIR = 3");
+    assert_eq(FDK_PIPE, 4, "FDK_PIPE = 4");
+    assert_eq(FDK_SOCKET, 6, "FDK_SOCKET = 6");
+    assert_eq(FDK_SIGNALFD, 7, "FDK_SIGNALFD = 7");
+    assert_eq(FDK_EPOLL, 8, "FDK_EPOLL = 8");
+    assert_eq(FDK_TIMERFD, 9, "FDK_TIMERFD = 9");
+    assert_eq(FDK_DEVICE, 10, "FDK_DEVICE = 10");
+    assert_eq(FDK_FD_MAX, 32, "the kernel's fd table is 32 entries");
+    # a real fd, by st_mode type bits (permission bits ignored) and the TCGETS answer
+    assert_eq(fdk_from_mode(0x2190, 1), FDK_CONSOLE, "char dev + TCGETS ok -> CONSOLE (a terminal)");
+    assert_eq(fdk_from_mode(0x21B6, 0), FDK_DEVICE, "char dev, not a tty -> DEVICE (/dev/null)");
+    assert_eq(fdk_from_mode(0x81A4, 0), FDK_FILE, "S_IFREG 0644 -> FILE");
+    assert_eq(fdk_from_mode(0x41ED, 0), FDK_DIR, "S_IFDIR 0755 -> DIR");
+    assert_eq(fdk_from_mode(0x1180, 0), FDK_PIPE, "S_IFIFO -> PIPE");
+    assert_eq(fdk_from_mode(0xC1FF, 0), FDK_SOCKET, "S_IFSOCK -> SOCKET");
+    assert_eq(fdk_from_mode(0x81A4, 1), FDK_FILE, "the tty answer only matters for a char dev");
+    assert_eq(fdk_from_mode(0x61B0, 0), 0 - 1, "S_IFBLK -> -1 (no agnos kind)");
+    assert_eq(fdk_from_mode(0x0180, 0), 0 - 1, "an anonymous inode (no type bits) -> -1");
+    # one of mirshi's emulated ids, by its _emu_classify band
+    assert_eq(fdk_from_emu_kind(KIND_SIGFD), FDK_SIGNALFD, "emulated signalfd -> SIGNALFD");
+    assert_eq(fdk_from_emu_kind(KIND_TIMERFD), FDK_TIMERFD, "emulated timerfd -> TIMERFD");
+    assert_eq(fdk_from_emu_kind(KIND_EPOLL), FDK_EPOLL, "emulated epoll -> EPOLL");
+    assert_eq(fdk_from_emu_kind(KIND_SOCK), 0 - 1, "a socket-tagged id is the stdlib's handle -> -1");
+    assert_eq(fdk_from_emu_kind(KIND_PIPE), 0 - 1, "the reserved pipe band has no ids -> -1");
+    assert_eq(fdk_from_emu_kind(KIND_REAL), 0 - 1, "a real fd is not answered here");
+    # every emulated base sits above the 32-entry bound, so the dispatcher must test it FIRST
+    assert_eq(MIN_EMU_BASE > FDK_FD_MAX, 1, "emulated ids are above the fd-table bound");
+
+    test_group("console-mode");
+    assert_eq(CM_NOECHO, 1, "CM_NOECHO = 1");
+    assert_eq(CM_FLUSH, 2, "CM_FLUSH = 2");
+    assert_eq(CM_NOSERIAL, 4, "CM_NOSERIAL = 4 (agnos 1.57.18)");
+    assert_eq(cm_args_ok(0, 0), 1, "(0, 0) is a query");
+    assert_eq(cm_args_ok(CM_NOECHO | CM_FLUSH, 0), 1, "NOECHO|FLUSH (TCSETSF's shape)");
+    assert_eq(cm_args_ok(7, 5), 1, "every legal bit at once");
+    assert_eq(cm_args_ok(8, 0), 0, "an unknown set bit -> refused");
+    assert_eq(cm_args_ok(0, CM_FLUSH), 0, "FLUSH in clear -> refused (it is no mode)");
+    assert_eq(cm_args_ok(0, 8), 0, "an unknown clear bit -> refused");
+    assert_eq(cm_args_ok(0x100, 0), 0, "a TTY_SELFTEST knob bit -> refused, as a production kernel does");
+    assert_eq(cm_args_ok(0 - 1, 0), 0, "all bits -> refused");
+    assert_eq(cm_mode_next(0, CM_NOECHO, 0), CM_NOECHO, "set NOECHO");
+    assert_eq(cm_mode_next(CM_NOECHO, 0, CM_NOECHO), 0, "clear NOECHO");
+    assert_eq(cm_mode_next(CM_NOECHO, 0, 0), CM_NOECHO, "a query keeps the mode");
+    assert_eq(cm_mode_next(0, CM_FLUSH, 0), 0, "FLUSH is an action, never stored");
+    assert_eq(cm_mode_next(0, CM_NOSERIAL, 0), 0, "NOSERIAL is per-process, never the console's");
+    assert_eq(cm_mode_next(CM_NOECHO, CM_FLUSH, CM_NOSERIAL), CM_NOECHO, "flush + clear NOSERIAL keep NOECHO");
+    assert_eq(cm_noser_next(0, CM_NOSERIAL, 0), 1, "set NOSERIAL");
+    assert_eq(cm_noser_next(1, 0, CM_NOSERIAL), 0, "clear NOSERIAL");
+    assert_eq(cm_noser_next(0, CM_NOSERIAL, CM_NOSERIAL), 1, "set wins over clear");
+    assert_eq(cm_noser_next(1, CM_NOECHO, 0), 1, "other bits leave it alone");
+    # the per-process cell lives in the child record and starts clear in every new process
+    assert_eq(C_CON_NOSER + 8, CHILD_REC_SIZE, "C_CON_NOSER is the record's last field");
+    _child_reset();
+    var cmt = _child_tbl();
+    store64(cmt + C_CON_NOSER, 1);                  # a stale cell in a FREE slot
+    var cmr = _child_alloc(4242, 0);
+    assert_eq(load64(cmr + C_CON_NOSER), 0, "_child_alloc clears CM_NOSERIAL");
+    _child_reset();
+
+    test_group("send-dl");
+    assert_eq(SEND_DL_D6_US, 8000000, "the D6 window is the kernel's TCP_PROGRESS_US (8 s)");
+    assert_eq(send_dl_wait_us(0 - 1), 0, "a spent ceiling never waits");
+    assert_eq(send_dl_wait_us(0), 0, "0 is plain #48 (routed to #48 before this)");
+    assert_eq(send_dl_wait_us(1), 1, "1 us");
+    assert_eq(send_dl_wait_us(250000), 250000, "a ceiling inside the window is kept");
+    assert_eq(send_dl_wait_us(8000000), 8000000, "exactly the window");
+    assert_eq(send_dl_wait_us(8000001), 8000000, "past the window -> the window");
+    assert_eq(send_dl_wait_us(0x7FFFFFFFFFFFFFFF), 8000000, "i64 max -> the window");
 
     return assert_summary();
 }

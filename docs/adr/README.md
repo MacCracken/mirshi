@@ -36,3 +36,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0015 — I/O multiplexing: supervisor-emulated epoll + timerfd, execute-in-child pipe](0015-io-mux-emulated-epoll-timerfd-executed-pipe.md) — *Accepted*
 - [0016 — Info getters supervisor-emulated (getuid / uname / sysinfo), flock execute-in-child](0016-info-getters-emulated-flock-executed.md) — *Accepted*
 - [0017 — winsize supervisor-emulated from TIOCGWINSZ (the whole direction-1 graphics surface)](0017-winsize-emulated-tiocgwinsz.md) — *Accepted*
+- [0018 — The agnos 1.57.13 band: fd_kind, console_mode and sock_send_dl, supervisor-emulated](0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md) — *Accepted*

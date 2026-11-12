@@ -50,27 +50,24 @@ var CHAN_BLOCKING = 1;
 # No trampoline is needed: a Darwin start routine is `void *(*)(void *)`, which is exactly the
 # shape of a cyrius `fn body(arg): i64` — arg 1 in x0, result in x0, stock AAPCS64 prologue.
 
-# Control block, 40 B: +0 done · +8 fp · +16 arg · +24 pthread_t · +32 TLS block.
+# Control block, 40 B: +0 done · +8 fp · +16 arg · +24 pthread_t · +32 the thread's TLS registry
+# entry (lib/thread_local.cyr's _tls_claim).
 # The HANDLE a caller holds IS this pointer, so `thread_is_done` reads +0 directly.
 var _THR_CTL = 40;
 
 # Thread entry. Runs on the new thread; `ctl` arrives in x0 as arg 1.
 #
+# ⚠ THE KEY IS BOUND BEFORE THE BODY RUNS: until then this thread's lookups find no entry.
 # ⚠ THE WAKE MUST FOLLOW THE STORE, AND THE FENCE MUST PRECEDE IT. A joiner parks on the
 # done word; publishing it after the wake would lose the wakeup permanently.
 fn _thr_entry(ctl): i64 {
-    _tls_bind(load64(ctl + 32));
+    var ent = load64(ctl + 32);
+    _tls_bind(ent);
     fncall1(load64(ctl + 8), load64(ctl + 16));
-    _tls_unbind();
+    _tls_unbind(ent);
     atomic_fence();                 # release: the body's writes happen-before done=1
     atomic_store(ctl, 1);
-    _threads_live_dec();
     sys_ulock_wake(0x101, ctl, 0);  # UL_COMPARE_AND_WAIT | ULF_WAKE_ALL — wake every joiner
-    return 0;
-}
-
-fn _threads_live_dec(): i64 {
-    if (_tls_live > 0) { _tls_live = _tls_live - 1; }
     return 0;
 }
 
@@ -80,6 +77,9 @@ fn _threads_live_dec(): i64 {
 # emulates isolation by saving/zeroing/restoring the caller's 128 slots around an INLINE call.
 # With a real thread that is not merely unnecessary, it is a race on the caller's own slots.
 # Isolation comes from a genuinely separate per-thread block (lib/thread_local.cyr).
+# ⛔ The registry entry is claimed HERE, before the thread exists. If none can be had (every
+# entry is held and no chunk can be allocated), the thread is refused (0). It never starts on
+# another thread's slots, as a thread past the 64th live one did until 6.7.18. CHANGELOG [6.7.18]
 fn thread_create(fp, arg): i64 {
     alloc_init();
     _threads_active = 1;            # arm the shared-heap lock BEFORE the thread can run
@@ -92,18 +92,22 @@ fn thread_create(fp, arg): i64 {
         store64(blk + i * 8, 0);
         i = i + 1;
     }
+    # The first thread_create runs while its caller is the only thread, so that caller is main.
+    # A plain store: the new thread reads it after pthread_create, and no other thread exists yet.
+    if (_tls_main == 0) { _tls_main = _thr_self(); }
+    var ent = _tls_claim(blk);
+    if (ent == 0) { return 0; }
     store64(ctl, 0);                # done
     store64(ctl + 8, fp);
     store64(ctl + 16, arg);
     store64(ctl + 24, 0);           # pthread_t out
-    store64(ctl + 32, blk);
-    _tls_live = _tls_live + 1;      # published BEFORE the thread can call thread_local_get
+    store64(ctl + 32, ent);
     atomic_fence();
     # pthread_create(&pthread_t, attr=NULL, _thr_entry, ctl) via __got[5]. 1700 is the
-    # libSystem-routine sub-band (see src/frontend/parse_expr.cyr) — NOT a BSD syscall number.
+    # libSystem-routine sub-band (see src/frontend/parse/expr/factor.cyr) — NOT a BSD syscall number.
     var rc = syscall(1700, ctl + 24, 0, &_thr_entry, ctl);
     if (rc != 0) {
-        _threads_live_dec();
+        _tls_unbind(ent);
         return 0;
     }
     return ctl;

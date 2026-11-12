@@ -88,8 +88,8 @@ fn tls_native_record_read_header(buf, buflen, ct_out, version_out, length_out): 
 # Data records but they have no consumer).
 fn tls_native_record_fragment_count(plaintext_len): i64 {
     if (plaintext_len <= 0) { return 0; }
-    var n = plaintext_len / TLS_RECORD_MAX_PLAINTEXT;
-    if ((plaintext_len % TLS_RECORD_MAX_PLAINTEXT) != 0) { n = n + 1; }
+    var n = plaintext_len / _TLS_RECORD_MAX_PLAINTEXT;
+    if ((plaintext_len % _TLS_RECORD_MAX_PLAINTEXT) != 0) { n = n + 1; }
     return n;
 }
 
@@ -176,6 +176,8 @@ var TLS_ERR_KEY_UNSUPPORTED = 0 - 21;
 # (ContentType = TLS_CT_HANDSHAKE) and may span multiple records.
 
 const _TLS_HANDSHAKE_HEADER_LEN = 4;
+# Read-only mirror of `_TLS_HANDSHAKE_HEADER_LEN`: lib/ reads the const; a write changes nothing (D16).
+# CHANGELOG [6.7.12]
 var TLS_HANDSHAKE_HEADER_LEN = _TLS_HANDSHAKE_HEADER_LEN;
 
 # Write a 4-byte handshake message header into `buf`. Returns
@@ -186,17 +188,17 @@ fn tls_native_handshake_write_header(buf, hs_type, body_len): i64 {
     if (body_len > 0xFFFFFF) { return TLS_ERR_INVALID_PARAM; }
     store8(buf, hs_type & 0xFF);
     _tn_be24_w(buf + 1, body_len);
-    return TLS_HANDSHAKE_HEADER_LEN;
+    return _TLS_HANDSHAKE_HEADER_LEN;
 }
 
 # Parse a 4-byte handshake header. Writes msg_type to `hs_type_out`,
 # body length to `body_len_out`. Returns TLS_HANDSHAKE_HEADER_LEN on
 # success, TLS_ERR_BAD_HANDSHAKE on short buffer.
 fn tls_native_handshake_read_header(buf, buflen, hs_type_out, body_len_out): i64 {
-    if (buflen < TLS_HANDSHAKE_HEADER_LEN) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (buflen < _TLS_HANDSHAKE_HEADER_LEN) { return TLS_ERR_BAD_HANDSHAKE; }
     store64(hs_type_out, load8(buf));
     store64(body_len_out, _tn_be24_r(buf + 1));
-    return TLS_HANDSHAKE_HEADER_LEN;
+    return _TLS_HANDSHAKE_HEADER_LEN;
 }
 
 # ================================================================
@@ -226,8 +228,12 @@ var TLS_HASH_SHA384_LEN = 48;
 # itself is 16 bytes (algo + ctx-pointer) plus the heap-alloc'd
 # hash ctx.
 var TLS_TRANSCRIPT_STATE_LEN = 16;
-var TLS_SHA256_CTX_LEN = 144;
+const _TLS_SHA256_CTX_LEN = 144;
+# Read-only mirror of `_TLS_SHA256_CTX_LEN`: lib/ reads the const; a write changes nothing
+# (6.7.12's D16). CHANGELOG [6.7.14]
+var TLS_SHA256_CTX_LEN = _TLS_SHA256_CTX_LEN;
 const _TLS_SHA384_CTX_LEN = 208;
+# Read-only mirror of `_TLS_SHA384_CTX_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS_SHA384_CTX_LEN = _TLS_SHA384_CTX_LEN;
 
 # Initialize a transcript-hash accumulator. `hash_algo` is one of
@@ -250,14 +256,14 @@ fn tls_native_transcript_init_in(a, hash_algo): i64 {
     if (state == 0) { return 0; }
     var hctx = 0;
     if (hash_algo == TLS_HASH_SHA256) {
-        if (a == 0) { hctx = alloc(TLS_SHA256_CTX_LEN); }
-        if (a != 0) { hctx = alloc_via(a, TLS_SHA256_CTX_LEN); }
+        if (a == 0) { hctx = alloc(_TLS_SHA256_CTX_LEN); }
+        if (a != 0) { hctx = alloc_via(a, _TLS_SHA256_CTX_LEN); }
         if (hctx == 0) { return 0; }
         sha256_init_into(hctx);
     }
     if (hash_algo == TLS_HASH_SHA384) {
-        if (a == 0) { hctx = alloc(TLS_SHA384_CTX_LEN); }
-        if (a != 0) { hctx = alloc_via(a, TLS_SHA384_CTX_LEN); }
+        if (a == 0) { hctx = alloc(_TLS_SHA384_CTX_LEN); }
+        if (a != 0) { hctx = alloc_via(a, _TLS_SHA384_CTX_LEN); }
         if (hctx == 0) { return 0; }
         sha384_init_into(hctx);
     }
@@ -302,11 +308,11 @@ fn tls_native_transcript_digest(state, digest_out): i64 {
     # leak on the global bump. Consumed by sha*_finalize before return.
     var clone[_TLS_SHA384_CTX_LEN];
     if (algo == TLS_HASH_SHA256) {
-        memcpy(&clone, hctx, TLS_SHA256_CTX_LEN);
+        memcpy(&clone, hctx, _TLS_SHA256_CTX_LEN);
         sha256_finalize(&clone, digest_out);
         return TLS_HASH_SHA256_LEN;
     }
-    memcpy(&clone, hctx, TLS_SHA384_CTX_LEN);
+    memcpy(&clone, hctx, _TLS_SHA384_CTX_LEN);
     sha384_finalize(&clone, digest_out);
     return TLS_HASH_SHA384_LEN;
 }

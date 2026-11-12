@@ -147,6 +147,9 @@ fn main(): i64 {
     var rc = intercept_run(target, selftest, bound, rootpath, net_active, net_entries, net_count, net_listen_any, child_argv);
     # Restore the terminal if a TUI child armed raw mode via kbscan#42 (no-op otherwise).
     _kbscan_restore_termios();
+    # Then give back the echo a console_mode#110 NOECHO still hides (1.12.1; no-op otherwise). This
+    # runs second on purpose: kbscan's saved termios is a hidden one if NOECHO came first.
+    _cm_restore_termios();
     return rc;
 }
 

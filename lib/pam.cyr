@@ -10,8 +10,10 @@
 #   argv: [ "unix_chkpwd", username, mode ]
 #     where mode is "nullok" (accept empty passwords — typical for
 #     interactive auth) or "nonull" (reject empty).
-#   stdin: the password bytes, no trailing NUL or newline; close
-#          the write end when done to send EOF.
+#   stdin: the password bytes FOLLOWED BY ONE NUL (no newline); close
+#          the write end when done to send EOF. Without the NUL the
+#          helper reads no password at all (6.7.18 — see the write).
+#          At most PAM_MAX_RESP_SIZE (512) password bytes are read.
 #   stdout/stderr: ignored.
 #   exit status: 0 = password correct, non-zero = fail.
 #
@@ -41,11 +43,26 @@ var PAM_AUTH_PIPE_FAILED    = 0 - 3;
 var PAM_AUTH_FORK_FAILED    = 0 - 4;
 var PAM_AUTH_EXEC_FAILED    = 0 - 5;
 
+# The longest password pam_unix_authenticate passes on: unix_chkpwd reads at most
+# PAM_MAX_RESP_SIZE (512) bytes, so a longer one could never be checked whole. CHANGELOG [6.7.18]
+# The const is the bound and sizes the stack copy the password is written from; the public var
+# only tells a caller the value — read as the bound, raising it memcpy'd a longer password over
+# that copy (lib_buffers_sized_by_const.sh axis 6). CHANGELOG [6.7.18]
+const _PAM_MAX_PASSWORD = 512;
+var PAM_MAX_PASSWORD = _PAM_MAX_PASSWORD;
+
+# Test-only seams (nothing outside tests/ sets them): `_pam_chkpwd_test`, a stand-in helper path
+# used instead of unix_chkpwd; `_pam_write_hook`, a fn the parent calls just before it writes the
+# password (a row lands the helper's exit there).
+var _pam_chkpwd_test = 0;
+var _pam_write_hook = 0;
+
 # Locate the unix_chkpwd helper. Returns the absolute path or 0.
 fn _pam_find_chkpwd(): i64 {
     #ifndef CYRIUS_TARGET_LINUX
     return 0;    # Linux-PAM only — see pam_unix_authenticate
     #endif
+    if (_pam_chkpwd_test != 0) { return _pam_chkpwd_test; }
     # /usr/sbin is the documented Linux-PAM location; Arch and some
     # others unify to /usr/bin via the usr-merge. Probe both.
     var p1 = "/usr/sbin/unix_chkpwd";
@@ -57,7 +74,7 @@ fn _pam_find_chkpwd(): i64 {
     return 0;
 }
 
-# Verify `password` (cstring, no terminator in the pipe) for
+# Verify `password` (cstring, sent with its NUL) for
 # `user`. Forks a child, pipes the password to unix_chkpwd's
 # stdin, waits for exit.
 #
@@ -66,7 +83,10 @@ fn _pam_find_chkpwd(): i64 {
 #    PAM_AUTH_FAIL (1)          — rejected (wrong password, locked,
 #                                  disabled, …), or the helper's verdict
 #                                  was never observed (waitpid failed —
-#                                  e.g. an inherited SIGCHLD = SIG_IGN)
+#                                  e.g. an inherited SIGCHLD = SIG_IGN),
+#                                  or the password is longer than
+#                                  PAM_MAX_PASSWORD (512) bytes, or it
+#                                  could not be written to the helper
 #    PAM_AUTH_HELPER_MISSING    — unix_chkpwd not on system
 #    PAM_AUTH_PIPE_FAILED       — syscall(pipe) errored
 #    PAM_AUTH_FORK_FAILED       — syscall(fork) errored
@@ -87,6 +107,19 @@ fn pam_unix_authenticate(user, password): i64 {
     #endif
     #ifdef CYRIUS_TARGET_LINUX
 
+    # ⛔ CYRIUS-2026-0050: one unchecked write of the whole password into the pipe, its read end
+    # already closed here. Past the pipe's 64 KiB the write blocked; unix_chkpwd read its bounded
+    # prefix and exited, the write took EPIPE, and SIGPIPE at its default disposition killed the
+    # CALLER — a remote client of a password-checking daemon ended the whole server pre-auth
+    # (exit 141); a helper that exited before reading did the same. Now a password past
+    # PAM_MAX_PASSWORD is refused before anything runs (the helper could never check it whole),
+    # and the parent keeps the pipe's read end until its write is done — pam_unix's own `close
+    # (fds[0])` after the write — so the pipe always has a reader and the write can never raise
+    # SIGPIPE; a write that still fails is PAM_AUTH_FAIL once the helper is reaped. nullok is
+    # kept (the user, 2026-10-22). CHANGELOG [6.7.18]
+    var plen = strlen(password);
+    if (plen > _PAM_MAX_PASSWORD) { return PAM_AUTH_FAIL; }
+
     var fds[8];
     var pr = sys_pipe(&fds);
     if (pr < 0) { return PAM_AUTH_PIPE_FAILED; }
@@ -101,10 +134,12 @@ fn pam_unix_authenticate(user, password): i64 {
     }
 
     if (pid == 0) {
-        # Child: wire rfd → stdin, close the rest, exec helper.
+        # Child: wire rfd → stdin, close the rest, exec helper. rfd may already BE 0 (a parent
+        # started with stdin closed gets the pipe as (0, n)): dup2(0, 0) is a no-op, and closing
+        # rfd then closed the helper's stdin, so it read no password. CHANGELOG [6.7.15]
         sys_close(wfd);
         sys_dup2(rfd, 0);
-        sys_close(rfd);
+        if (rfd != 0) { sys_close(rfd); }
 
         var argv[40];   # N BYTES (CLAUDE.md buffer contract): 4 ptrs = 32 B.
         store64(&argv,      helper);     # was argv[4]/envp[1] = 8 B each → envp[0]
@@ -119,12 +154,30 @@ fn pam_unix_authenticate(user, password): i64 {
         sys_exit(127);                   # only reached if execve failed
     }
 
-    # Parent: send password bytes, close write end → EOF for child.
-    sys_close(rfd);
-    var plen = strlen(password);
-    if (plen > 0) {
-        sys_write(wfd, password, plen);
+    # Parent: send the password and its terminating NUL, close write end → EOF for child. `rfd`
+    # stays open until the write is done (above). At most 513 bytes: well under any pipe's
+    # capacity, so it never blocks.
+    # ⛔ The NUL is the protocol: unix_chkpwd (Linux-PAM >= 1.1, pam_read_passwords) takes a
+    # password only up to a NUL, and bytes with none read as NO password — "" — so without it a
+    # correct password never verified, and with nullok an account with an empty hash accepted
+    # ANY password. Measured against a stand-in /etc/shadow (user + mount namespace): "hunter2"
+    # unterminated -> 7, "hunter2\0" -> 0; an empty hash, "anything" unterminated -> 0. pam_unix
+    # writes the password then "" the same way (support.c). CHANGELOG [6.7.18]
+    var pbuf[_PAM_MAX_PASSWORD + 8];   # the password + its NUL, in BYTES; wiped after the write
+    memcpy(&pbuf, password, plen);
+    store8(&pbuf + plen, 0);
+    var tlen = plen + 1;
+    if (_pam_write_hook != 0) { fncall0(_pam_write_hook); }
+    var wbad = 0;
+    var off = 0;
+    while (off < tlen) {
+        var wn = sys_write(wfd, &pbuf + off, tlen - off);
+        if (wn == 0 - 4) { continue; }       # EINTR
+        if (wn <= 0) { wbad = 1; break; }
+        off += wn;
     }
+    memset(&pbuf, 0, _PAM_MAX_PASSWORD + 8);
+    sys_close(rfd);
     sys_close(wfd);
 
     # Only a wait that returned THIS pid wrote status_buf. Under an inherited SIGCHLD = SIG_IGN
@@ -139,8 +192,9 @@ fn pam_unix_authenticate(user, password): i64 {
     var status = load32(&status_buf);
 
     if (WIFEXITED(status) == 1) {
-        if (WEXITSTATUS(status) == 0) { return PAM_AUTH_OK; }
         if (WEXITSTATUS(status) == 127) { return PAM_AUTH_EXEC_FAILED; }
+        if (wbad == 1) { return PAM_AUTH_FAIL; }   # the helper never had the whole password
+        if (WEXITSTATUS(status) == 0) { return PAM_AUTH_OK; }
         return PAM_AUTH_FAIL;
     }
     # Signalled or stopped: treat as fail.
@@ -152,8 +206,7 @@ fn pam_unix_authenticate(user, password): i64 {
 # 0 otherwise. Consumers should gate on this before advertising
 # that they support password auth.
 fn pam_unix_available(): i64 {
-    if (_pam_find_chkpwd() == 0) { return 0; }
-    return 1;
+    return _pam_find_chkpwd() != 0;
 }
 
 # v5.8.31 — PamError variants. Maps the int-return contract of

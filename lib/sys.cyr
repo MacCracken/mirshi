@@ -417,17 +417,23 @@ fn sysinfo_blk_write(buf, tag): i64 {
 # unwritten, so the slot is pre-filled with -1 and comes back unchanged), or -errno.
 # Not wired off agnos (-ENOSYS): Linux's nearest figure, /proc/interrupts' RES row, counts
 # kicks RECEIVED per CPU, which is a different number. CHANGELOG [6.6.7]
+# The decline is -ENOSYS in the host's numbering: -78 on macOS (Darwin's ENOSYS; 38 is its
+# ENOTSOCK), -38 elsewhere. CHANGELOG [6.7.16]
 fn sys_sched_kicks(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # Sized by the same constant as the length passed below: the kernel writes that many. (6.6.7
     # spelled it as the literal 208 because an enum constant past var index 1024 did not fold,
     # and a program with the folded stdlibs in scope reaches that index before this line — fixed
-    # at 6.6.8, so the constant is back.) agnos_sysinfo_tail_parity pins FULL at 208. CHANGELOG [6.6.8]
+    # at 6.6.8, so the constant is back.) SYSINFO_SIZE_FULL above is 208; the cross-repo parity
+    # check against agnos's kernel is agnos's own CI's job since 6.7.16. CHANGELOG [6.6.8]
     var buf[SYSINFO_SIZE_FULL];
     store64(&buf + SI_SCHED_KICKS, 0 - 1);
     var r = sys_sysinfo_n(&buf, SYSINFO_SIZE_FULL);
     if (r < 0) { return r; }
     return load64(&buf + SI_SCHED_KICKS);
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     return 0 - 38;
@@ -513,8 +519,9 @@ fn system_free_memory(): i64 {
 # Thread id. agnos is single-threaded (no separate tid concept) → routes to
 # getpid; Linux issues SYS_GETTID. macOS (Darwin's thread-id is __thread_selfid,
 # NOT the Linux-numbered SYS_GETTID the macOS peer mis-copies) and Windows
-# (GetCurrentThreadId, no raw-syscall path) are not yet wired → -ENOSYS, the
-# same "not wired" convention sys_uname/sys_sysinfo use for these targets above.
+# (GetCurrentThreadId, no raw-syscall path) are not yet wired → -ENOSYS in the
+# host's numbering: -78 on macOS (Darwin's ENOSYS, as every macOS decline answers;
+# 38 is its ENOTSOCK), -38 on Windows and cx. CHANGELOG [6.7.16]
 fn sys_gettid(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_getpid();
@@ -523,7 +530,7 @@ fn sys_gettid(): i64 {
     return syscall(SYS_GETTID);
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    return 0 - 38;   # ENOSYS — Darwin __thread_selfid not yet wired
+    return 0 - 78;   # Darwin's ENOSYS — __thread_selfid not yet wired
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows GetCurrentThreadId not yet wired

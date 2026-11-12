@@ -38,6 +38,9 @@ include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fnptr.cyr"
+# 6.7.18: the DNS query encoder and answer parser write and read through fn-local [u8] slices,
+# checked in every build. CHANGELOG [6.7.18]
+include "lib/slice.cyr"
 
 # 6.6.10: async_run_process's deadline ends the child's whole tree through lib/process.cyr's
 # `proc_kill_tree`. Named here so this module stays self-sufficient, under the SAME guard as
@@ -206,7 +209,7 @@ fn _async_step(rt): i64 {
             }
         }
         if (load64(t + 16) != TASK_DONE) {
-            active = active + 1;
+            active += 1;
         }
         t = load64(t + 24);
     }
@@ -224,21 +227,18 @@ fn _async_poll(rt, timeout): i64 {
     # v6.5.26 — room for 8 ready fds per wait, not 1. maxevents was 1, so even with
     # several fds ready the reactor woke one task per syscall; with multiple waiters
     # that is a needless round trip per direction.
-    var evbuf[128];
+    var evbuf[128];                    # 8 events at EPOLL_EVENT_SIZE (12 x86_64, 16 aarch64)
     var nr = sys_epoll_wait(epfd, &evbuf, 8, timeout);
     var ei = 0;
     while (ei < nr) {
-        var eoff = ei * 16;
-        var fired = load32(&evbuf + eoff);
-        # epoll_event.data offset is ABI-dependent: x86_64 has EPOLL_PACKED
-        # (data @4); aarch64 leaves the struct unpacked so the u64 aligns to @8.
-        # Must match the write in _async_wait_events. (CHANGELOG [6.4.42])
-        #ifdef CYRIUS_ARCH_AARCH64
-        var wfd = load64(&evbuf + eoff + 8);
-        #endif
-        #ifndef CYRIUS_ARCH_AARCH64
-        var wfd = load64(&evbuf + eoff + 4);
-        #endif
+        # The peer's readers and stride: epoll_event's layout is ABI-dependent (x86_64 packs it,
+        # data @4, 12 bytes; aarch64 does not, data @8, 16 bytes) and must match the writes in
+        # _async_wait_events / the MOD below. The stride was 16 on every arch, so on x86_64 the
+        # 2nd..8th event of one wait were read 4, 8, … bytes off — a stale or garbage fd, the
+        # real one re-reported only by the next wait. CHANGELOG [6.7.12]
+        var ev = &evbuf + ei * EPOLL_EVENT_SIZE;
+        var fired = epoll_event_events(ev);
+        var wfd = epoll_event_data(ev);
         # v6.5.26 — data is the FD, so resolve it to EVERY parked task waiting on
         # it whose mask intersects what actually fired. Previously data was a single
         # task pointer and exactly one task could ever be woken per fd.
@@ -268,16 +268,10 @@ fn _async_poll(rt, timeout): i64 {
             syscall(SYS_EPOLL_CTL, epfd, 2, wfd, 0);   # EPOLL_CTL_DEL
         } else {
             var rev[16];
-            store32(&rev, rem);
-            #ifdef CYRIUS_ARCH_AARCH64
-            store64(&rev + 8, wfd);
-            #endif
-            #ifndef CYRIUS_ARCH_AARCH64
-            store64(&rev + 4, wfd);
-            #endif
+            epoll_event_set(&rev, rem, wfd);
             syscall(SYS_EPOLL_CTL, epfd, 3, wfd, &rev);   # EPOLL_CTL_MOD
         }
-        ei = ei + 1;
+        ei += 1;
     }
     return nr;
 }
@@ -286,9 +280,9 @@ fn _async_poll(rt, timeout): i64 {
 # watches one, async_with_timeout races a task against a deadline sentinel — or, when
 # both are 0, until the runtime is idle (async_run). Does NOT close the epfd.
 fn _async_pump(rt, until_a, until_b): i64 {
-    while (1 == 1) {
-        if (until_a != 0) { if (load64(until_a + 16) == TASK_DONE) { return 0; } }
-        if (until_b != 0) { if (load64(until_b + 16) == TASK_DONE) { return 0; } }
+    loop {
+        if (until_a != 0 && load64(until_a + 16) == TASK_DONE) { return 0; }
+        if (until_b != 0 && load64(until_b + 16) == TASK_DONE) { return 0; }
         if (_async_step(rt) == 0) { return 0; }
     }
 }
@@ -322,34 +316,34 @@ fn async_join_all(rt, handles, n, results): i64 {
     var i = 0;
     while (i < n) {
         store64(results + i * 8, task_join(rt, load64(handles + i * 8)));
-        i = i + 1;
+        i += 1;
     }
     return n;
+}
+
+# The index of the first DONE task in handles[0..n), or -1. A 0 handle (an OOM-failed spawn) is
+# skipped.
+fn _async_first_done(handles, n): i64 {
+    for (var i = 0; i < n; i += 1) {
+        var h = load64(handles + i * 8);
+        if (h != 0 && load64(h + 16) == TASK_DONE) { return i; }
+    }
+    return 0 - 1;
 }
 
 # Await the FIRST task in handles[0..n) to complete; returns its index (0..n-1), or -1
 # if the runtime went idle with none done. The other tasks are left pending (the caller
 # may task_join or retire them). v6.4.37 (P3 — tokio's select!).
 fn async_select(rt, handles, n): i64 {
-    while (1 == 1) {
-        var i = 0;
-        while (i < n) {
-            var hnd = load64(handles + i * 8);          # null-guard: OOM-failed spawn → 0
-            if (hnd != 0) { if (load64(hnd + 16) == TASK_DONE) { return i; } }
-            i = i + 1;
-        }
+    loop {
+        var d = _async_first_done(handles, n);
+        if (d >= 0) { return d; }
         if (_async_step(rt) == 0) {
             # The step that idled the runtime may itself have completed a watched handle
             # (a task that runs to DONE and drives active→0 in the SAME sweep is not
             # counted as active). Re-scan once before reporting "none done" — otherwise a
             # select over the last/only live task returns -1 instead of its index.
-            i = 0;
-            while (i < n) {
-                var hd = load64(handles + i * 8);
-                if (hd != 0) { if (load64(hd + 16) == TASK_DONE) { return i; } }
-                i = i + 1;
-            }
-            return 0 - 1;
+            return _async_first_done(handles, n);
         }
     }
 }
@@ -371,7 +365,7 @@ fn _async_fd_mask(rt, fd): i64 {
     var t = load64(rt + 8);
     while (t != 0) {
         if (load64(t + 16) == TASK_WAITING) {
-            if (load64(t + 32) == fd) { m = m | load64(t + 56); }
+            if (load64(t + 32) == fd) { m |= load64(t + 56); }
         }
         t = load64(t + 24);
     }
@@ -389,20 +383,14 @@ fn _async_wait_events(rt, fd, events): i64 {
     store64(cur + 16, TASK_WAITING); # park
     var mask = _async_fd_mask(rt, fd);
     var ev[16];
-    store32(&ev, mask);              # EPOLLIN (1) / EPOLLOUT (4) / union
     # v6.5.26 — epoll_data now carries the FD, not the task pointer. With a task pointer
     # an fd could identify exactly ONE waiter, which is the whole reason two concurrent
     # directions on one fd (or two tasks on one listener) were inexpressible. The fd is
     # the stable key; _async_step resolves it back to every matching parked task.
-    # Offset is ABI-dependent: x86_64 packs the struct (EPOLL_PACKED → data @4); aarch64
-    # leaves it unpacked so the u64 aligns to @8. The wake read in _async_step must use
-    # the same offset. (CHANGELOG [6.4.42])
-    #ifdef CYRIUS_ARCH_AARCH64
-    store64(&ev + 8, fd);
-    #endif
-    #ifndef CYRIUS_ARCH_AARCH64
-    store64(&ev + 4, fd);
-    #endif
+    # The mask is EPOLLIN (1) / EPOLLOUT (4) / the union. The data offset is the peer's
+    # (x86_64 packs the struct, data @4; aarch64 does not, data @8): epoll_event_set writes
+    # it where _async_step's epoll_event_data reads it. CHANGELOG [6.7.14]
+    epoll_event_set(&ev, mask, fd);
     # ⛔ CHECK THE RETURN. EPOLL_CTL_ADD on an fd already in the set returns -EEXIST, and
     # ignoring that is exactly how the second waiter used to be lost: it parked, its fd was
     # never (re)registered with its event bit, and nothing ever woke it. On -EEXIST the fd
@@ -604,14 +592,21 @@ fn _async_recv_task(ctx): i64 {
 # count (0 = EOF, <0 = error). One read per call — a full-message read re-spawns per
 # chunk (streaming with backpressure awaits the mid-body-suspend follow-on). v6.4.39.
 fn async_recv(rt, fd, buf, len): i64 {
-    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
-    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
+    return _async_io_spawn(rt, &_async_recv_task, fd, buf, len);
+}
+
+# Spawn the one-shot recv / send task `fp` with ctx = { step 0, fd, buf, len, rt }, the ctx from
+# rt's allocator (arena-reclaimable). 0 when that allocation is refused: no task (async_spawn's own
+# OOM answer, CHANGELOG [6.6.10]). The one body async_recv and async_send each open-coded.
+fn _async_io_spawn(rt, fp, fd, buf, len): i64 {
+    var ctx = alloc_via(load64(rt + 32), 40);
+    if (ctx == 0) { return 0; }
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
     store64(ctx + 24, len);
     store64(ctx + 32, rt);
-    return async_spawn(rt, &_async_recv_task, ctx);
+    return async_spawn(rt, fp, ctx);
 }
 
 # Reactor socket send task: park on the fd's write-readiness, then write once from buf.
@@ -630,14 +625,7 @@ fn _async_send_task(ctx): i64 {
 # `len` bytes from `buf`. Returns a task handle whose result (via task_join) is the byte
 # count written (<0 = error). One write per call. v6.4.39.
 fn async_send(rt, fd, buf, len): i64 {
-    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
-    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
-    store64(ctx, 0);
-    store64(ctx + 8, fd);
-    store64(ctx + 16, buf);
-    store64(ctx + 24, len);
-    store64(ctx + 32, rt);
-    return async_spawn(rt, &_async_send_task, ctx);
+    return _async_io_spawn(rt, &_async_send_task, fd, buf, len);
 }
 
 # ================================================================
@@ -645,46 +633,57 @@ fn async_send(rt, fd, buf, len): i64 {
 # wire-format; ported from the sandhi resolver so async.cyr stays sandhi-free).
 # ================================================================
 
-# Encode a hostname (C-string) into DNS label wire-format at `out`. Returns length.
+# Encode a hostname (C-string) into DNS label wire-format at `out`, which holds at least 255 bytes
+# (the longest name DNS carries). Returns the length written (the host's + 2), or -1 for a name DNS
+# cannot carry — empty, over 253 bytes, an empty label ("a..b", ".a", "a.") or a label over 63 bytes.
+# ⛔ CYRIUS-2026-0038 (6.7.18): the walk wrote every host byte as it went and checked the total
+# (`wi > 255`) only after the loop, so a long host — or 300 one-byte labels, each passing the
+# 63-byte rule — wrote host length + 12 bytes past the resolver task's 288-byte stack query buffer,
+# over its return address. The length is now taken first and an over-long name refused before a
+# byte is written, as lib/net.cyr's _net_dns_build does; every store goes through a slice of
+# exactly the encoded length, so even a mis-counted store traps. CHANGELOG [6.7.18]
 fn _async_dns_encode_labels(host, out): i64 {
+    var hl = 0;
+    while (load8(host + hl) != 0) {
+        hl += 1;
+        if (hl > 253) { return 0 - 1; }
+    }
+    if (hl == 0) { return 0 - 1; }
+    var o: [u8] = 0;
+    slice_set(&o, out, hl + 2);
     var label_start = 0;
     var p = 0;
     var wi = 1;                         # +1: leaves room for label 0's length byte
-    while (load8(host + p) != 0) {
+    while (p < hl) {
         var c = load8(host + p);
         if (c == 46) {                 # '.'
             var llen = p - label_start;
             if (llen == 0) { return 0 - 1; }
             if (llen > 63) { return 0 - 1; }
-            store8(out + (wi - llen - 1), llen);
+            o[wi - llen - 1] = llen;
             label_start = p + 1;
-            wi = wi + 1;
         } else {
-            store8(out + wi, c);
-            wi = wi + 1;
+            o[wi] = c;
         }
-        p = p + 1;
+        wi += 1;
+        p += 1;
     }
     var last_len = p - label_start;
     if (last_len == 0) { return 0 - 1; }
     if (last_len > 63) { return 0 - 1; }
-    store8(out + (wi - last_len - 1), last_len);
-    store8(out + wi, 0);               # root terminator
-    wi = wi + 1;
-    if (wi > 255) { return 0 - 1; }
-    return wi;
+    o[wi - last_len - 1] = last_len;
+    o[wi] = 0;                         # root terminator
+    return wi + 1;
 }
 
-# Build a DNS A-record query (txid `id`, hostname `host`) into `out`. Returns length.
+# Build a DNS A-record query (txid `id`, hostname `host`) into `out`, which holds at least 271
+# bytes (12 header + 255 name + 4). Returns length, or -1 (see _async_dns_encode_labels).
 fn _async_dns_build_query(id, host, out): i64 {
+    memset(out, 0, 12);                # ANCOUNT, NSCOUNT, ARCOUNT and the rest: 0
     store8(out + 0, (id >> 8) & 0xFF);
     store8(out + 1, id & 0xFF);
     store8(out + 2, 0x01);             # flags MSB: RD=1
-    store8(out + 3, 0x00);
-    store8(out + 4, 0x00); store8(out + 5, 0x01);   # QDCOUNT=1
-    store8(out + 6, 0x00); store8(out + 7, 0x00);
-    store8(out + 8, 0x00); store8(out + 9, 0x00);
-    store8(out + 10, 0x00); store8(out + 11, 0x00);
+    store8(out + 5, 0x01);             # QDCOUNT=1
     var qlen = _async_dns_encode_labels(host, out + 12);
     if (qlen < 0) { return 0 - 1; }
     var qi = 12 + qlen;
@@ -693,21 +692,27 @@ fn _async_dns_build_query(id, host, out): i64 {
     return qi + 4;
 }
 
-# Skip a DNS name at `off` (labels + 0xC0 compression pointer). Returns offset past it.
+# Skip a DNS name at `off` (labels + 0xC0 compression pointer). Returns offset past it, or -1 when
+# it runs off the end of buf[0, blen), uses a reserved label type, or has more than 256 labels.
+# 6.7.18 (D1): every byte is read through a slice of buf[0, blen) — checked in every build, so a
+# bound this fn gets wrong is `slice bounds violation`, never a read past the datagram.
+# CHANGELOG [6.7.18]
 fn _async_dns_skip_name(buf, blen, off): i64 {
+    var s: [u8] = 0;
+    slice_set(&s, buf, blen);
     var p = off;
     var safety = 0;
     while (safety < 256) {
-        if (p >= blen) { return 0 - 1; }
-        var c = load8(buf + p);
+        if (p < 0 || p >= blen) { return 0 - 1; }
+        var c = s[p];
         if (c == 0) { return p + 1; }
         if ((c & 0xC0) == 0xC0) {
             if (p + 1 >= blen) { return 0 - 1; }
             return p + 2;
         }
         if (c > 63) { return 0 - 1; }
-        p = p + 1 + c;
-        safety = safety + 1;
+        p += 1 + c;
+        safety += 1;
     }
     return 0 - 1;
 }
@@ -715,34 +720,34 @@ fn _async_dns_skip_name(buf, blen, off): i64 {
 # Parse a DNS response: verify the txid + rcode, skip the question, and return the
 # first A record's IPv4 (network-order bytes as an int, ready for async_connect), or
 # -1. Pragmatic — returns the first A answer (no CNAME-chain / name-match validation).
+# 6.7.18 (D1): every read goes through a slice of buf[0, blen) — single bytes as `r[i]`, the
+# 16-bit fields through slice_get_be — checked in every build. CHANGELOG [6.7.18]
 fn _async_dns_parse_a(buf, blen, expected_id): i64 {
     if (blen < 12) { return 0 - 1; }
-    if (((load8(buf + 0) << 8) | load8(buf + 1)) != expected_id) { return 0 - 1; }
-    if ((load8(buf + 3) & 0x0F) != 0) { return 0 - 1; }        # rcode
-    var ancount = (load8(buf + 6) << 8) | load8(buf + 7);
+    var r: [u8] = 0;
+    slice_set(&r, buf, blen);
+    if (slice_get_be(&r, 0, 2) != expected_id) { return 0 - 1; }
+    if ((r[3] & 0x0F) != 0) { return 0 - 1; }                 # rcode
+    var ancount = slice_get_be(&r, 6, 2);
     if (ancount == 0) { return 0 - 1; }
     var off = _async_dns_skip_name(buf, blen, 12);             # skip the question name
     if (off < 0) { return 0 - 1; }
-    off = off + 4;                                             # QTYPE + QCLASS
+    off += 4;                                             # QTYPE + QCLASS
     var i = 0;
     while (i < ancount) {
         off = _async_dns_skip_name(buf, blen, off);
         if (off < 0) { return 0 - 1; }
         if (off + 10 > blen) { return 0 - 1; }
-        var rtype = (load8(buf + off + 0) << 8) | load8(buf + off + 1);
-        var rdlength = (load8(buf + off + 8) << 8) | load8(buf + off + 9);
-        off = off + 10;
+        var rtype = slice_get_be(&r, off, 2);
+        var rdlength = slice_get_be(&r, off + 8, 2);
+        off += 10;
         if (rtype == 1) {
             if (rdlength != 4) { return 0 - 1; }
             if (off + 4 > blen) { return 0 - 1; }
-            var b0 = load8(buf + off);
-            var b1 = load8(buf + off + 1);
-            var b2 = load8(buf + off + 2);
-            var b3 = load8(buf + off + 3);
-            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            return r[off] | (r[off + 1] << 8) | (r[off + 2] << 16) | (r[off + 3] << 24);
         }
-        off = off + rdlength;
-        i = i + 1;
+        off += rdlength;
+        i += 1;
     }
     return 0 - 1;
 }
@@ -918,18 +923,18 @@ fn async_with_timeout(rt, handle, ms): i64 {
 fn _async_interval_task(ctx): i64 {
     var tfd = load64(ctx + 24);
     var tok = load64(ctx + 40);                   # cancel-token CELL (0 = never cancel)
-    if (tok != 0) { if (load64(tok) != 0) {       # cancel-token cell signalled?
-            syscall(SYS_CLOSE, tfd);
-            return 0;
-        } }
+    if (tok != 0 && load64(tok) != 0) {           # cancel-token cell signalled?
+        syscall(SYS_CLOSE, tfd);
+        return 0;
+    }
     if (load64(ctx) == 1) {
         var buf[8];
         syscall(SYS_READ, tfd, &buf, 8);          # drain the tick(s)
         fncall1(load64(ctx + 8), load64(ctx + 16));   # fp(arg)
-        if (tok != 0) { if (load64(tok) != 0) {   # callback may have cancelled
-                syscall(SYS_CLOSE, tfd);
-                return 0;
-            } }
+        if (tok != 0 && load64(tok) != 0) {       # callback may have cancelled
+            syscall(SYS_CLOSE, tfd);
+            return 0;
+        }
     }
     store64(ctx, 1);
     async_wait_fd(load64(ctx + 32), tfd);         # park for the next tick
@@ -1185,8 +1190,7 @@ fn async_read(fd, buf, len): i64 {
 # wait ran on an EMPTY set — a file read as a timeout and a closed fd hung for ever with
 # `ms` < 0 — and the kernel truncated `ms` to an int. CHANGELOG [6.6.20]
 fn async_await_readable_ms(fd, ms): i64 {
-    if (fd_wait_ready(fd, 0, ms) == 1) { return 1; }
-    return 0;
+    return fd_wait_ready(fd, 0, ms) == 1;
 }
 
 # Wait for fd to be readable (blocks without limit).
@@ -1236,13 +1240,7 @@ fn async_timeout(fp, arg, ms): i64 {
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     if (epfd >= 0) {
         var ev[16];
-        store32(&ev, 1);
-        #ifdef CYRIUS_ARCH_AARCH64
-        store64(&ev + 8, rfd);        # epoll_data @8 on aarch64 (unpacked); @4 on x86 (v6.4.42)
-        #endif
-        #ifndef CYRIUS_ARCH_AARCH64
-        store64(&ev + 4, rfd);
-        #endif
+        epoll_event_set(&ev, 1, rfd);  # EPOLLIN, data = the read end, in the peer's layout
         var nr = 0;
         if (syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev) >= 0) {
             var revents[16];
@@ -1388,7 +1386,7 @@ fn async_write_unlock(lk): i64 {
 # awaited (or spawned + run) — matching the cooperative runtime above, where a
 # Future is exactly a task with its arguments bundled in.
 #
-# The argc word carries two compiler-set markers (src/frontend/parse_fn.cyr
+# The argc word carries two compiler-set markers (src/frontend/parse/fn/def.cyr
 # `_async_argc_word`; the compiler and this file ship in LOCKSTEP):
 #   FUT_MEMO (256) — a compiler-built PLAIN Future, laid out
 #                    `[fp, argc|256, arg0 … arg{n-1}, done, value]`. It runs its body ONCE;
@@ -1430,7 +1428,7 @@ fn future_force(fut): i64 {
 fn future_pending(fut): i64 {
     if (fut == 0) { return 0; }
     if ((load64(fut + 8) & FUT_CORO) == 0) { return 0; }
-    if (load64(fut + 24) == 0 - 1) { return 0; }   # C[state] == DONE (parse.cyr _coro_mark_done)
+    if (load64(fut + 24) == 0 - 1) { return 0; }   # C[state] == DONE (parse/state.cyr _coro_mark_done)
     return 1;
 }
 

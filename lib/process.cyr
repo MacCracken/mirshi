@@ -4,11 +4,12 @@
 #   CYRIUS_KERNEL=1) that includes it now FAILS with a clear error instead of
 #   compiling silently and faulting at runtime inside the kernel. `#` opens a comment
 #   in cyrius, so this line is inert for every host target. See PP_IS_HOST_ONLY in
-#   src/frontend/lex_pp.cyr; remove the marker if this module is ever made
+#   src/frontend/lex/pp/include.cyr; remove the marker if this module is ever made
 #   freestanding.
 # process.cyr — process management
 # Usage: include "lib/process.cyr"
-# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, vec.cyr, str.cyr.
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, vec.cyr, str.cyr;
+# and io.cyr on Linux / macOS (env_block, 6.7.16).
 #
 # v5.10.18 — was hard-blocked on `O_WRONLY` from `lib/io.cyr` for
 # the `/dev/null` redirect in `run_capture`; cyrius's own
@@ -54,6 +55,10 @@ include "lib/process_agnos.cyr"
 #ifndef CYRIUS_TARGET_WIN
 #ifndef CYRIUS_TARGET_AGNOS
 
+# The environment exec_cmd forwards is lib/io.cyr's env_block (see _read_environ_envp). io.cyr
+# includes nothing of this module, so there is no cycle. CHANGELOG [6.7.16]
+include "lib/io.cyr"
+
 # ⛔ v6.6.6 — NO CHILD THIS MODULE SPAWNS OUTLIVES ITS PARENT, AND EVERY CHILD IT WAITS
 # FOR CAN BE BOUNDED.
 #
@@ -76,9 +81,9 @@ include "lib/process_agnos.cyr"
 #     cleanup, ever, so nothing parent-side can reach the child. The kernel has to do it.
 #   * a DEADLINE — OPT-IN, and OFF by default. This is the general-purpose process module,
 #     not a test runner: `lib/sigil.cyr` drives `cryptsetup luksFormat` / `veritysetup
-#     format` through `run_capture` and `cbt/deps.cyr` drives git through `exec_capture`, so
-#     a default timeout would kill legitimate long work. An embedder that wants a bound asks
-#     for one — `proc_set_timeout_ms(120000)` — which is what the check driver now does.
+#     format` through `run_capture`, so a default timeout would kill legitimate long work.
+#     An embedder that wants a bound asks for one — `proc_set_timeout_ms(120000)` — which
+#     is what the check driver now does.
 #     0 keeps the historical behaviour exactly.
 # CHANGELOG [6.6.6]
 var _PROC_DEADLINE_MS = 0;
@@ -140,15 +145,15 @@ fn proc_timeout_ms(): i64 {
 # execve — by `_proc_child_guard` and by `spawn` (which has no guard): the mask is emptied and
 # SIGPIPE / SIGXFSZ go back to SIG_DFL (Python's `restore_signals` pair; Rust's Command empties
 # the mask and resets SIGPIPE). Every OTHER ignore is kept on purpose: a SIGHUP that `nohup`
-# ignored is the operator's choice and must reach the command. The mask half is Linux only: the
-# macOS floor declines sigprocmask (-78, no Mach-O route), so a cyrius program there cannot block
-# a signal to hand on — but a mask it inherited from its own launcher still passes through
-# (issues/2026-10-11-macos-exec-child-keeps-launcher-signal-mask.md). CHANGELOG [6.7.9]
-var _PROC_SIGXFSZ = 25;   # Linux (x86_64 and aarch64) and Darwin alike; lib/'s Signal enums have no name for it
+# ignored is the operator's choice and must reach the command. CHANGELOG [6.7.9]
+# 6.7.12 — the mask half runs on macOS too: sys_sigprocmask works there now (Darwin's 329 through
+# a shim), so a mask inherited from a launcher no longer passes through to the child. cx (its own
+# target, no signal delivery) keeps skipping it. CHANGELOG [6.7.12]
+const _PROC_SIGXFSZ = 25;   # Linux (x86_64 and aarch64) and Darwin alike; lib/'s Signal enums have no name for it
 
 fn _proc_child_signals(): i64 {
-    #ifdef CYRIUS_TARGET_LINUX
-    var empty[8];          # a kernel sigset: 8 bytes, rt_sigprocmask's sigsetsize
+    #ifndef CYRIUS_TARGET_CX
+    var empty[8];          # a sigset: 8 bytes (rt_sigprocmask's sigsetsize; Darwin reads the low 4)
     store64(&empty, 0);
     sys_sigprocmask(SIG_SETMASK, &empty, 0);
     #endif
@@ -169,7 +174,7 @@ fn _proc_child_signals(): i64 {
 # while a grandchild it started still holds the capture pipe (`_proc_end_cut_group`): by then the
 # child is reaped and its orphans reparented, so they are nobody's descendants. Only with a
 # deadline: a session of its own detaches the child from the terminal (no Ctrl-C, no /dev/tty),
-# which an unbounded call — `git` prompting for credentials through cbt/deps.cyr — must keep.
+# which an unbounded call — a `git` prompting for credentials, say — must keep.
 # PR_SET_PDEATHSIG still ends a Linux child when its parent dies. CHANGELOG [6.6.10] [6.6.11]
 fn _proc_child_guard(ppid_before): i64 {
     _proc_child_signals();
@@ -195,7 +200,7 @@ fn _proc_child_guard(ppid_before): i64 {
 # The twin of lib/regression.cyr's `_regression_kill_tree`. CHANGELOG [6.6.8]
 var _PROC_GRACE_MS = 5000;
 var _proc_tree = 0;      # i64[4096] snapshot, then a 4 KiB dirent buffer, then 64 KiB of text
-var _PROC_TREE_CAP = 4096;
+const _PROC_TREE_CAP = 4096;
 
 #ifdef CYRIUS_TARGET_LINUX
 # Append `v` (>= 0) in decimal at `p`; returns the byte after it.
@@ -203,15 +208,15 @@ fn _proc_put_dec(p, v): i64 {
     var t[24];
     var n = 0;
     if (v == 0) { store8(&t, 48); n = 1; }
-    while (v > 0) { store8(&t + n, 48 + v % 10); v = v / 10; n = n + 1; }
+    while (v > 0) { store8(&t + n, 48 + v % 10); v = v / 10; n += 1; }
     var i = 0;
-    while (i < n) { store8(p + i, load8(&t + n - 1 - i)); i = i + 1; }
+    while (i < n) { store8(p + i, load8(&t + n - 1 - i)); i += 1; }
     return p + n;
 }
 
 fn _proc_put_str(p, s): i64 {
     var i = 0;
-    while (load8(s + i) != 0) { store8(p + i, load8(s + i)); i = i + 1; }
+    while (load8(s + i) != 0) { store8(p + i, load8(s + i)); i += 1; }
     return p + i;
 }
 
@@ -235,7 +240,7 @@ fn _proc_tree_add(pid, tid, n): i64 {
                 var j = 0;
                 while (load8(nm + j) >= 48 && load8(nm + j) <= 57) { t = t * 10 + load8(nm + j) - 48; j = j + 1; }
                 if (j > 0 && load8(nm + j) == 0) { n = _proc_tree_add(pid, t, n); }
-                off = off + load16(db + off + 16);
+                off += load16(db + off + 16);
             }
             got = sys_getdents64(fd, db, 4096);
         }
@@ -252,10 +257,10 @@ fn _proc_tree_add(pid, tid, n): i64 {
         if (i < len) { c = load8(cb + i); }
         if (c >= 48 && c <= 57) { if (v < 0) { v = 0; } v = v * 10 + c - 48; }
         else {
-            if (v >= 0 && n < _PROC_TREE_CAP) { store64(_proc_tree + n * 8, v); n = n + 1; }
+            if (v >= 0 && n < _PROC_TREE_CAP) { store64(_proc_tree + n * 8, v); n += 1; }
             v = 0 - 1;
         }
-        i = i + 1;
+        i += 1;
     }
     return n;
 }
@@ -279,7 +284,7 @@ fn _proc_tree_collect(root): i64 {
     if (_proc_tree_ready() == 0) { return 0; }
     var n = _proc_tree_add(root, 0, 0);
     var i = 0;
-    while (i < n) { n = _proc_tree_add(load64(_proc_tree + i * 8), 0, n); i = i + 1; }
+    while (i < n) { n = _proc_tree_add(load64(_proc_tree + i * 8), 0, n); i += 1; }
     return n;
     #endif
     #ifndef CYRIUS_TARGET_LINUX
@@ -302,7 +307,7 @@ fn _proc_zombie(p): i64 {
     var n = sys_read(fd, &b, 511);
     sys_close(fd);
     var i = n - 1;
-    while (i > 0 && load8(&b + i) != 41) { i = i - 1; }   # the LAST ')' ends comm
+    while (i > 0 && load8(&b + i) != 41) { i -= 1; }   # the LAST ')' ends comm
     if (i <= 0 || i + 2 >= n) { return 0; }
     var st = load8(&b + i + 2);
     if (st == 90 || st == 88) { return 1; }                # 'Z' / 'X'
@@ -327,13 +332,13 @@ fn _proc_snap_sweep(snap, n, sig): i64 {
             if (sig == 9) { sys_kill(p, 9); }
             sys_waitpid(p, &st, 1);
             if (sys_kill(p, 0) == 0 && _proc_zombie(p) == 0) {
-                live = live + 1;
+                live += 1;
                 if (sig == 15 && e > 0) { sys_kill(p, 15); store64(snap + i * 8, 0 - p); }
             } else {
                 store64(snap + i * 8, 0);
             }
         }
-        i = i + 1;
+        i += 1;
     }
     return live;
 }
@@ -458,7 +463,7 @@ fn _proc_kill_wait(ks, stbuf, waited): i64 {
     while (go == 1) {
         if (_proc_kill_step(ks, stbuf) == 1) { go = 0; }
         elif (waited >= _PROC_GRACE_MS) { go = 0; }
-        else { syscall(7, 0, 0, 10); waited = waited + 10; }
+        else { syscall(7, 0, 0, 10); waited += 10; }
     }
     _proc_kill_finish(ks, stbuf);
     return 0;
@@ -505,12 +510,12 @@ fn _proc_tree_end(n): i64 {
     var live = _proc_tree_sweep(n, 15);
     while (live > 0 && waited < _PROC_GRACE_MS) {
         syscall(7, 0, 0, 10);
-        waited = waited + 10;
+        waited += 10;
         live = _proc_tree_sweep(n, 15);
     }
     _proc_tree_sweep(n, 9);
     var tries = 0;
-    while (_proc_tree_sweep(n, 0) > 0 && tries < 100) { syscall(7, 0, 0, 10); tries = tries + 1; }
+    while (_proc_tree_sweep(n, 0) > 0 && tries < 100) { syscall(7, 0, 0, 10); tries += 1; }
     return 0;
 }
 
@@ -554,7 +559,7 @@ fn _proc_subreap_begin(): i64 {
     }
     var n = _proc_tree_add(sys_getpid(), 0, 0);
     var i = 0;
-    while (i < n) { store64(_proc_sr_pre + i * 8, load64(_proc_tree + i * 8)); i = i + 1; }
+    while (i < n) { store64(_proc_sr_pre + i * 8, load64(_proc_tree + i * 8)); i += 1; }
     _proc_sr_npre = n;
     _proc_sr_open = 1;
     #endif
@@ -566,7 +571,7 @@ fn _proc_sr_had(p): i64 {
     var i = 0;
     while (i < _proc_sr_npre) {
         if (load64(_proc_sr_pre + i * 8) == p) { return 1; }
-        i = i + 1;
+        i += 1;
     }
     return 0;
 }
@@ -586,16 +591,16 @@ fn _proc_subreap_end(): i64 {
         var i = 0;
         while (i < n) {
             var p = load64(_proc_tree + i * 8);
-            if (_proc_sr_had(p) == 0) { store64(_proc_tree + k * 8, p); k = k + 1; }
-            i = i + 1;
+            if (_proc_sr_had(p) == 0) { store64(_proc_tree + k * 8, p); k += 1; }
+            i += 1;
         }
         if (k == 0) { round = 4; }
         else {
             i = 0;
-            while (i < k) { k = _proc_tree_add(load64(_proc_tree + i * 8), 0, k); i = i + 1; }
+            while (i < k) { k = _proc_tree_add(load64(_proc_tree + i * 8), 0, k); i += 1; }
             if (round == 0) { found = k; }
             _proc_tree_end(k);
-            round = round + 1;
+            round += 1;
         }
     }
     if (_proc_sr_set == 1) { sys_prctl(36, 0, 0, 0, 0); _proc_sr_set = 0; }
@@ -631,11 +636,11 @@ fn _proc_wait_deadline(pid, stbuf, timeout_ms): i64 {
         if (w == pid) { return 1; }
         if (w < 0) { proc_kill_tree(pid, stbuf); return 0 - 1; }
         syscall(7, 0, 0, slice);
-        waited = waited + slice;
+        waited += slice;
         if (waited >= 50) { slice = 10; }
         if (waited >= 2000) { slice = 50; }
     }
-    _proc_deadline_kills = _proc_deadline_kills + 1;
+    _proc_deadline_kills += 1;
     # The deadline fired and WE ended it (6.6.8: its whole tree, TERM -> grace -> KILL): 0 is
     # the truth even if an auto-reap leaves nothing to collect.
     proc_kill_tree(pid, stbuf);
@@ -656,7 +661,7 @@ fn _proc_poll_in(fd, timeout_ms): i64 {
 # Drain `fd` into `buf` (at most `buflen`), never blocking longer than `timeout_ms` WITHOUT
 # PROGRESS. The deadline is an IDLE one by design and the distinction is worth stating: a
 # child that keeps producing output is working, and killing it at a wall-clock limit would
-# break `cbt/deps.cyr`'s git and sigil's cryptsetup; a child that produces nothing and does
+# break a long `git` clone and sigil's cryptsetup; a child that produces nothing and does
 # not exit is the hang this exists to stop. The total is bounded regardless because the loop
 # also stops at `buflen`. `timeout_ms <= 0` is the historical unbounded drain.
 # Set by `_proc_read_pipe`: 1 when it stopped because the idle deadline expired, 2 when poll
@@ -686,7 +691,7 @@ fn _proc_read_pipe(fd, buf, buflen, timeout_ms): i64 {
             var n = sys_read(fd, buf + total, buflen - total);
             if (n <= 0) { rgo = 0; }
             else {
-                total = total + n;
+                total += n;
                 if (total >= buflen) { rgo = 0; }
             }
         }
@@ -703,13 +708,24 @@ fn _exec3(cmd, arg1, arg2): i64 {
     var argv[40];
     store64(&argv, cmd);
     var ai = 1;
-    if (arg1 != 0) { store64(&argv + ai * 8, arg1); ai = ai + 1; }
-    if (arg2 != 0) { store64(&argv + ai * 8, arg2); ai = ai + 1; }
+    if (arg1 != 0) { store64(&argv + ai * 8, arg1); ai += 1; }
+    if (arg2 != 0) { store64(&argv + ai * 8, arg2); ai += 1; }
     store64(&argv + ai * 8, 0);
     var envp[16];
     store64(&envp, 0);
     sys_execve(cmd, &argv, &envp);
     sys_exit(127);
+}
+
+# Point `target` (0 / 1 / 2) at `fd` and drop `fd` — unless `fd` already IS `target`. A parent
+# that started with a std fd closed hands that number to the next pipe or open (fds 0 and 1
+# closed: the capture pipe is (0, 1); fd 2 closed: the child's /dev/null opens at 2), and
+# `dup2(fd, fd)` is a no-op: closing `fd` then closed the redirect it had just made, so the
+# exec'd program started with that std fd closed and a capture read 0 bytes. CHANGELOG [6.7.15]
+fn _proc_redirect(fd, target): i64 {
+    sys_dup2(fd, target);
+    if (fd != target) { sys_close(fd); }
+    return 0;
 }
 
 # Run a command and wait for it. Returns Result(exit_code).
@@ -747,10 +763,9 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     if (pid == 0) {
         _proc_child_guard(_pg_ppid);
         sys_close(read_fd);
-        sys_dup2(write_fd, 1);
-        sys_close(write_fd);
+        _proc_redirect(write_fd, 1);
         var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (Linux/macOS native; PE backend reroutes)
-        if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
+        if (devnull >= 0) { _proc_redirect(devnull, 2); }
         _exec3(cmd, arg1, arg2);
     }
     sys_close(write_fd);
@@ -759,7 +774,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     sys_close(read_fd);
     var status_buf[4];
     var reaped = _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
-    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
+    if (cut == 1 && reaped == 1) { _proc_deadline_kills += 1; _proc_end_cut_group(pid); }
     return Ok(total);
 }
 
@@ -838,6 +853,99 @@ fn getppid(): i64 { return sys_getppid(); }
 # when the heap is exhausted — they stored through address 0 before (the alloc census,
 # tests/gates/memory/stdlib_alloc_checked_census.sh). CHANGELOG [6.6.10]
 
+# A NUL-terminated array of the pointers in vec `v` — each element's str_data when `strs` (the
+# `_str` family's Str elements), the element itself otherwise (cstr) — or 0 when the allocation
+# is refused. The argv / envp builder every exec_* verb open-coded (6.7.18).
+fn _proc_ptrs(v, strs: bool = false): i64 {
+    var n = vec_len(v);
+    var p = alloc((n + 1) * 8);
+    if (p == 0) { return 0; }
+    for (var i = 0; i < n; i += 1) {
+        var e = vec_get(v, i);
+        if (strs) { e = str_data(e); }
+        store64(p + i * 8, e);
+    }
+    store64(p + n * 8, 0);
+    return p;
+}
+
+# An empty environment: a lone NULL, or 0 when the allocation is refused.
+fn _proc_no_env(): i64 {
+    var e = alloc(8);
+    if (e == 0) { return 0; }
+    store64(e, 0);
+    return e;
+}
+
+# Fork and execve `cmd` with `argv` / `envp` — stderr to /dev/null when `quiet` — and wait under
+# proc_timeout_ms: the exit code, -2 when the deadline killed it (v6.6.6: without that the
+# deadline's own SIGKILL is indistinguishable from the child crashing, and "it never finished" is
+# a very different report from "it died"), else -1 (no fork, a signal death, never reaped). The
+# tail exec_vec, exec_env, their `_str` peers and exec_cmd each open-coded (6.7.18).
+fn _proc_exec_wait(cmd, argv, envp, quiet: bool): i64 {
+    var _pg_ppid = sys_getpid();
+    var pid = sys_fork();
+    if (pid < 0) { return 0 - 1; }
+    if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
+        if (quiet) {
+            var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
+            if (devnull >= 0) { _proc_redirect(devnull, 2); }
+        }
+        sys_execve(cmd, argv, envp);
+        sys_exit(127);
+    }
+    var stbuf[4];
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
+    var st = load32(&stbuf);
+    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
+    return 0 - 1;
+}
+
+# Fork and execve `cmd` with `argv` / `envp`, stdout into a pipe read into buf[0..buflen) under
+# proc_timeout_ms, stderr to /dev/null; report how it ended at `status_out` (see
+# exec_capture_status). Returns the bytes read, or -1 when nothing could be spawned (no pipe, no
+# fork). The body exec_capture_status and exec_capture_str each open-coded (6.7.18) — the second
+# copy never checked its pipe (CHANGELOG [6.7.18]).
+fn _proc_capture(cmd, argv, envp, buf, buflen, status_out): i64 {
+    var pipefd[16];
+    if (sys_pipe(&pipefd) < 0) { return 0 - 1; }
+    var rfd = load32(&pipefd);
+    var wfd = load32(&pipefd + 4);
+    var _pg_ppid = sys_getpid();
+    var pid = sys_fork();
+    if (pid < 0) { sys_close(rfd); sys_close(wfd); return 0 - 1; }
+    if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
+        sys_close(rfd);
+        _proc_redirect(wfd, 1);
+        var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
+        if (devnull >= 0) { _proc_redirect(devnull, 2); }
+        sys_execve(cmd, argv, envp);
+        sys_exit(127);
+    }
+    sys_close(wfd);
+    var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
+    var cut = _proc_read_cut;
+    sys_close(rfd);
+    var stbuf[4];
+    store32(&stbuf, 0 - 1);   # never a stale stack word, even if a path below forgets
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    # The reader gave up at the deadline: report THAT — unless waitpid never saw the child,
+    # which is "unknown" (-1), never a guessed -2. A poll error (cut 2) is a failure to read
+    # the child's output, reported as -1, never as the deadline. CHANGELOG [6.6.8]
+    if (cut == 1 && reaped == 1) {
+        reaped = 0;
+        _proc_deadline_kills += 1;
+        _proc_end_cut_group(pid);
+    }
+    if (cut == 2 && reaped == 1) { reaped = 0 - 1; }
+    _proc_store_status(status_out, reaped, load32(&stbuf));
+    return total;
+}
+
 # Run command with a vec of cstr argv elements. Returns exit code
 # or -1.
 # Usage: var args = vec_new(); vec_push(args, "/usr/bin/ls");
@@ -846,39 +954,12 @@ fn getppid(): i64 { return sys_getppid(); }
 # use `exec_vec_str` instead (silently fails otherwise — see family
 # header comment above).
 fn exec_vec(args): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = vec_get(args, 0);
-    # Build argv array (argc + 1 for null terminator)
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, vec_get(args, avi));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envp = alloc(8);
+    var envp = _proc_no_env();
     if (envp == 0) { return 0 - 1; }
-    store64(envp, 0);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    var stbuf[4];
-    # v6.6.6: -2 is the timeout code (module header). Without it the deadline's own SIGKILL
-    # is indistinguishable from the child crashing, and "it never finished" is a very
-    # different report from "it died".
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (reaped == 0) { return 0 - 2; }
-    if (reaped < 0) { return 0 - 1; }
-    var st = load32(&stbuf);
-    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
-    return 0 - 1;
+    return _proc_exec_wait(vec_get(args, 0), argv, envp, false);
 }
 
 # Decode a wait(2) status word into `status_out`'s two i64 slots (the shape
@@ -913,53 +994,12 @@ fn _proc_store_status(status_out, reaped, st): i64 {
 fn exec_capture_status(args, buf, buflen, status_out): i64 {
     store64(status_out, 0 - 1);
     store64(status_out + 8, 0);
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = vec_get(args, 0);
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, vec_get(args, avi));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envp = alloc(8);
+    var envp = _proc_no_env();
     if (envp == 0) { return 0 - 1; }
-    store64(envp, 0);
-    var pipefd[16];
-    if (sys_pipe(&pipefd) < 0) { return 0 - 1; }
-    var rfd = load32(&pipefd);
-    var wfd = load32(&pipefd + 4);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { sys_close(rfd); sys_close(wfd); return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        sys_close(rfd);
-        sys_dup2(wfd, 1);
-        sys_close(wfd);
-        var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
-        if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    sys_close(wfd);
-    var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
-    var cut = _proc_read_cut;
-    sys_close(rfd);
-    var stbuf[4];
-    store32(&stbuf, 0 - 1);   # never a stale stack word, even if a path below forgets
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    # The reader gave up at the deadline: report THAT — unless waitpid never saw the child,
-    # which is "unknown" (-1), never a guessed -2. A poll error (cut 2) is a failure to read
-    # the child's output, reported as -1, never as the deadline. CHANGELOG [6.6.8]
-    if (cut == 1) {
-        if (reaped == 1) { reaped = 0; _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
-    }
-    if (cut == 2) { if (reaped == 1) { reaped = 0 - 1; } }
-    _proc_store_status(status_out, reaped, load32(&stbuf));
-    return total;
+    return _proc_capture(vec_get(args, 0), argv, envp, buf, buflen, status_out);
 }
 
 # Run command with cstr args vec and capture stdout. Returns bytes
@@ -976,43 +1016,12 @@ fn exec_capture(args, buf, buflen): i64 {
 # v5.10.44: cstr-only on both args + env; Str pushers use
 # `exec_env_str`.
 fn exec_env(args, env): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = vec_get(args, 0);
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, vec_get(args, avi));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envc = vec_len(env);
-    var envp = alloc((envc + 1) * 8);
+    var envp = _proc_ptrs(env);
     if (envp == 0) { return 0 - 1; }
-    var evi = 0;
-    while (evi < envc) {
-        store64(envp + evi * 8, vec_get(env, evi));
-        evi = evi + 1;
-    }
-    store64(envp + envc * 8, 0);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
-        if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    var stbuf[4];
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (reaped == 0) { return 0 - 2; }
-    if (reaped < 0) { return 0 - 1; }
-    var st = load32(&stbuf);
-    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
-    return 0 - 1;
+    return _proc_exec_wait(vec_get(args, 0), argv, envp, true);
 }
 
 # ================================================================
@@ -1037,121 +1046,35 @@ fn exec_env(args, env): i64 {
 # or -1. Same semantics as exec_vec; the only difference is the
 # argv element shape (Str fat-pointer rather than cstr).
 fn exec_vec_str(args): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = str_data(vec_get(args, 0));
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args, strs: true);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, str_data(vec_get(args, avi)));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envp = alloc(8);
+    var envp = _proc_no_env();
     if (envp == 0) { return 0 - 1; }
-    store64(envp, 0);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    var stbuf[4];
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (reaped == 0) { return 0 - 2; }
-    if (reaped < 0) { return 0 - 1; }
-    var st = load32(&stbuf);
-    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
-    return 0 - 1;
+    return _proc_exec_wait(load64(argv), argv, envp, false);
 }
 
 # Run command with Str args vec and capture stdout. Returns bytes
-# read. buf must be pre-allocated.
+# read, or -1 when nothing could be spawned. buf must be pre-allocated.
 fn exec_capture_str(args, buf, buflen): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = str_data(vec_get(args, 0));
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args, strs: true);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, str_data(vec_get(args, avi)));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envp = alloc(8);
+    var envp = _proc_no_env();
     if (envp == 0) { return 0 - 1; }
-    store64(envp, 0);
-    var pipefd[16];
-    sys_pipe(&pipefd);
-    var rfd = load32(&pipefd);
-    var wfd = load32(&pipefd + 4);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { sys_close(rfd); sys_close(wfd); return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        sys_close(rfd);
-        sys_dup2(wfd, 1);
-        sys_close(wfd);
-        var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
-        if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    sys_close(wfd);
-    var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
-    var cut = _proc_read_cut;
-    sys_close(rfd);
-    var stbuf[4];
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
-    return total;
+    var st[16];
+    return _proc_capture(load64(argv), argv, envp, buf, buflen, &st);
 }
 
 # Run command with Str args vec + Str env vec.
 # env is a vec of "KEY=VALUE" Str pointers.
 fn exec_env_str(args, env): i64 {
-    var argc = vec_len(args);
-    if (argc < 1) { return 0 - 1; }
-    var cmd = str_data(vec_get(args, 0));
-    var argv = alloc((argc + 1) * 8);
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var argv = _proc_ptrs(args, strs: true);
     if (argv == 0) { return 0 - 1; }
-    var avi = 0;
-    while (avi < argc) {
-        store64(argv + avi * 8, str_data(vec_get(args, avi)));
-        avi = avi + 1;
-    }
-    store64(argv + argc * 8, 0);
-    var envc = vec_len(env);
-    var envp = alloc((envc + 1) * 8);
+    var envp = _proc_ptrs(env, strs: true);
     if (envp == 0) { return 0 - 1; }
-    var evi = 0;
-    while (evi < envc) {
-        store64(envp + evi * 8, str_data(vec_get(env, evi)));
-        evi = evi + 1;
-    }
-    store64(envp + envc * 8, 0);
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
-        if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
-        sys_execve(cmd, argv, envp);
-        sys_exit(127);
-    }
-    var stbuf[4];
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (reaped == 0) { return 0 - 2; }
-    if (reaped < 0) { return 0 - 1; }
-    var st = load32(&stbuf);
-    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
-    return 0 - 1;
+    return _proc_exec_wait(load64(argv), argv, envp, true);
 }
 
 # Helper: build args vec from command string (split by spaces)
@@ -1160,26 +1083,25 @@ fn exec_env_str(args, env): i64 {
 # the pre-v5.10.43 byte-or-pointer impl, would crash under the
 # new STR-path dispatch) to 32 (byte literal for space). Hits the
 # byte path of str_split's v5.10.43 runtime dispatch.
-# Read /proc/self/environ and build a NULL-terminated envp array suitable
-# for execve. Each entry points into a heap copy of the environ blob, so the
-# array outlives this call and survives across fork into the child. Returns
-# the envp array pointer, or 0 if environ can't be read (caller substitutes
-# an empty env). Mirrors getenv's /proc/self/environ source (lib/io.cyr).
+# The NULL-terminated envp array execve wants, holding this process's whole environment: the
+# block lib/io.cyr's env_block answers (getenv's, read once to its end — /proc/self/environ on
+# Linux, the entry-stack envp on macOS). Each entry points into that block, which lives for the
+# process and is only read, so the array survives fork into the child. Answers 0 when there is
+# no environment (the caller substitutes an empty one).
+# It opened /proc/self/environ itself, with ONE read of at most 65,535 bytes: macOS has no /proc,
+# so every child of exec_cmd (and the compiled cyriusly's) ran with an EMPTY environment there,
+# and on Linux a larger environment was cut, every variable past the cut gone. CHANGELOG [6.7.16]
 fn _read_environ_envp(): i64 {
-    var fd = sys_open("/proc/self/environ", 0, 0);   # 0 = O_RDONLY
-    if (fd < 0) { return 0; }
-    var blob = alloc(65536);
-    if (blob == 0) { sys_close(fd); return 0; }
-    var n = sys_read(fd, blob, 65535);
-    sys_close(fd);
-    if (n <= 0) { return 0; }
-    store8(blob + n, 0);
+    var lenb[8];
+    var blob = env_block(&lenb);
+    var n = load64(&lenb);
+    if (blob == 0 || n <= 0) { return 0; }
     # environ entries are NUL-separated; one terminator per entry.
     var count = 0;
     var i = 0;
     while (i < n) {
-        if (load8(blob + i) == 0) { count = count + 1; }
-        i = i + 1;
+        if (load8(blob + i) == 0) { count += 1; }
+        i += 1;
     }
     var envp = alloc((count + 1) * 8);
     if (envp == 0) { return 0; }
@@ -1189,10 +1111,10 @@ fn _read_environ_envp(): i64 {
     while (i < n) {
         if (load8(blob + i) == 0) {
             store64(envp + ei * 8, blob + start);
-            ei = ei + 1;
+            ei += 1;
             start = i + 1;
         }
-        i = i + 1;
+        i += 1;
     }
     store64(envp + ei * 8, 0);
     return envp;
@@ -1214,26 +1136,9 @@ fn exec_cmd(cmdline): i64 {
     store64(&argv + 16, cmdline);
     store64(&argv + 24, 0);
     var envp = _read_environ_envp();
-    if (envp == 0) {
-        envp = alloc(8);
-        if (envp == 0) { return 0 - 1; }
-        store64(envp, 0);
-    }
-    var _pg_ppid = sys_getpid();
-    var pid = sys_fork();
-    if (pid < 0) { return 0 - 1; }
-    if (pid == 0) {
-        _proc_child_guard(_pg_ppid);
-        sys_execve("/bin/sh", &argv, envp);
-        sys_exit(127);
-    }
-    var stbuf[4];
-    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (reaped == 0) { return 0 - 2; }
-    if (reaped < 0) { return 0 - 1; }
-    var st = load32(&stbuf);
-    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
-    return 0 - 1;
+    if (envp == 0) { envp = _proc_no_env(); }
+    if (envp == 0) { return 0 - 1; }
+    return _proc_exec_wait("/bin/sh", &argv, envp, false);
 }
 
 #endif

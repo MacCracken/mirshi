@@ -5,6 +5,19 @@
 
 ## Version
 
+**1.12.1** — 2026-11-12. **Toolchain `6.7.9` → `6.7.18`, with `lib/` re-vendored to the 6.7.18 bundle**
+(`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle; `cyrius.lock` regenerated).
+**Plus the agnos 1.57.13 band the 6.7.11+ stdlib issues**, all supervisor-EMULATE
+([ADR 0018](../adr/0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md)):
+- `sock_send_dl#109`: #48 with a caller ceiling, in the net band. It is on the stdlib's own socket-write
+  path, so it was a stray ENOSYS line in every socket writer.
+- `console_mode#110`: echo off/on and typeahead flush on the console tty (the first tty among fds 0/1/2).
+  The mode dies with its holder, and the echo is restored at exit and when HUP/INT/QUIT/TERM ends mirshi.
+- `fd_kind#111`: an `FdKind` for a child fd, via `pidfd_getfd` + `fstat` + `TCGETS`, and by slot for
+  mirshi's emulated event fds.
+
+Build warning-free; `cyrius test` 398/0; all 29 `scripts/it/*` gates (new: `fdkind_console.sh`,
+`send_dl.sh`) and `docker/smoke.sh` green.
 **1.12.0** — 2026-11-12. **Toolchain `6.6.20` → `6.7.9`, with `lib/` re-vendored to the 6.7.9 bundle**
 (`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle; `cyrius.lock` regenerated).
 No mirshi source change. The 6.7.9 agnos stdlib issues no new agnos syscall numbers, so the coverage matrix
@@ -144,7 +157,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.7.9` (in `cyrius.cyml [package].cyrius`); `lib/` is the full 6.7.9 snapshot,
+- **Cyrius pin**: `6.7.18` (in `cyrius.cyml [package].cyrius`); `lib/` is the full 6.7.18 snapshot,
   sha256-locked in `cyrius.lock`
 
 ## Source
@@ -245,7 +258,7 @@ paths in the child red zone + repack output structs at the exit stop
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
-  **329 assertions**, hermetic)
+  **398 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -329,6 +342,18 @@ paths in the child red zone + repack output structs at the exit stop
 - `scripts/it/winsize.sh` — 1.9.0 winsize#60 gate (after info): the no-tty default (`(cols<<16)|rows` == 80×24)
   + a pty sized to 120×40 → `TIOCGWINSZ` reports 120×40 (proves the real read, not just the fallback; the pty
   sub-test needs python3, SKIPs without).
+- `scripts/it/fdkind_console.sh` — 1.12.1 fd_kind#111 + console_mode#110 gate (after winsize):
+  - Every `FdKind` and -1 case on no-tty stdio.
+  - Piped stdin keeps its input.
+  - On a pty: refusals, FLUSH, NOECHO hide/show, NOSERIAL, a spawned holder's mode dying with it, and the
+    echo restored at exit.
+  - Stdin piped with the console on stderr.
+  - mirshi killed by SIGTERM / SIGINT while hiding the echo.
+  - The pty sub-tests need python3 and SKIP without it.
+- `scripts/it/send_dl.sh` — 1.12.1 sock_send_dl#109 gate (net band):
+  - The probe, length and dead-conn order.
+  - A 250 ms ceiling answering 0 on time against a peer that stops reading.
+  - The stdlib's own socket write delivering with no ENOSYS line.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 

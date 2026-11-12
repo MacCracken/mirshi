@@ -59,19 +59,31 @@ fn _grp_load(): i64 {
     return _grp_buf;
 }
 
-# Decimal parse. Same packed return format as lib/pwd.cyr:
-# high 32 bits = value, low 32 bits = bytes consumed.
-fn _grp_atoi_span(p, end): i64 {
-    var v = 0;
+# Parse the gid field [p, end): one optional '-', then decimal digits that run to `end`. Writes
+# the value to `out` and returns 1; returns 0 — `out` untouched — for a field that is not one
+# number end to end, and the line is skipped. ⛔ 6.7.12 — the same defect as lib/pwd.cyr's
+# `_pwd_id_field`: a digit run read unchecked made Darwin's `nobody:*:-2:` gid 0, ahead of
+# `wheel`, so `grp_getgrgid(0)` answered nobody on both Macs. CHANGELOG [6.7.12]
+fn _grp_id_field(p, end, out): i64 {
     var i = 0;
+    var neg = 0;
+    if (p < end) {
+        if (load8(p) == 45) { neg = 1; i = 1; }     # '-'
+    }
+    var v = 0;
+    var nd = 0;
     while (p + i < end) {
         var c = load8(p + i);
-        if (c < 48) { break; }
-        if (c > 57) { break; }
+        if (c < 48) { return 0; }
+        if (c > 57) { return 0; }
         v = v * 10 + (c - 48);
+        nd = nd + 1;
         i = i + 1;
     }
-    return (v << 32) | i;
+    if (nd == 0) { return 0; }
+    if (neg == 1) { v = 0 - v; }
+    store64(out, v);
+    return 1;
 }
 
 fn _grp_stash(p, n, strbuf, soff_ptr, strbufsz): i64 {
@@ -113,8 +125,8 @@ fn _grp_parse_header(line_start, line_end, grrec, strbuf, strbufsz): i64 {
     var f2_s = load64(&field_starts + 16);
     var f2_e = load64(&field_starts + 24) - 1;   # gid
 
-    var gid_pack = _grp_atoi_span(f2_s, f2_e);
-    var gid = gid_pack >> 32;
+    var gid = 0;
+    if (_grp_id_field(f2_s, f2_e, &gid) == 0) { return 0; }   # not one number: malformed (6.7.12)
 
     var name_p = _grp_stash(f0_s, f0_e - f0_s, strbuf, &soff_store, strbufsz);
     if (name_p < 0) { return 0 - 2; }
@@ -305,12 +317,13 @@ fn grp_getgrouplist(user, primary_gid, gid_buf, max): i64 {
                             if (load8(gid_end) == 58) { break; }
                             gid_end = gid_end + 1;
                         }
-                        var gpack = _grp_atoi_span(gid_start, gid_end);
-                        var g = gpack >> 32;
-                        if (g != primary_gid) {
-                            if (count >= max) { return 0 - 2; }
-                            store64(gid_buf + count * 8, g);
-                            count = count + 1;
+                        var g = 0;
+                        if (_grp_id_field(gid_start, gid_end, &g) == 1) {   # malformed: skipped (6.7.12)
+                            if (g != primary_gid) {
+                                if (count >= max) { return 0 - 2; }
+                                store64(gid_buf + count * 8, g);
+                                count = count + 1;
+                            }
                         }
                     }
                 }

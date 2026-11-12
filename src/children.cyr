@@ -19,7 +19,8 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
     # that flipping spawn#3 to EMULATE reopens (deliberately NOT
     # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 176;       # 22 x i64 fields (v1.7.0 grew it by 3: epoll / timerfd / pipe tables)
+    CHILD_REC_SIZE = 184;       # 23 x i64 fields (v1.7.0 grew it by 3: epoll / timerfd / pipe tables;
+    # 1.12.1 by 1: the console_mode#110 CM_NOSERIAL cell)
     # --- v1.6.0 signalfd#18 constants ---
     SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
     # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
@@ -57,6 +58,10 @@ enum MirshiChild {
     C_TIMERFD_TBL = 160;       # v1.7.0: this child's timerfd slot-table ptr (0 = not yet alloc'd)
     C_PIPE_TBL = 168;          # v1.7.0: RESERVED (unused in the MVP) — a watchable-pipe promotion would
     # store a supervisor-held {readfd,writefd} pair table here (ADR 0015)
+    C_CON_NOSER = 176;         # 1.12.1: console_mode#110's PER-PROCESS CM_NOSERIAL cell (0 / 1). agnos
+    # keeps it in the process's slot (proc_con_noser), so it dies with the
+    # process and a spawned child starts without it. mirshi has no serial
+    # mirror, so the bit changes no output — it is only reported back.
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
@@ -197,6 +202,18 @@ fn _emu_classify(fd): i64 {
     return KIND_REAL;
 }
 
+# fd_kind#111 (1.12.1) for one of mirshi's EMULATED ids, by its _emu_classify KIND_* code: the three
+# event fds the agnos kernel keeps as real fds (FDK_* from src/translate.cyr). A socket-tagged id
+# (bit 30) is the cyrius stdlib's own userland handle, which the kernel answers -1 for, and the
+# reserved pipe band has no ids. The caller checks the slot is OPEN first (a freed slot is a closed
+# fd: -1). Pure.
+fn fdk_from_emu_kind(kind): i64 {
+    if (kind == KIND_SIGFD) { return FDK_SIGNALFD; }
+    if (kind == KIND_TIMERFD) { return FDK_TIMERFD; }
+    if (kind == KIND_EPOLL) { return FDK_EPOLL; }
+    return 0 - 1;
+}
+
 # The number of timerfd expirations to report at `now` for a timer whose next deadline is `deadline`
 # (all ms). `interval` 0 = one-shot -> 1; periodic -> 1 + floor((now - deadline) / interval), the ticks
 # elapsed since the deadline (matching Linux timerfd's u64 expiration count). Precondition: the caller
@@ -291,6 +308,7 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_EPOLL_TBL, 0);        # v1.7.0: lazy-alloc-once tables start unallocated
             store64(b + C_TIMERFD_TBL, 0);
             store64(b + C_PIPE_TBL, 0);         # reserved (unused in the MVP)
+            store64(b + C_CON_NOSER, 0);        # 1.12.1: a new process starts without CM_NOSERIAL
             return b;
         }
         i = i + 1;

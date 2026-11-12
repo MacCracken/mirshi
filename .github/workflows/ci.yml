@@ -260,6 +260,20 @@ jobs:
         # pty sub-test SKIPs without python3). Same-uid ptrace requirement.
         run: bash scripts/it/winsize.sh
 
+      - name: fd_kind#111 + console_mode#110 (v1.12.1)
+        # v1.12.1 agnos 1.57.13 band, both EMULATE. fd_kind classifies a child fd (pidfd_getfd + fstat + TCGETS
+        # supervisor-side; mirshi's emulated event fds by slot), console_mode drives the host tty's echo/flush with
+        # the kernel's holder rule. Proves every fd kind + -1 case, piped stdin keeps its input, and on a pty:
+        # NOECHO hide/show, FLUSH, NOSERIAL, a spawned holder's mode dying with it, and the echo restored at exit
+        # (the pty sub-test SKIPs without python3). Same-uid ptrace requirement.
+        run: bash scripts/it/fdkind_console.sh
+
+      - name: Net band — sock_send_dl#109 (v1.12.1)
+        # v1.12.1: sock_send#48 with a caller ceiling (agnos 1.57.13), net-band EMULATE. Proves the kernel's
+        # argument order (the stdlib's support probe), a 250 ms ceiling answering 0 on time against a peer that
+        # stops reading (not #48's ~8 s window), and the stdlib's own socket write path with no ENOSYS line.
+        run: bash scripts/it/send_dl.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

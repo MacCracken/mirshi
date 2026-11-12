@@ -1,7 +1,9 @@
 # lib/ws_server.cyr — server-side WebSocket (RFC 6455)
 #
-# Companion to lib/ws.cyr (client-side).
-# Self-sufficient: includes syscalls.cyr, alloc.cyr, string.cyr, str.cyr, net.cyr, sha1.cyr and
+# Companion to lib/ws.cyr (client-side), which it includes: the WS_OP_* opcodes and the WS_OPEN /
+# WS_CLOSING / WS_CLOSED states are ws.cyr's enum constants, one home per name (a second copy here
+# made `cyrius distlib`'s owner rule refuse every WS_* name as a tie). CHANGELOG [6.7.12]
+# Self-sufficient: includes syscalls.cyr, alloc.cyr, string.cyr, str.cyr, net.cyr, ws.cyr, sha1.cyr and
 # two folds — bayan (base64_encode; base64.cyr was folded into it) and sandhi
 # (sandhi_server_find_header; http_server.cyr was folded into it) — whose bundles carry their
 # own requires blocks since 6.6.19 R1. CHANGELOG [6.6.19]
@@ -18,28 +20,21 @@ include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/str.cyr"
 include "lib/net.cyr"
+include "lib/ws.cyr"
 include "lib/sha1.cyr"
+# 6.7.18 (D1): the frame header, the payload and the handshake key are read through fn-local [u8]
+# slices, checked in every build. CHANGELOG [6.7.18]
+include "lib/slice.cyr"
 include "lib/bayan.cyr"
 include "lib/sandhi.cyr"
 
 # ================================================================
-# WebSocket constants
+# WebSocket constants (the opcodes and states: lib/ws.cyr's WsOpcode / WsState)
 # ================================================================
-var WS_OP_CONTINUATION = 0;
-var WS_OP_TEXT         = 1;
-var WS_OP_BINARY       = 2;
-var WS_OP_CLOSE        = 8;
-var WS_OP_PING         = 9;
-var WS_OP_PONG         = 10;
-
-var WS_OPEN    = 1;
-var WS_CLOSING = 2;
-var WS_CLOSED  = 3;
-
 var WS_MAX_PAYLOAD = 1048576;   # 1 MB cap on incoming frame payloads
 
 # Magic GUID per RFC 6455 § 1.3 — appended to client key before SHA-1.
-fn _wss_magic(): i64 { return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"; }
+const _WSS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 # ================================================================
 # SHA-1 (via lib/sha1.cyr)
@@ -82,6 +77,11 @@ fn ws_server_state(ws): i64 { return load64(ws + 8); }
 # Handshake
 # ================================================================
 
+# 1 when `c` is in the base64 alphabet (A-Z a-z 0-9 + /).
+fn _wss_b64_char(c): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 47;
+}
+
 # Parse req_buf as a WebSocket upgrade. On success: send 101 Switching
 # Protocols + Sec-WebSocket-Accept, return upgraded ws handle. On failure
 # (not a valid WS upgrade): return 0 — caller should respond 400. Also 0 when
@@ -107,7 +107,18 @@ fn ws_server_handshake(cfd, req_buf, req_len): i64 {
     # See CHANGELOG [5.11.16].
     var klen = strlen(key);
     if (klen != 24) { return 0; }
-    var magic = _wss_magic();
+    # 6.7.18 (D1): the key's 24 bytes are read through a slice — 22 of the base64 alphabet and the
+    # two '=' of a 16-byte value's padding; any other key is refused like a wrong length (its
+    # Accept would be derived from bytes no client sent as a key). CHANGELOG [6.7.18]
+    var ks: [u8] = 0;
+    slice_set(&ks, key, klen);
+    var ki = 0;
+    while (ki < 22) {
+        if (!_wss_b64_char(ks[ki])) { return 0; }
+        ki += 1;
+    }
+    if (ks[22] != 61 || ks[23] != 61) { return 0; }
+    var magic = _WSS_MAGIC;
     var mlen = strlen(magic);
     var concat_len = klen + mlen;
     var concat = alloc(concat_len);
@@ -140,17 +151,82 @@ fn ws_server_handshake(cfd, req_buf, req_len): i64 {
 # Frame I/O
 # ================================================================
 
-# Read EXACTLY n bytes into buf. Returns 0, or -1 on EOF / a read error (EINTR is retried).
-# A TCP read returns what has arrived, so even the 2-byte header can come back short.
-# ⛔ Through lib/net.cyr's _net_os_recv, never sys_read: on Windows sys_read is ReadFile, which
-# returns 0 (a false EOF) on an overlapped Winsock socket with data waiting. CHANGELOG [6.6.11]
-fn _wss_recv_exact(fd, buf, n): i64 {
-    var got = 0;
-    while (got < n) {
-        var r = _net_os_recv(fd, buf + got, n - got);
-        if (r == 0 - 4) { continue; }
-        if (r <= 0) { return 0 - 1; }
-        got = got + r;
+# Every frame part is read EXACTLY through lib/ws.cyr's _ws_recv_exact (0, or -1 on EOF / a read
+# error; EINTR retried): a TCP read returns what has arrived, so even the 2-byte header can come
+# back short. ⛔ It reads through lib/net.cyr's _net_os_recv, never sys_read: on Windows sys_read
+# is ReadFile, which returns 0 (a false EOF) on an overlapped Winsock socket with data waiting
+# (CHANGELOG [6.6.11]). This file kept a byte-identical copy, _wss_recv_exact, until 6.7.18.
+
+# Read one frame's header from `fd` into h (four i64 slots): h[0] the opcode, h[8] the payload
+# length, h[16] 1 when the frame is masked, h[24] the mask key (byte k at bits 8k). Returns 0, or
+# 0 - 1 on socket error / close, a length over `max` or WS_MAX_PAYLOAD, or a 64-bit length with
+# any of its top 32 bits set.
+#
+# ⚠ 6.6.10 (the CYRIUS-2026-0011 sweep). The header, extended-length and mask reads took ONE read each
+# and treated a short one as a dead connection, so a healthy client whose frame arrived split
+# across segments was dropped; they are now exact. A 64-bit length with any of its top 32 bits
+# set (RFC 6455 §5.2: the MSB must be 0) composed to a NEGATIVE len that passed both
+# `len > max` bounds; it is refused by name now. CHANGELOG [6.6.10]
+fn _wss_recv_header(fd, max, h): i64 {
+    # 6.7.18 (D1): every byte is read through a fn-local [u8] slice of exactly the bytes received,
+    # the extended lengths through slice_get_be — checked in every build. CHANGELOG [6.7.18]
+    # First two bytes: FIN/opcode + MASK/length
+    var hdr[2];
+    if (_ws_recv_exact(fd, &hdr, 2) != 0) { return 0 - 1; }
+    var hs: [u8] = 0;
+    slice_set(&hs, &hdr, 2);
+
+    var op = hs[0] & 0x0F;
+    var has_mask = (hs[1] & 0x80) >> 7;
+    var len = hs[1] & 0x7F;
+
+    # Extended length
+    var ext[8];
+    var e: [u8] = 0;
+    if (len == 126) {
+        if (_ws_recv_exact(fd, &ext, 2) != 0) { return 0 - 1; }
+        slice_set(&e, &ext, 2);
+        len = slice_get_be(&e, 0, 2);
+    } elif (len == 127) {
+        if (_ws_recv_exact(fd, &ext, 8) != 0) { return 0 - 1; }
+        slice_set(&e, &ext, 8);
+        if (slice_get_be(&e, 0, 4) != 0) { return 0 - 1; }
+        len = slice_get_be(&e, 4, 4);
+    }
+
+    if (len < 0 || len > max || len > WS_MAX_PAYLOAD) { return 0 - 1; }
+
+    # Mask key (4 bytes) — required for client→server frames per RFC 6455
+    var mask = 0;
+    if (has_mask == 1) {
+        var mk[4];
+        if (_ws_recv_exact(fd, &mk, 4) != 0) { return 0 - 1; }
+        var m: [u8] = 0;
+        slice_set(&m, &mk, 4);
+        mask = m[0] | (m[1] << 8) | (m[2] << 16) | (m[3] << 24);
+    }
+    store64(h, op);
+    store64(h + 8, len);
+    store64(h + 16, has_mask);
+    store64(h + 24, mask);
+    return 0;
+}
+
+# Read the `len`-byte payload of the frame whose header `h` describes into buf (len bytes) and
+# unmask it in place, through a slice of buf[0, len) (D1, 6.7.18). Returns 0, or 0 - 1 on socket
+# error / close.
+fn _wss_recv_payload(fd, h, buf, len): i64 {
+    # Payload — read in a loop because TCP may fragment
+    if (_ws_recv_exact(fd, buf, len) != 0) { return 0 - 1; }
+    if (load64(h + 16) == 1) {
+        var mask = load64(h + 24);
+        var p: [u8] = 0;
+        slice_set(&p, buf, len);
+        var pi = 0;
+        while (pi < len) {
+            p[pi] = p[pi] ^ ((mask >> ((pi & 3) * 8)) & 0xFF);
+            pi += 1;
+        }
     }
     return 0;
 }
@@ -158,64 +234,15 @@ fn _wss_recv_exact(fd, buf, n): i64 {
 # Read a single frame from cfd into payload_buf (up to max bytes).
 # Unmasks the payload in place (server reads MASKED client frames).
 # Writes the opcode to *opcode_out.
-# Returns the payload length, or 0 - 1 on socket error / close / a frame that breaks a bound.
-#
-# ⚠ 6.6.10 (the CYRIUS-2026-0011 sweep). The header, extended-length and mask reads took ONE read each
-# and treated a short one as a dead connection, so a healthy client whose frame arrived split
-# across segments was dropped; they are now exact. A 64-bit length with any of its top 32 bits
-# set (RFC 6455 §5.2: the MSB must be 0) composed to a NEGATIVE len that passed both
-# `len > max` bounds; it is refused by name now. CHANGELOG [6.6.10]
+# Returns the payload length, or 0 - 1 on socket error / close / a frame that breaks a bound
+# (_wss_recv_header).
 fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
     var fd = ws_server_fd(ws);
-
-    # First two bytes: FIN/opcode + MASK/length
-    var hdr[2];
-    if (_wss_recv_exact(fd, &hdr, 2) != 0) { return 0 - 1; }
-
-    var op = load8(&hdr) & 0x0F;
-    store64(opcode_out, op);
-
-    var mask_len = load8(&hdr + 1);
-    var has_mask = (mask_len & 0x80) >> 7;
-    var len = mask_len & 0x7F;
-
-    # Extended length
-    if (len == 126) {
-        var ext[2];
-        if (_wss_recv_exact(fd, &ext, 2) != 0) { return 0 - 1; }
-        len = (load8(&ext) << 8) | load8(&ext + 1);
-    } elif (len == 127) {
-        var ext[8];
-        if (_wss_recv_exact(fd, &ext, 8) != 0) { return 0 - 1; }
-        var hi = load8(&ext) | load8(&ext + 1) | load8(&ext + 2) | load8(&ext + 3);
-        if (hi != 0) { return 0 - 1; }
-        len = 0;
-        var ei = 4;
-        while (ei < 8) {
-            len = (len << 8) | load8(&ext + ei);
-            ei = ei + 1;
-        }
-    }
-
-    if (len < 0 || len > max || len > WS_MAX_PAYLOAD) { return 0 - 1; }
-
-    # Mask key (4 bytes) — required for client→server frames per RFC 6455
-    var mask[4];
-    if (has_mask == 1) {
-        if (_wss_recv_exact(fd, &mask, 4) != 0) { return 0 - 1; }
-    }
-
-    # Payload — read in a loop because TCP may fragment
-    if (_wss_recv_exact(fd, payload_buf, len) != 0) { return 0 - 1; }
-
-    # Unmask
-    if (has_mask == 1) {
-        var pi = 0;
-        while (pi < len) {
-            store8(payload_buf + pi, load8(payload_buf + pi) ^ load8(&mask + (pi & 3)));
-            pi = pi + 1;
-        }
-    }
+    var h: i64[4];
+    if (_wss_recv_header(fd, max, &h) != 0) { return 0 - 1; }
+    store64(opcode_out, load64(&h));
+    var len = load64(&h + 8);
+    if (_wss_recv_payload(fd, &h, payload_buf, len) != 0) { return 0 - 1; }
     return len;
 }
 
@@ -233,23 +260,16 @@ fn ws_server_send_frame(ws, opcode, data, len): i64 {
     pos = 1;
     if (len < 126) {
         store8(&hdr + pos, len);
-        pos = pos + 1;
+        pos += 1;
     } elif (len < 65536) {
         store8(&hdr + pos, 126);
         store8(&hdr + pos + 1, (len >> 8) & 0xFF);
         store8(&hdr + pos + 2, len & 0xFF);
-        pos = pos + 3;
+        pos += 3;
     } else {
         store8(&hdr + pos, 127);
-        store8(&hdr + pos + 1, (len >> 56) & 0xFF);
-        store8(&hdr + pos + 2, (len >> 48) & 0xFF);
-        store8(&hdr + pos + 3, (len >> 40) & 0xFF);
-        store8(&hdr + pos + 4, (len >> 32) & 0xFF);
-        store8(&hdr + pos + 5, (len >> 24) & 0xFF);
-        store8(&hdr + pos + 6, (len >> 16) & 0xFF);
-        store8(&hdr + pos + 7, (len >> 8) & 0xFF);
-        store8(&hdr + pos + 8,  len & 0xFF);
-        pos = pos + 9;
+        for (var k = 0; k < 8; k += 1) { store8(&hdr + pos + 1 + k, (len >> ((7 - k) * 8)) & 0xFF); }   # big-endian
+        pos += 9;
     }
     var hr = sock_send_all(fd, &hdr, pos);
     if (hr < 0) { return hr; }
@@ -264,41 +284,63 @@ fn ws_server_send_frame(ws, opcode, data, len): i64 {
 # High-level API — handles control frames internally
 # ================================================================
 
-# Reusable per-process recv buffer (lazily allocated). Up to WS_MAX_PAYLOAD.
-var _wss_recv_buf = 0;
+# The stack buffer ws_server_recv reads a control frame into (RFC 6455 §5.5: 125 bytes at most)
+# and drains a dropped frame through.
+const _WSS_CBUF = 128;
 
 # Block until a TEXT or BINARY data frame arrives. Handles ping/pong/close
 # transparently. Returns the payload as an alloc'd cstr (NUL-terminated for
-# text safety) on success, or 0 if the peer closed the connection.
+# text safety) on success, or 0 if the peer closed the connection, a frame broke a bound, or the
+# message could not be allocated.
+#
+# ⛔ CYRIUS-2026-0043 (6.7.18): every call on every thread read into ONE process-global 1 MiB
+# buffer (`_wss_recv_buf`), so two connections served on two threads (sandhi_server_run_pooled)
+# read into each other: a client that held back the last byte of a PING got the other
+# connection's message echoed back in its PONG — through its own mask key, in plaintext. Each frame
+# now has a buffer of its own: a data frame is read straight into the allocation this call returns
+# (its exact length + 1), a control frame into this call's stack — RFC 6455 §5.5 caps a control
+# payload at 125 bytes, and a longer one now fails the call — and a frame with a reserved
+# non-control opcode (3-7) is drained through that stack buffer and dropped, as before. Nothing is
+# shared, and no 1 MiB is held for the process's life. CHANGELOG [6.7.18]
 fn ws_server_recv(ws): i64 {
-    if (_wss_recv_buf == 0) { _wss_recv_buf = alloc(WS_MAX_PAYLOAD + 1); }
-    if (_wss_recv_buf == 0) { return 0; }
-    while (1 == 1) {
-        var op_slot[8];
-        store64(&op_slot, 0);
-        var n = ws_server_recv_frame(ws, _wss_recv_buf, WS_MAX_PAYLOAD, &op_slot);
-        if (n < 0) { return 0; }
-        var op = load64(&op_slot);
+    var fd = ws_server_fd(ws);
+    var h: i64[4];
+    var cbuf[_WSS_CBUF];
+    loop {
+        if (_wss_recv_header(fd, WS_MAX_PAYLOAD, &h) != 0) { return 0; }
+        var op = load64(&h);
+        var n = load64(&h + 8);
 
-        if (op == WS_OP_CLOSE) {
-            store64(ws + 8, WS_CLOSING);
-            ws_server_send_close(ws, 1000, "");
-            return 0;
-        }
-        if (op == WS_OP_PING) {
-            ws_server_send_pong(ws, _wss_recv_buf, n);
-            # loop and wait for the next data frame
-        } elif (op == WS_OP_PONG) {
-            # ignore
+        if (op >= 8) {
+            # A control frame: CLOSE, PING, PONG, or a reserved 0xB-0xF (dropped).
+            if (n > 125) { return 0; }
+            if (_wss_recv_payload(fd, &h, &cbuf, n) != 0) { return 0; }
+            if (op == WS_OP_CLOSE) {
+                store64(ws + 8, WS_CLOSING);
+                ws_server_send_close(ws, 1000, "");
+                return 0;
+            }
+            if (op == WS_OP_PING) {
+                ws_server_send_pong(ws, &cbuf, n);
+                # loop and wait for the next data frame
+            }
+            # PONG: ignore
         } elif (op == WS_OP_TEXT || op == WS_OP_BINARY || op == WS_OP_CONTINUATION) {
-            store8(_wss_recv_buf + n, 0);
             var out = alloc(n + 1);
             if (out == 0) { return 0; }
-            memcpy(out, _wss_recv_buf, n);
+            if (_wss_recv_payload(fd, &h, out, n) != 0) { return 0; }
             store8(out + n, 0);
             return out;
+        } else {
+            # A reserved non-control opcode (3-7): drain its payload and keep looping.
+            var left = n;
+            while (left > 0) {
+                var part = left;
+                if (part > _WSS_CBUF) { part = _WSS_CBUF; }
+                if (_ws_recv_exact(fd, &cbuf, part) != 0) { return 0; }
+                left -= part;
+            }
         }
-        # else: unknown opcode — keep looping
     }
     return 0;
 }

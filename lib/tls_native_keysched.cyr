@@ -27,10 +27,12 @@
 # beside it added 2 + 256 + 256 and the constant did not — so the scratch it sizes was two
 # bytes short; see tls_native_hkdf_expand_label.)
 const _TLS_HKDF_LABEL_BUF_LEN = 2 + (1 + 255) + (1 + 255);
+# Read-only mirror of `_TLS_HKDF_LABEL_BUF_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS_HKDF_LABEL_BUF_LEN = _TLS_HKDF_LABEL_BUF_LEN;
 var TLS_KEYSCHED_STATE_LEN = 104;     # 13 i64 slots (+1 @ v6.2.25: ALLOC) — see layout below
 var TLS_KS_OFF_ALLOC       = 96;      # v6.2.25 Allocator handle (0=global bump); derive fns route through it
 const _TLS_MAX_DIGEST_LEN = 48;       # SHA-384
+# Read-only mirror of `_TLS_MAX_DIGEST_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS_MAX_DIGEST_LEN = _TLS_MAX_DIGEST_LEN;
 
 # Key schedule "which sec" identifiers (for keysched_get_secret).
@@ -254,6 +256,9 @@ fn tls_native_keysched_set_psk(ks, psk, psk_len): i64 {
 #   - client_handshake_traffic_secret  ("c hs traffic")
 #   - server_handshake_traffic_secret  ("s hs traffic")
 fn tls_native_keysched_derive_handshake(ks, dhe, dhe_len, transcript): i64 {
+    # The "derived" bridge secret is a `secret var`, zeroised on every return (it was a
+    # _tn_ks_alloc abandoned un-wiped). CHANGELOG [6.7.18]
+    secret var derived_b[_TLS_MAX_DIGEST_LEN];
     if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
     if (transcript == 0) { return TLS_ERR_INVALID_PARAM; }
     var hash_algo = load64(ks);
@@ -264,8 +269,7 @@ fn tls_native_keysched_derive_handshake(ks, dhe, dhe_len, transcript): i64 {
 
     # Derive-Secret(early, "derived", "") — the empty-transcript
     # bridge to the next HKDF-Extract.
-    var derived = _tn_ks_alloc(ks, hash_len);
-    if (derived == 0) { return TLS_ERR_OOM; }
+    var derived = &derived_b;
     var empty_th = _tn_empty_transcript_in(load64(ks + TLS_KS_OFF_ALLOC), hash_algo);
     if (empty_th == 0) { return TLS_ERR_OOM; }
     var drc = tls_native_derive_secret(early, hash_len, "derived", 7, empty_th, derived);
@@ -308,6 +312,9 @@ fn tls_native_keysched_derive_handshake(ks, dhe, dhe_len, transcript): i64 {
 #   - exporter_master_secret             ("exp master")
 #   - resumption_master_secret           ("res master")
 fn tls_native_keysched_derive_master(ks, transcript): i64 {
+    # The "derived" bridge secret is a `secret var`, zeroised on every return (it was a
+    # _tn_ks_alloc abandoned un-wiped). CHANGELOG [6.7.18]
+    secret var derived_b[_TLS_MAX_DIGEST_LEN];
     if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
     if (transcript == 0) { return TLS_ERR_INVALID_PARAM; }
     var hash_algo = load64(ks);
@@ -317,8 +324,7 @@ fn tls_native_keysched_derive_master(ks, transcript): i64 {
     var hs = load64(ks + 32);
 
     # Derive-Secret(hs, "derived", "") bridge.
-    var derived = _tn_ks_alloc(ks, hash_len);
-    if (derived == 0) { return TLS_ERR_OOM; }
+    var derived = &derived_b;
     var empty_th = _tn_empty_transcript_in(load64(ks + TLS_KS_OFF_ALLOC), hash_algo);
     if (empty_th == 0) { return TLS_ERR_OOM; }
     var drc = tls_native_derive_secret(hs, hash_len, "derived", 7, empty_th, derived);
@@ -385,6 +391,22 @@ fn tls_native_keysched_get_secret(ks, which, out): i64 {
 fn tls_native_keysched_phase(ks): i64 {
     if (ks == 0) { return TLS_KSP_NONE; }
     return load64(ks + 16);
+}
+
+# Zeroise the schedule's nine secrets (early through resumption master, +24..+88, each hash_len
+# bytes) and clear their slots, so none can be read back (get_secret answers TLS_ERR_PROTOCOL).
+# tls_native_close runs it through _tn_wipe_secrets. Idempotent. CHANGELOG [6.7.18]
+fn _tn_ks_wipe(ks): i64 {
+    if (ks == 0) { return 0; }
+    var hash_len = load64(ks + 8);
+    var off = 24;
+    while (off <= 88) {
+        var p = load64(ks + off);
+        if (p != 0) { memset(p, 0, hash_len); }
+        store64(ks + off, 0);
+        off = off + 8;
+    }
+    return 0;
 }
 
 # ----------------------------------------------------------------

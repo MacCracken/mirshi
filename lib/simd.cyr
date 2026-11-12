@@ -18,12 +18,10 @@
 # counter convention; consumers are all cyrius-compiled.
 #
 # Pointer-form retained for callsites that have raw f64v2 pointers
-# (e.g. dynamically-allocated f64v2 arrays) AND as the sole shape
-# on Win64 PE — value-form fns are gated on
-# CYRIUS_HAS_VAL_SIMD_PARAMS (defined by EVERY emit path since v6.4.31/.32;
-# main.cyr's PE/Mach-O cross arms were fixed at v6.4.81).
-# On PE the overload dispatch still works: `f64v2_add(&x, &y)`
-# routes to `f64v2_add_ptr` transparently.
+# (e.g. dynamically-allocated f64v2 arrays). The value-form fns are gated on
+# CYRIUS_HAS_VAL_SIMD_PARAMS, which every emit path predefines, Win64 PE
+# included (since v6.4.31/.32; main.cyr's PE/Mach-O cross arms at v6.4.81).
+# The overload dispatch routes `f64v2_add(&x, &y)` to `f64v2_add_ptr`.
 #
 # Historical: v5.10.33 shipped pointer-form ONLY. v5.10.35
 # unblocked abs/sqrt. v5.10.38 shipped the param-side ABI.
@@ -146,16 +144,23 @@ fn f64v4_lane2_ptr(p): i64 { return load64(p + 16); }
 # Lane 3 extractor (pointer form).
 fn f64v4_lane3_ptr(p): i64 { return load64(p + 24); }
 
-# --- f64v4 arithmetic: 256-bit ymm when the CPU has AVX2, else 2×SSE (v6.5.24) ---
-# All four ops (add/sub/mul/div), in BOTH the pointer and value forms below, pick the
-# 256-bit packed-double kernel `f64v256_*` (vaddpd/vsubpd/vmulpd/vdivpd ymm — ONE
-# iteration for all four lanes) when the host advertises AVX2, and otherwise keep the
-# 128-bit `f64v_*` path (two iterations). Measured 15.9 -> ~7.9 ns.
+# --- f64v4 arithmetic: the 128-bit kernel, no per-call dispatch (v6.5.60 / v6.5.62) ---
+# All four ops (add/sub/mul/div), in BOTH the pointer and value forms below, call the 128-bit
+# `f64v_*` kernel (two iterations for four lanes) unconditionally. v6.5.24 had them pick the
+# 256-bit `f64v256_*` kernel (one ymm iteration) when the host advertised AVX2 — 15.9 -> ~7.9 ns
+# in isolation — but a value-form f64v4 crossed the AVX<->SSE boundary on every call (v6.5.60),
+# and at a fixed 4 lanes the per-call dispatch CALL cost more than the kernel saved (v6.5.62, an
+# 8-slot SOA biquad: 188-192 us with it, 141-148 us without). The ymm win is real in a batch loop:
+# call `f64v256_*` directly there (2.4x at n=1024). fmadd and dot keep a dispatch, on the cached
+# `_avx2_cache`, because their two paths are not bit-identical (fused vs two roundings, another
+# reduction order). tests/gates/codegen/simd_valueform_no_avx_transition.sh measures all of this.
+# (This block described the v6.5.24 dispatch until CHANGELOG [6.7.16].)
 #
-# ⚠ THE GATE IS NOT OPTIONAL. `f64v256_*` emits unconditional VEX, which #UDs (SIGILL) on
-# any pre-AVX2 x86. `simd_has_avx2()` also returns 0 on every non-x86 target — its CPUID
-# probe is `#ifdef CYRIUS_ARCH_X86` and no-ops elsewhere — so aarch64 / Mach-O-arm64 / cx
-# take the `f64v_*` NEON-or-portable path for free, exactly as the f32v8 wrappers do.
+# ⚠ THE GATE IS NOT OPTIONAL wherever a ymm kernel runs (fmadd / dot here, any caller of
+# `f64v256_*`). `f64v256_*` emits unconditional VEX, which #UDs (SIGILL) on any pre-AVX2 x86.
+# `simd_has_avx2()` also returns 0 on every non-x86 target — its CPUID probe is
+# `#ifdef CYRIUS_ARCH_X86` and no-ops elsewhere — so aarch64 / Mach-O-arm64 / cx take the
+# `f64v_*` NEON-or-portable path for free, exactly as the f32v8 wrappers do.
 # ⚠ n is 4 here and MUST stay a multiple of 4: the ymm emitter strides its index by 4.
 # The f64v2 wrappers above pass n=2 and MUST keep calling `f64v_*` — never widen them.
 # Pointer form of f64v4_add.
@@ -280,10 +285,11 @@ fn f32v4_mul_ptr(a_ptr, b_ptr): f32v4 {
 
 # --- AVX2 runtime capability gate (SIMD Phase 4 R1, v6.4.8) ---
 # f32v8 emits 256-bit AVX2 (vaddps ymm), which is NOT x86-64 baseline — it #UDs on
-# pre-AVX2 CPUs. So the f32v8_* wrappers below pick the AVX2 path only when the CPU
-# advertises it, else fall back to a 2×SSE path (the f32v_ 128-bit ops with n=8, which
-# process 8 lanes as two 128-bit iterations). cycc itself never calls these → it stays
-# pure SSE2 and self-hosts everywhere. Probe = a byte-for-byte clone of sigil's
+# pre-AVX2 CPUs. So a wrapper below that runs a ymm kernel (f32v8_dot_ptr; f32v8_fma_ptr on the
+# FMA bit) picks it only when the CPU advertises it, else falls back to the f32v_ 128-bit op with
+# n=8 (8 lanes as two 128-bit iterations). add / sub / mul take that 128-bit path always, with no
+# per-call dispatch, since v6.5.62 (see the f64v4 arithmetic block above). cycc itself never calls
+# these → it stays pure SSE2 and self-hosts everywhere. Probe = a byte-for-byte clone of sigil's
 # _sha_ni_cpuid_probe (CPUID leaf 7 sub-leaf 0 EBX), testing bit 5 (AVX2) not 29 (SHA).
 # 2 = uncached, 0 = no, 1 = yes. The probe is idempotent (deterministic CPUID + a bit
 # test, no shared self-test scratch) so — unlike sha_ni/aes_ni — no CAS latch is needed:
@@ -319,8 +325,9 @@ fn simd_has_avx2(): i64 {
 
 # --- f32v8 (256-bit, 8 f32 lanes) constructor + pointer-form (x86 AVX2 / SSE fallback) ---
 # v6.4.8 (SIMD Phase 4 R1). f32v8 packs 8 f32 in one YMM (32 B). Consumers pass f32
-# values as their i32 bit patterns (f32_from). Arithmetic uses AVX2 when available
-# (vaddps ymm) and a 2×SSE fallback otherwise, chosen per-call via simd_has_avx2().
+# values as their i32 bit patterns (f32_from). add / sub / mul run the 2×SSE path with no
+# per-call dispatch (v6.5.62); fma and dot pick the ymm kernel when the CPU has it (the cached
+# probe), since their two paths are not bit-identical.
 
 # Build an f32v8 from eight i32 (f32-bit) patterns — 4-byte lanes.
 fn f32v8_make(a, b, c, d, e, f, g, h): f32v8 {
@@ -358,21 +365,21 @@ fn f32v8_lane6_ptr(p): i64 { return load32(p + 24); }
 # Extract lane 7 (pointer form).
 fn f32v8_lane7_ptr(p): i64 { return load32(p + 28); }
 
-# Packed add (pointer form) — vaddps ymm (AVX2) or 2×SSE addps. Routes f32v8_add(&x, &y).
+# Packed add (pointer form) — 2×SSE addps, no per-call dispatch (v6.5.62). Routes f32v8_add(&x, &y).
 fn f32v8_add_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
     f32v_add(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
-# Packed sub (pointer form) — vsubps ymm (AVX2) or 2×SSE subps.
+# Packed sub (pointer form) — 2×SSE subps, no per-call dispatch (v6.5.62).
 fn f32v8_sub_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
     f32v_sub(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
-# Packed mul (pointer form) — vmulps ymm (AVX2) or 2×SSE mulps.
+# Packed mul (pointer form) — 2×SSE mulps, no per-call dispatch (v6.5.62).
 fn f32v8_mul_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
     f32v_mul(&r, a_ptr, b_ptr, 8);
@@ -602,8 +609,8 @@ fn f64v4_lane2(v: f64v4): i64 { return load64(&v + 16); }
 fn f64v4_lane3(v: f64v4): i64 { return load64(&v + 24); }
 
 # 4-lane packed-double add (value form): r[i] = a[i] + b[i].
-# ⚠ These four value forms carry the SAME AVX2 gate as their `_ptr` siblings — see the
-# comment block above `f64v4_add_ptr`. This fn's NAME is also why the builtin is spelled
+# ⚠ These four value forms run the 128-bit kernel with no dispatch, as their `_ptr` siblings do —
+# see the comment block above `f64v4_add_ptr`. This fn's NAME is also why the builtin is spelled
 # `f64v256_add` rather than `f64v4_add`: the lane-count name was already taken here, and
 # reserving it as a keyword would make this very definition a parse error.
 fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
@@ -612,8 +619,8 @@ fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
     # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
     # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
     # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
-    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
-    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` forms
+    # dropped their gate too (v6.5.62): at a fixed 4 lanes the dispatch call was the cost.
     f64v_add(&r, &a, &b, 4);
     return r;
 }
@@ -625,8 +632,8 @@ fn f64v4_sub(a: f64v4, b: f64v4): f64v4 {
     # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
     # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
     # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
-    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
-    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` forms
+    # dropped their gate too (v6.5.62): at a fixed 4 lanes the dispatch call was the cost.
     f64v_sub(&r, &a, &b, 4);
     return r;
 }
@@ -638,8 +645,8 @@ fn f64v4_mul(a: f64v4, b: f64v4): f64v4 {
     # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
     # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
     # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
-    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
-    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` forms
+    # dropped their gate too (v6.5.62): at a fixed 4 lanes the dispatch call was the cost.
     f64v_mul(&r, &a, &b, 4);
     return r;
 }
@@ -651,14 +658,15 @@ fn f64v4_div(a: f64v4, b: f64v4): f64v4 {
     # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
     # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
     # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
-    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
-    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` forms
+    # dropped their gate too (v6.5.62): at a fixed 4 lanes the dispatch call was the cost.
     f64v_div(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane FMA (value form): r[i] = a[i] * b[i] + c[i].
-# v6.5.38: gated onto the 256-bit kernel, matching add/sub/mul/div above. Until now this ran
+# v6.5.38: gated onto the 256-bit kernel, as add/sub/mul/div then were (they dropped it at
+# v6.5.60 / .62; fmadd keeps it — its two paths round differently). Until v6.5.38 this ran
 # the 128-bit SSE2 loop unconditionally — two iterations for four lanes — because `.24` widened
 # only the four arithmetic ops and left the rest of the family behind.
 fn f64v4_fmadd(a: f64v4, b: f64v4, c: f64v4): f64v4 {

@@ -240,6 +240,12 @@ fn _fl_mmap(length): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return syscall(SYS_MMAP, length);          # agnos mmap#27: length in arg1, anon R/W
     #endif
+    # cx: -1, so _fl_arena_alloc and fl_alloc's large path (`<= 0`) answer 0. cxvm cannot map
+    # guest memory; the raw mmap handed back a HOST address and the first store faulted the VM
+    # — 6.7.12's D13 arm (lib/mmap.cyr cyr_mmap), which this raw path missed. CHANGELOG [6.7.14]
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 1;
+    #endif
     var prot = PROT_READ | PROT_WRITE;
     var flags = _fl_map_flags();
     return syscall(SYS_MMAP, 0, length, prot, flags, 0 - 1, 0);

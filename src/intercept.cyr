@@ -692,12 +692,14 @@ fn _trace_run(root_pid): i64 {
                 store64(rec + C_EXIT_CODE, WEXITSTATUS(st));   # incl. exit#0 -> exit_group
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return WEXITSTATUS(st); }   # ROOT -> supervisor exit
+                _cm_on_death(load64(rec + C_AGNOS_PID));       # 1.12.1: a console_mode#110 holder's mode dies with it
                 _wake_waiters(load64(rec + C_AGNOS_PID));      # release any waitpid#4 parkers on it
             }
             if (WIFSIGNALED(st) == 1) {
                 store64(rec + C_EXIT_CODE, 0 - 1);   # killed by signal -> agnos -1 (waitpid#4 sees -1)
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return 128 + WTERMSIG(st); }
+                _cm_on_death(load64(rec + C_AGNOS_PID));
                 _wake_waiters(load64(rec + C_AGNOS_PID));
             }
             if (WIFSTOPPED(st) == 1) {

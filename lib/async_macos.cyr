@@ -59,6 +59,7 @@ var TASK_SIZE = 64;
 # and strides it (6.7.9: the poll walked its const-sized batch by the writable var); the public
 # var keeps the API. _KEV_BATCH is how many events one poll collects.
 const _KEV_SIZE = 32;
+# Read-only mirror of `_KEV_SIZE`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var KEV_SIZE = _KEV_SIZE;
 const _KEV_BATCH = 8;
 var _KEVF_READ = 65535;

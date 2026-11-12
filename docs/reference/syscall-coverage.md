@@ -95,8 +95,11 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
 
 | 95 | uptime_us | EMULATE | — | **v1.11.3:** `CLOCK_MONOTONIC` in the supervisor → µs, the same epoch as `uptime_ms#40` (never −1: the host clock always works). ⚠ Linux #95 is `umask` — the skip keeps it from running in the child |
+| 109 | sock_send_dl | EMULATE ² ⁸ | — | **v1.12.1 (agnos 1.57.13):** `sock_send#48` with a caller ceiling. Conn checked first (−1 even for len ≤ 0), len ≤ 0 → 0; `timeout_us` 0 = exactly #48, < 0 = one non-blocking attempt, > 0 = wait ≤ min(ceiling, 8 s) for space; an expired wait → **0** (committed count), not −1. ⚠ Linux #109 is `setpgid` |
+| 110 | console_mode | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** `(set, clear)` → the console's previous flags / −1. `CM_NOECHO` hides echo on the host tty and **dies with its holder**, `CM_FLUSH` = `tcflush(TCIFLUSH)`, `CM_NOSERIAL` per process (reported only). Unknown bits → −1 with nothing changed. ⚠ Linux #110 is `getppid` |
+| 111 | fd_kind | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** fd → `FdKind` (1 CONSOLE … 10 DEVICE) / −1. Emulated event fds by slot; a real fd via `pidfd_getfd` + `fstat` + `TCGETS` in the supervisor; fd < 0, ≥ 32 or closed → −1. ⚠ Linux #111 is `getpgrp` |
 
-**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as is `uptime_us#95` (v1.11.3). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
+**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3) and the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
 ¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) the
 filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLVE_IN_ROOT`),
@@ -195,6 +198,33 @@ returns `(cols<<16)|rows` — cols high, rows low, matching the kernel's `fb_win
 so `winsize` never −1 there; darshana treats a size as "is a tty"). Supervisor-side `ioctl` → no child-seccomp
 delta; `--root`-orthogonal. See [ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md).
 
+⁸ **The agnos 1.57.13 band (v1.12.1).** The cyrius 6.7.11+ agnos stdlib issues three newer numbers; each
+probes first and falls back on −1, so before v1.12.1 programs ran under mirshi with the pre-1.57.13 behaviour
+and a stray `ENOSYS agnos#N` line. All three are **supervisor-EMULATE**, with no child buffer except #109's
+`pvm_read` of the payload, so there is no child-seccomp delta.
+- **`sock_send_dl#109`** rides the net band (`--net`; without it, ENOSYS like #48). The stdlib's socket write
+  path (`sys_write` on a tagged fd, `tls_native`) probes it with `#109(conn, buf, 0, 0)` on the first write,
+  which is why the conn check comes before the length check. The 8 s cap is the kernel's D6 window
+  (`TCP_PROGRESS_US`).
+- **`console_mode#110`** treats the host terminal as the console: the first of mirshi's fds 0/1/2 that is a tty
+  (as for `winsize#60`; `fd_kind#111` answers CONSOLE for each). The mode is one global cell
+  plus its **holder** (the process that last set a mode bit); it applies to whoever reads, and it dies with the
+  holder on every death path (the trace loop's exit hook, and a lazy liveness check on every call), so a
+  program killed with echo off leaves the tty echoing. `CM_NOECHO` clears `ECHO | ECHONL` and clearing it puts
+  back the bits it found; `CM_NOECHO | CM_FLUSH` in one call is `TCSETSF`. If mirshi itself is ended by HUP, INT,
+  QUIT or TERM while it hides the echo, a handler armed by the first hide gives the echo back and re-raises,
+  so mirshi dies with the same status (not as a container's PID 1, and not for SIGKILL). With no tty on any of
+  the three fds the mode is tracked and reported but nothing changes, so scripted input survives. With stdin
+  piped and stderr on a terminal, that terminal is the console and the pipe keeps its bytes. While `kbscan#42`
+  has the tty raw, the echo bits are left to it. mirshi restores the echo at exit.
+- **`fd_kind#111`** answers mirshi's emulated signalfd / timerfd / epoll ids by slot (open → 7 / 9 / 8, freed →
+  −1) **before** the kernel's 32-entry bound, because under mirshi they are `BASE + slot` ids rather than small
+  fds. A real fd is duplicated into the supervisor with `pidfd_getfd`, `fstat`'d and asked `TCGETS`: a terminal
+  is `FDK_CONSOLE`, another char device (`/dev/null`) `FDK_DEVICE`. A socket-tagged id (bit 30) is the stdlib's
+  own handle → −1, as on the kernel.
+
+See [ADR 0018](../adr/0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md).
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -248,3 +278,10 @@ the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
   `sethostname` yet); `sysinfo.procs` is mirshi's live agnos-process count vs the kernel's `proc_count`
   high-water (a cosmetic stat). `uptime`/`totalram`/`freeram`/`cpus` are the real host facts (degrade to 0/1 if
   the host reads fail). All await confirmation against a real agnos consumer. See [ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md).
+- **The agnos 1.57.13 band (⁸)**: `console_mode#110`'s `CM_FLUSH` discards the tty's input at once, even a line
+  another process is half-way through; the kernel waits for that reader to finish its line first. A SIGKILL of
+  mirshi (or any fatal signal when it is a container's PID 1) leaves a hidden echo hidden. After a job-control
+  stop the shell may restore its own tty modes, and mirshi does not hide the echo again on SIGCONT. A signalfd
+  slot is never freed by `close#6` (the signal-band gap above), so `fd_kind#111` still answers `FDK_SIGNALFD`
+  for a closed signalfd. `sock_send_dl#109` sends one chunk of at most 4096 bytes per call, like #48 (the
+  caller loops).

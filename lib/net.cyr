@@ -4,7 +4,7 @@
 #   CYRIUS_KERNEL=1) that includes it now FAILS with a clear error instead of
 #   compiling silently and faulting at runtime inside the kernel. `#` opens a comment
 #   in cyrius, so this line is inert for every host target. See PP_IS_HOST_ONLY in
-#   src/frontend/lex_pp.cyr; remove the marker if this module is ever made
+#   src/frontend/lex/pp/include.cyr; remove the marker if this module is ever made
 #   freestanding.
 # net.cyr — TCP/UDP network sockets. Uses the Linux x86_64 socket syscall
 # numbers; the Mach-O backends translate them to Darwin BSD (ESYSXLAT /
@@ -15,7 +15,7 @@
 # there is a Winsock SOCKET and must be closed with sock_close, never sys_close.
 # Usage: include "lib/net.cyr"
 # Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, and io.cyr
-# for the resolver.
+# for the resolver, and slice.cyr for the DNS reply parser (6.7.18).
 
 # 6.6.9: the line above used to be a Requires list for the caller (naming a retired agnosys
 # path), and a bare include compiled with ~11 undefined functions — sys_read/sys_write, alloc,
@@ -29,6 +29,8 @@ include "lib/result.cyr"
 # file_open — the agnos-ABI-bridged open. Include-once, so an existing caller pays nothing.
 # CHANGELOG [6.6.9]
 include "lib/io.cyr"
+# 6.7.18 (the user's D1): the DNS reply parser reads the datagram through a fn-local slice.
+include "lib/slice.cyr"
 
 # Syscall numbers
 var NSYS_SOCKET = 41;
@@ -83,8 +85,8 @@ enum IpOpt {
     IP_ADD_MEMBERSHIP = 12;
     IP_DROP_MEMBERSHIP = 13;
 }
-var _NET_EINPROGRESS = 36;
-var _NET_SO_REUSE = 0x0004;          # sock_reuse's option: SO_REUSEADDR
+const _NET_EINPROGRESS = 36;
+const _NET_SO_REUSE = 0x0004;        # sock_reuse's option: SO_REUSEADDR
 #else
 #ifdef CYRIUS_TARGET_WIN
 # 6.6.11: Winsock (winsock2.h / ws2ipdef.h). The option values are the BSD ones, and the
@@ -107,12 +109,12 @@ enum IpOpt {
     IP_ADD_MEMBERSHIP = 12;
     IP_DROP_MEMBERSHIP = 13;
 }
-var _NET_EINPROGRESS = 10035;        # WSAEWOULDBLOCK: a non-blocking connect is under way
+const _NET_EINPROGRESS = 10035;      # WSAEWOULDBLOCK: a non-blocking connect is under way
 # ⛔ sock_reuse's option on Windows is SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR), NOT SO_REUSEADDR.
 # Windows' SO_REUSEADDR lets ANOTHER socket bind a port this server is using and take its
 # traffic; Linux's only lets a restarted server rebind past TIME_WAIT. EXCLUSIVEADDRUSE is the
 # option that keeps the port this process's alone. CHANGELOG [6.6.11]
-var _NET_SO_REUSE = 0xFFFFFFFB;
+const _NET_SO_REUSE = 0xFFFFFFFB;
 #else
 enum SockOpt {
     SOL_SOCKET = 1;
@@ -131,17 +133,17 @@ enum IpOpt {
     IP_ADD_MEMBERSHIP = 35;
     IP_DROP_MEMBERSHIP = 36;
 }
-var _NET_EINPROGRESS = 115;
-var _NET_SO_REUSE = 2;               # sock_reuse's option: SO_REUSEADDR
+const _NET_EINPROGRESS = 115;
+const _NET_SO_REUSE = 2;             # sock_reuse's option: SO_REUSEADDR
 #endif
 #endif
 
 # sockaddr_in: { family(2), port(2), addr(4), zero(8) } = 16 bytes
-# Build a sockaddr_in struct from address and port
-# Returns the 16-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
-fn sockaddr_in(addr, port): i64 {
-    var sa = alloc(16);
-    if (sa == 0) { return 0; }
+# Write the sockaddr_in for `addr` (packed, network byte order) and host-order `port` into the
+# 16 bytes at `sa`; returns `sa`. The one copy of the layout: sockaddr_in (allocated) and
+# net_connect_nb (on the stack, allocator-free) both fill through it — net_connect_nb used to
+# inline its own copy. CHANGELOG [6.7.18]
+fn _net_sa4_fill(sa, addr, port): i64 {
     memset(sa, 0, 16);
     #ifdef CYRIUS_TARGET_MACOS
     # BSD sockaddr_in prefixes a length byte: sin_len(u8=16) @0, sin_family(u8) @1.
@@ -159,19 +161,23 @@ fn sockaddr_in(addr, port): i64 {
     return sa;
 }
 
-# v6.2.10: Build a sockaddr_in6 (28 bytes) from a 16-byte IPv6 address (pointed
-# to by `addr16`, network byte order) + host-order `port`. Parallels
-# sockaddr_in's Darwin length-byte split: Linux has u16 sin6_family@0; Darwin
-# (BSD) has sin6_len(u8=28)@0 + sin6_family(u8=30)@1. Layout: family@0/1,
-# port@2 (NBO), flowinfo@4 (0), addr@8 (16 B), scope_id@24 (0).
-# NOTE: net_connect_nb6 inlines this exact 28-byte layout (it must stay
-# allocator-free, so it can't call this alloc-based builder) — keep the two in
-# lock-step if the layout ever changes (e.g. populating sin6_scope_id).
-# See docs/development/issues/archived/2026-06-15-cyrius-net-v6-darwin.md.
-# Returns the 28-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
-fn sockaddr_in6(addr16, port): i64 {
-    var sa = alloc(28);
+# Build a sockaddr_in struct from address and port
+# Returns the 16-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
+fn sockaddr_in(addr, port): i64 {
+    var sa = alloc(16);
     if (sa == 0) { return 0; }
+    return _net_sa4_fill(sa, addr, port);
+}
+
+# v6.2.10: the sockaddr_in6 (28 bytes) for a 16-byte IPv6 address (pointed to by `addr16`,
+# network byte order) + host-order `port`, written at `sa`; returns `sa`. Parallels sockaddr_in's
+# Darwin length-byte split: Linux has u16 sin6_family@0; Darwin (BSD) has sin6_len(u8=28)@0 +
+# sin6_family(u8=30)@1. Layout: family@0/1, port@2 (NBO), flowinfo@4 (0), addr@8 (16 B),
+# scope_id@24 (0). The one copy of the layout: sockaddr_in6 and the allocator-free
+# net_connect_nb6 both fill through it (net_connect_nb6 used to inline a copy kept "in lock-step"
+# by hand). See docs/development/issues/archived/2026-06-15-cyrius-net-v6-darwin.md.
+# CHANGELOG [6.7.18]
+fn _net_sa6_fill(sa, addr16, port): i64 {
     memset(sa, 0, 28);
     #ifdef CYRIUS_TARGET_MACOS
     store8(sa, 28);                  # sin6_len (BSD)
@@ -186,6 +192,14 @@ fn sockaddr_in6(addr16, port): i64 {
     store64(sa + 16, load64(addr16 + 8));
     # scope_id @24 stays 0 (memset).
     return sa;
+}
+
+# Build a sockaddr_in6 (28 bytes) from a 16-byte IPv6 address and a host-order port.
+# Returns the 28-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
+fn sockaddr_in6(addr16, port): i64 {
+    var sa = alloc(28);
+    if (sa == 0) { return 0; }
+    return _net_sa6_fill(sa, addr16, port);
 }
 
 # Common addresses
@@ -223,7 +237,7 @@ fn _agnos_bswap32(x): i64 {
 # connection pending, matching a Linux non-blocking accept's -EAGAIN (11) so a
 # server's accept poll-loop stays source-identical across targets. v6.4.61: moved
 # out of the AGNOS #ifdef — the Linux/macho path uses it too (the would-block singleton).
-var _NET_EAGAIN = 11;
+const _NET_EAGAIN = 11;
 
 # v6.4.61: shared would-block Result singleton. sock_accept's overwhelmingly common
 # return in a non-blocking server is "nothing pending" (Err(_NET_EAGAIN)); on the
@@ -290,6 +304,7 @@ fn _net_wsa_io_err(): i64 {
 
 # ioctlsocket(FIONBIO): 1 = non-blocking, 0 = blocking. 0 or -WSAGetLastError.
 fn _net_wsa_nbio(fd, on): i64 {
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     var v[8];
     store64(&v, on);
     if (syscall(0xF049, fd, 0x8004667E, &v) != 0) { return _net_wsa_err(); }   # FIONBIO
@@ -306,6 +321,7 @@ fn _net_wsa_nbio(fd, on): i64 {
 # is the same sys_write as before (the peer routes a tagged fd to #48). CHANGELOG [6.6.16]
 fn _net_os_send(fd, buf, len): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }    # send() takes an int length; a short write is legal
     var n = syscall(0xF047, fd, buf, len, 0);
     if (n < 0) { return _net_wsa_io_err(); }
@@ -319,6 +335,7 @@ fn _net_os_send(fd, buf, len): i64 {
 # Receive up to `len` bytes from socket `fd`: the count (0 = the peer closed), or -errno.
 fn _net_os_recv(fd, buf, len): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }
     var n = syscall(0xF048, fd, buf, len, 0);
     if (n < 0) { return _net_wsa_io_err(); }
@@ -333,6 +350,7 @@ fn _net_os_recv(fd, buf, len): i64 {
 # CloseHandle (sys_close) on one is documented as undefined and skips Winsock's teardown.
 fn _net_os_close(fd): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     return _net_wsa_rc(syscall(0xF023, fd));
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -363,6 +381,7 @@ fn _net_os_socket(type): i64 {
 # bind(fd, sa, salen): 0 or -errno.
 fn _net_os_bind(fd, sa, salen): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     return _net_wsa_rc(syscall(0xF025, fd, sa, salen));
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -373,6 +392,7 @@ fn _net_os_bind(fd, sa, salen): i64 {
 # connect(fd, sa, salen), blocking: 0 or -errno.
 fn _net_os_connect(fd, sa, salen): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     return _net_wsa_rc(syscall(0xF028, fd, sa, salen));
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -383,6 +403,7 @@ fn _net_os_connect(fd, sa, salen): i64 {
 # listen(fd, backlog): 0 or -errno.
 fn _net_os_listen(fd, backlog): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     return _net_wsa_rc(syscall(0xF033, fd, backlog));
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -400,6 +421,7 @@ fn _net_os_listen(fd, backlog): i64 {
 # Linux and agnos are unchanged: no extra syscall. CHANGELOG [6.6.16]
 fn _net_os_accept(fd): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     var c = syscall(0xF045, fd, 0, 0);
     if (c == 0 - 1) {                                          # INVALID_SOCKET
         var e = _net_wsa_err();
@@ -441,6 +463,7 @@ fn _net_os_accept(fd): i64 {
 # values (the SockOpt / IpOpt enums above).
 fn _net_os_setopt(fd, level, name, val, vallen): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     return _net_wsa_rc(syscall(0xF032, fd, level, name, val, vallen));
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -448,10 +471,30 @@ fn _net_os_setopt(fd, level, name, val, vallen): i64 {
     #endif
 }
 
+# setsockopt with a 4-byte int value `v`, held on the stack (setsockopt copies it in): 0 or
+# -errno. The one body for the int options sock_reuse, sock_reuseport, sock_set_nodelay and the
+# multicast TTL / loop / interface setters each open-coded. CHANGELOG [6.7.18]
+fn _net_setopt_int(fd, level, name, v): i64 {
+    var b[8];
+    store64(&b, 0);
+    store32(&b, v);
+    return _net_os_setopt(fd, level, name, &b, 4);
+}
+
+# struct ip_mreq is { imr_multiaddr@0, imr_interface@4 } = 8 bytes, identical on every target:
+# join (`opt` IP_ADD_MEMBERSHIP) or leave (IP_DROP_MEMBERSHIP) `group` on `iface`. 0 or -errno.
+fn _net_mcast_member(fd, opt, group, iface): i64 {
+    var mreq[8];
+    store32(&mreq, group);
+    store32(&mreq + 4, iface);
+    return _net_os_setopt(fd, IPPROTO_IP, opt, &mreq, 8);
+}
+
 # shutdown(fd, how) — 0 = read, 1 = write, 2 = both on every target (SD_RECEIVE / SD_SEND /
 # SD_BOTH on Windows): 0 or -errno.
 fn _net_os_shutdown(fd, how): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }    # never a descriptor (6.7.16)
     if (syscall(0xF046, fd, how) != 0) { return _net_wsa_err(); }
     return 0;
     #endif
@@ -539,9 +582,7 @@ fn sock_reuse(fd): i64 {
     # refuse (it was an unchecked alloc(4), leaked per call, until 6.6.10). CHANGELOG [6.6.10]
     # _NET_SO_REUSE is SO_REUSEADDR on POSIX and SO_EXCLUSIVEADDRUSE on Windows (see its
     # definition: Windows' SO_REUSEADDR would let another socket take this port). CHANGELOG [6.6.11]
-    var val[8];
-    store32(&val, 1);
-    return _net_os_setopt(fd, SOL_SOCKET, _NET_SO_REUSE, &val, 4);
+    return _net_setopt_int(fd, SOL_SOCKET, _NET_SO_REUSE, 1);
     #endif
 }
 
@@ -577,9 +618,10 @@ fn sock_set_send_timeout(fd, secs, usecs): i64 {
     # AGNOS has no SO_SNDTIMEO (NSYS_SETSOCKOPT=54 mis-dispatches). The syscall
     # peer's sys_write socket route bounds a STALL with it: sock_send#48 returns 0
     # after ~8 s with no ACK progress, and _agnos_sock_send_all retries until this
-    # deadline, then returns the partial count (or -1). secs = usecs = 0 restores the
-    # 30 s default. (This comment used to claim a "poll path" that did not exist and
-    # the call ignored `secs`, until v6.6.7.) CHANGELOG [6.6.7]
+    # deadline, then returns the partial count (or -1); on a kernel with sock_send_dl#109
+    # (agnos 1.57.13) each call is also handed the window left as its ceiling (6.7.11).
+    # secs = usecs = 0 restores the 30 s default. (This comment used to claim a "poll path"
+    # that did not exist and the call ignored `secs`, until v6.6.7.) CHANGELOG [6.6.7]
     return _agnos_sock_set_tmo(&_agnos_sock_sndto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
@@ -602,10 +644,9 @@ fn sock_set_nodelay(fd, on): i64 {
     return 0 - 38;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var v[8];
-    store64(&v, 0);
-    if (on != 0) { store32(&v, 1); }               # an int: a wide `on` is 1, never truncated to 0
-    return _net_os_setopt(fd, 6, 1, &v, 4);        # IPPROTO_TCP, TCP_NODELAY
+    var v = 0;
+    if (on != 0) { v = 1; }                        # an int: a wide `on` is 1, never truncated to 0
+    return _net_setopt_int(fd, 6, 1, v);           # IPPROTO_TCP, TCP_NODELAY
     #endif
 }
 
@@ -623,6 +664,13 @@ fn sock_bind(fd, addr, port) : Result {
     # ⛔ CYRIUS-2026-0008 (v6.6.7): `addr` used to be IGNORED, so a 127.0.0.1 server listened
     # on the network. On an agnos kernel older than 1.57.7 the loopback class is
     # refused at sock_listen — the server does not start, which is the safe answer.
+    # An fd that is not a tagged socket fd is refused first, before any table write (each of the
+    # four agnos arms stashed into, listened on, accepted from or connected into slot `fd & 7`
+    # whatever `fd` was: a failed open's -1 was slot 7). CHANGELOG [6.7.12]
+    if (_agnos_is_sock_fd(fd) == 0) {             # not a tagged socket fd: Linux's answers,
+        if (fd < 0) { return Err(9); }             # EBADF for a negative fd,
+        return Err(88);                            # ENOTSOCK for any other
+    }
     var ip = _agnos_bswap32(addr);
     var cls = _agnos_listen_class(ip);
     if (cls < 0) { return Err(99); }
@@ -644,6 +692,10 @@ fn sock_listen(fd, backlog) : Result {
     # Issue sock_listen(#56) on the port stashed by sock_bind (the kernel merges
     # bind+listen → a listen_id, stored in the fd's adapter slot). backlog is
     # advisory on AGNOS — the kernel's 8-conn-slot table caps it. v6.2.22.
+    if (_agnos_is_sock_fd(fd) == 0) {             # not a tagged socket fd: Linux's answers,
+        if (fd < 0) { return Err(9); }             # EBADF for a negative fd,
+        return Err(88);                            # ENOTSOCK for any other
+    }
     var r = _agnos_listen_start(fd);
     # port in use / kernel conn table full / unbound — or a LOOPBACK bind on an agnos
     # older than 1.57.7, which has no address classes: refused, never widened (CYRIUS-2026-0008).
@@ -671,6 +723,10 @@ fn sock_accept(fd) : Result {
     # a Linux non-blocking accept). On success wrap the conn_id in a FRESH tagged
     # fd via the client-band adapter — the accepted conn then transparently uses
     # sock_send#48 / sock_recv#49 / sock_close#50. v6.2.22.
+    if (_agnos_is_sock_fd(fd) == 0) {             # not a tagged socket fd: Linux's answers,
+        if (fd < 0) { return Err(9); }             # EBADF for a negative fd,
+        return Err(88);                            # ENOTSOCK for any other
+    }
     var lid = _agnos_fd_listen(fd);
     if (lid < 0) { return Err(1); }              # fd isn't a LISTEN socket
     var cid = sys_sock_accept(lid);
@@ -712,6 +768,11 @@ fn sock_connect(fd, addr, port) : Result {
     # packed (sockaddr sin_addr; INADDR_LOOPBACK 0x0100007F), but #47 wants the
     # kernel ip4() form (oct1<<24)|…|oct4 (0x7F000001) — byte-swap it. src_port
     # 0 → kernel auto-assigns ephemeral. Blocks ~8s polling for the SYN-ACK.
+    # The fd is checked BEFORE #47: a conn opened for a non-socket fd would leak. CHANGELOG [6.7.12]
+    if (_agnos_is_sock_fd(fd) == 0) {             # not a tagged socket fd: Linux's answers,
+        if (fd < 0) { return Err(9); }             # EBADF for a negative fd,
+        return Err(88);                            # ENOTSOCK for any other
+    }
     var conn = sys_sock_connect(_agnos_bswap32(addr), port, 0);
     if (conn < 0) { return Err(1); }
     _agnos_sock_bind(fd, conn);
@@ -748,7 +809,7 @@ fn sock_send_all(fd, buf, len): i64 {
         if (n == 0 - 4) { continue; }               # EINTR: nothing was written; retry
         if (n < 0) { return n; }
         if (n == 0) { return 0 - 5; }               # EIO: a stream write never returns 0 for len > 0
-        off = off + n;
+        off += n;
     }
     return len;
 }
@@ -790,18 +851,21 @@ fn sock_recv(fd, buf, len) : Result {
 #
 # ⭐ The real fix is upstream of all of this and is a different size class: the allocation is
 # not a `Result` or a net.cyr property at all — the enum payload-variant constructor lowering
-# (`src/frontend/parse_types.cyr:386`) unconditionally calls the global `alloc`, so EVERY
+# (`src/frontend/parse/types/enum.cyr`) unconditionally calls the global `alloc`, so EVERY
 # payload-carrying enum in the language does this. Changing that representation touches 24 enum
 # declarations and 516 construction sites. See lib/result.cyr's `ok_via` header.
 # Send on a socket, boxing the Result through the caller's allocator. Returns Ok(n)/Err(errno).
-fn sock_send_a(a, fd, buf, len): i64 {
+# Both `_a` forms are declared `: Result`, what they return (lib/result.cyr's ok_via / err_via,
+# 6.7.13's D37): `cyrius header` printed `cyr_val` for the pair, and callers compile
+# byte-identical. CHANGELOG [6.7.14]
+fn sock_send_a(a, fd, buf, len): Result {
     var n = _net_os_send(fd, buf, len);
     if (n < 0) { return err_via(a, 0 - n); }
     return ok_via(a, n);
 }
 
 # Receive from a socket, boxing the Result through the caller's allocator. Ok(n)/Err(errno).
-fn sock_recv_a(a, fd, buf, len): i64 {
+fn sock_recv_a(a, fd, buf, len): Result {
     var n = _net_os_recv(fd, buf, len);
     if (n < 0) { return err_via(a, 0 - n); }
     return ok_via(a, n);
@@ -844,9 +908,7 @@ fn sock_reuseport(fd): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var optval[4];
-    store32(&optval, 1);
-    return _net_os_setopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, 4);
+    return _net_setopt_int(fd, SOL_SOCKET, SO_REUSEPORT, 1);
     #endif
 }
 
@@ -858,10 +920,7 @@ fn net_join_multicast(fd, group, iface): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var mreq[8];
-    store32(&mreq, group);
-    store32(&mreq + 4, iface);
-    return _net_os_setopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, 8);
+    return _net_mcast_member(fd, IP_ADD_MEMBERSHIP, group, iface);
     #endif
 }
 
@@ -871,10 +930,7 @@ fn net_drop_multicast(fd, group, iface): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var mreq[8];
-    store32(&mreq, group);
-    store32(&mreq + 4, iface);
-    return _net_os_setopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, 8);
+    return _net_mcast_member(fd, IP_DROP_MEMBERSHIP, group, iface);
     #endif
 }
 
@@ -885,9 +941,7 @@ fn net_set_multicast_ttl(fd, ttl): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var optval[4];
-    store32(&optval, ttl);
-    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &optval, 4);
+    return _net_setopt_int(fd, IPPROTO_IP, IP_MULTICAST_TTL, ttl);
     #endif
 }
 
@@ -897,9 +951,7 @@ fn net_set_multicast_loop(fd, on): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var optval[4];
-    store32(&optval, on);
-    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &optval, 4);
+    return _net_setopt_int(fd, IPPROTO_IP, IP_MULTICAST_LOOP, on);
     #endif
 }
 
@@ -910,9 +962,7 @@ fn net_set_multicast_if(fd, iface): i64 {
     return 0 - 1;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var optval[4];
-    store32(&optval, iface);
-    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &optval, 4);
+    return _net_setopt_int(fd, IPPROTO_IP, IP_MULTICAST_IF, iface);
     #endif
 }
 
@@ -961,9 +1011,9 @@ fn net_set_multicast_if(fd, iface): i64 {
 # SO_ERROR=4; POLLOUT=4 is the same on both. v6.6.8: the O_NONBLOCK toggle is
 # fd_set_nonblocking / fd_restore_flags (lib/syscalls_linux_common.cyr), whose
 # per-target flag is private — this file's own `_NET_O_NONBLOCK` copy is gone.
-var _NET_CONN_NB_OK = 0;
-var _NET_CONN_NB_ERR = 0 - 1;
-var _NET_CONN_NB_TIMEOUT = 0 - 2;
+const _NET_CONN_NB_OK = 0;
+const _NET_CONN_NB_ERR = 0 - 1;
+const _NET_CONN_NB_TIMEOUT = 0 - 2;
 
 # Non-blocking TCP connect with bounded timeout. See top-of-fn
 # block above for full contract; returns 0 on connected,
@@ -978,29 +1028,21 @@ fn net_connect_nb(fd, addr, port, timeout_ms): i64 {
     # fixed) polling for the SYN-ACK, itself a bounded-timeout connect. The
     # fcntl/poll/getsockopt/connect dance below is Linux-only (syscalls
     # 72/7/55/42, absent from the agnos ABI), so route to the blocking #47 path;
-    # timeout_ms is advisory here. 0 connected, _NET_CONN_NB_ERR on full/timeout/RST.
+    # timeout_ms is advisory here. 0 connected, _NET_CONN_NB_ERR on full/timeout/RST — and on an
+    # fd that is not a tagged socket fd, BEFORE #47 (its conn would leak). CHANGELOG [6.7.12]
+    if (_agnos_is_sock_fd(fd) == 0) { return _NET_CONN_NB_ERR; }
     var aconn = sys_sock_connect(_agnos_bswap32(addr), port, 0);
     if (aconn < 0) { return _NET_CONN_NB_ERR; }
     _agnos_sock_bind(fd, aconn);
     return _NET_CONN_NB_OK;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    # Build sockaddr_in inline (avoid alloc — net_connect_nb runs from
-    # regression / probe code without an allocator), then delegate the
-    # fcntl/poll/getsockopt dance to net_connect_sa_nb. v6.2.10: the body was
-    # extracted to net_connect_sa_nb so net_connect_nb6 + sandhi's v6 path
+    # The sockaddr_in is on the stack (no alloc — net_connect_nb runs from regression / probe
+    # code without an allocator), then the fcntl/poll/getsockopt dance is net_connect_sa_nb's.
+    # v6.2.10: the body was extracted to net_connect_sa_nb so net_connect_nb6 + sandhi's v6 path
     # share one implementation (behaviour for v4 is unchanged).
     var sa[16];   # 16-byte sockaddr_in
-    #ifdef CYRIUS_TARGET_MACOS
-    store8(&sa,      16);                                   # sin_len (BSD)
-    store8(&sa + 1,  2);                                    # sin_family AF_INET
-    #else
-    store16(&sa,     2);                                    # AF_INET
-    #endif
-    store16(&sa + 2, ((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
-    store32(&sa + 4, addr);
-    store64(&sa + 8, 0);
-    return net_connect_sa_nb(fd, &sa, 16, timeout_ms);
+    return net_connect_sa_nb(fd, _net_sa4_fill(&sa, addr, port), 16, timeout_ms);
     #endif
 }
 
@@ -1034,28 +1076,28 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
     var cr = syscall(42, fd, sa, salen);                    # connect
     if (cr == 0) {
         result = _NET_CONN_NB_OK;                           # immediate (localhost)
-    } else { if (cr == 0 - _NET_EINPROGRESS) {
-            var pfd[8];
-            store32(&pfd,     fd);
-            store16(&pfd + 4, 4);                           # POLLOUT
-            store16(&pfd + 6, 0);                           # revents
-            var pr = syscall(7, &pfd, 1, timeout_ms);       # poll
-            if (pr > 0) {
-                # 6.6.20: connected only when getsockopt itself succeeded AND read 0 — the
-                # buffer is primed non-zero, as the Windows arm's is. It was primed 0 with the
-                # return dropped, so a failed getsockopt reported a refused connect as connected.
-                # Pinned by tests/tcyr/crossos/net_connect_nb_so_error.tcyr. CHANGELOG [6.6.20]
-                var sb[4];
-                var slen[4];
-                store32(&sb,   1);                          # not 0: an unwritten value is no success
-                store32(&slen, 4);
-                if (syscall(55, fd, SOL_SOCKET, SO_ERROR, &sb, &slen) == 0) {  # getsockopt SO_ERROR
-                    if (load32(&sb) == 0) { result = _NET_CONN_NB_OK; }
-                }
-            } else { if (pr == 0) {
-                    result = _NET_CONN_NB_TIMEOUT;
-                } }
-        } }
+    } elif (cr == 0 - _NET_EINPROGRESS) {
+        var pfd[8];
+        store32(&pfd,     fd);
+        store16(&pfd + 4, 4);                               # POLLOUT
+        store16(&pfd + 6, 0);                               # revents
+        var pr = syscall(7, &pfd, 1, timeout_ms);           # poll
+        if (pr > 0) {
+            # 6.6.20: connected only when getsockopt itself succeeded AND read 0 — the
+            # buffer is primed non-zero, as the Windows arm's is. It was primed 0 with the
+            # return dropped, so a failed getsockopt reported a refused connect as connected.
+            # Pinned by tests/tcyr/crossos/net_connect_nb_so_error.tcyr. CHANGELOG [6.6.20]
+            var sb[4];
+            var slen[4];
+            store32(&sb,   1);                              # not 0: an unwritten value is no success
+            store32(&slen, 4);
+            if (syscall(55, fd, SOL_SOCKET, SO_ERROR, &sb, &slen) == 0) {  # getsockopt SO_ERROR
+                if (load32(&sb) == 0) { result = _NET_CONN_NB_OK; }
+            }
+        } elif (pr == 0) {
+            result = _NET_CONN_NB_TIMEOUT;
+        }
+    }
     fd_restore_flags(fd, saved_flags);                      # F_SETFL <saved> — restore blocking
     return result;
     #endif
@@ -1069,6 +1111,7 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
 # ⚠ WSAPoll before Windows 10 2004 does not report a REFUSED non-blocking connect: it waits out
 # the timeout, so on those builds a refusal reads as _NET_CONN_NB_TIMEOUT. CHANGELOG [6.6.11]
 fn _net_win_connect_nb(fd, sa, salen, timeout_ms): i64 {
+    if (_win_fd_aliases(fd) == 1) { return _NET_CONN_NB_ERR; }   # never a descriptor (6.7.16)
     if (_net_wsa_nbio(fd, 1) != 0) { return _NET_CONN_NB_ERR; }
     var result = _NET_CONN_NB_ERR;
     var cr = _net_wsa_rc(syscall(0xF028, fd, sa, salen));  # connect
@@ -1100,28 +1143,16 @@ fn _net_win_connect_nb(fd, sa, salen, timeout_ms): i64 {
 
 # v6.2.10: IPv6 non-blocking connect — `addr16` is a ptr to the 16-byte v6
 # address (network byte order), `port` host-order. Builds a Darwin/Linux-correct
-# sockaddr_in6 on the stack (same layout as sockaddr_in6() — inlined here to stay
-# allocator-free; keep both in sync) and delegates to net_connect_sa_nb. AGNOS is
-# IPv4-only → fail closed. Returns the same _NET_CONN_NB_* sentinels.
+# sockaddr_in6 on the stack (_net_sa6_fill, sockaddr_in6's layout, allocator-free)
+# and delegates to net_connect_sa_nb. AGNOS is IPv4-only → fail closed. Returns the
+# same _NET_CONN_NB_* sentinels.
 fn net_connect_nb6(fd, addr16, port, timeout_ms): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return _NET_CONN_NB_ERR;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var sa[28];   # 28-byte sockaddr_in6
-    var z = 0;
-    while (z < 28) { store8(&sa + z, 0); z = z + 1; }
-    #ifdef CYRIUS_TARGET_MACOS
-    store8(&sa,      28);                                   # sin6_len (BSD)
-    store8(&sa + 1,  AF_INET6);                             # sin6_family (u8) = 30
-    #else
-    store16(&sa,     AF_INET6);                             # Linux sin6_family (u16) = 10
-    #endif
-    store8(&sa + 2, (port >> 8) & 0xFF);
-    store8(&sa + 3, port & 0xFF);
-    store64(&sa + 8,  load64(addr16));                      # v6 addr (16 B) @8
-    store64(&sa + 16, load64(addr16 + 8));
-    return net_connect_sa_nb(fd, &sa, 28, timeout_ms);
+    return net_connect_sa_nb(fd, _net_sa6_fill(&sa, addr16, port), 28, timeout_ms);
     #endif
 }
 
@@ -1191,18 +1222,18 @@ fn net_parse_ipv4(s): i64 {
             if (digits == 0) { return 0 - 1; }
             if (part >= 3) { return 0 - 1; }
             addr = addr | (cur << (part * 8));
-            part = part + 1;
+            part += 1;
             cur = 0;
             digits = 0;
         } elif (c >= 48 && c <= 57) {
             if (digits == 1 && cur == 0) { return 0 - 1; }
             cur = cur * 10 + (c - 48);
-            digits = digits + 1;
+            digits += 1;
             if (cur > 255) { return 0 - 1; }
         } else {
             return 0 - 1;
         }
-        i = i + 1;
+        i += 1;
         c = load8(s + i);
     }
     if (digits == 0) { return 0 - 1; }
@@ -1213,44 +1244,42 @@ fn net_parse_ipv4(s): i64 {
 # Length of a host name without its one optional trailing dot ("a.b." is "a.b").
 fn _net_name_len(s): i64 {
     var n = strlen(s);
-    if (n > 0 && load8(s + n - 1) == 46) { n = n - 1; }
+    if (n > 0 && load8(s + n - 1) == 46) { n -= 1; }
     return n;
 }
 
-# 1 when a[0..alen) and b[0..blen) are the same name, ASCII case-insensitively.
-fn _net_name_ieq(a, alen, b, blen): i64 {
-    if (alen != blen) { return 0; }
+# Whether a[0..alen) and b[0..blen) are the same name, ASCII case-insensitively.
+fn _net_name_ieq(a, alen, b, blen): bool {
+    if (alen != blen) { return false; }
     var i = 0;
     while (i < alen) {
         var x = load8(a + i);
         var y = load8(b + i);
-        if (x >= 65 && x <= 90) { x = x + 32; }
-        if (y >= 65 && y <= 90) { y = y + 32; }
-        if (x != y) { return 0; }
-        i = i + 1;
+        if (x >= 65 && x <= 90) { x += 32; }
+        if (y >= 65 && y <= 90) { y += 32; }
+        if (x != y) { return false; }
+        i += 1;
     }
-    return 1;
+    return true;
 }
 
-# 1 for `localhost` and every `*.localhost` name, any case, trailing dot or not. RFC 6761 §6.3:
+# True for `localhost` and every `*.localhost` name, any case, trailing dot or not. RFC 6761 §6.3:
 # these always mean the loopback address and are never sent to a DNS server.
-fn _net_is_localhost(host): i64 {
+fn _net_is_localhost(host): bool {
     var n = _net_name_len(host);
-    if (_net_name_ieq(host, n, "localhost", 9) == 1) { return 1; }
-    if (n > 10 && _net_name_ieq(host + n - 10, 10, ".localhost", 10) == 1) { return 1; }
-    return 0;
+    return _net_name_ieq(host, n, "localhost", 9) || (n > 10 && _net_name_ieq(host + n - 10, 10, ".localhost", 10));
 }
 
 # Index of the first byte at or after `i` in line[0..n) that is not a space or tab.
 fn _net_skip_ws(line, n, i): i64 {
-    while (i < n && (load8(line + i) == 32 || load8(line + i) == 9)) { i = i + 1; }
+    while (i < n && (load8(line + i) == 32 || load8(line + i) == 9)) { i += 1; }
     return i;
 }
 
 # Index just past the field that starts at `i` (it ends at a space, tab, `#` or the line end).
 fn _net_field_end(line, n, i): i64 {
     while (i < n && load8(line + i) != 32 && load8(line + i) != 9 && load8(line + i) != 35) {
-        i = i + 1;
+        i += 1;
     }
     return i;
 }
@@ -1284,8 +1313,8 @@ fn _net_conf_line(line, n, want): i64 {
     while (i < n && load8(line + i) != 35) {
         e = _net_field_end(line, n, i);
         var flen = e - i;
-        if (flen > 0 && load8(line + e - 1) == 46) { flen = flen - 1; }
-        if (_net_name_ieq(line + i, flen, want, wlen) == 1) { return addr; }
+        if (flen > 0 && load8(line + e - 1) == 46) { flen -= 1; }
+        if (_net_name_ieq(line + i, flen, want, wlen)) { return addr; }
         i = _net_skip_ws(line, n, e);
     }
     return 0 - 1;
@@ -1319,11 +1348,11 @@ fn _net_conf_scan(path, want): i64 {
                 } elif (ll < 1024) {
                     if (c == 13) { c = 32; }        # CRLF files: the CR is whitespace
                     store8(&line + ll, c);
-                    ll = ll + 1;
+                    ll += 1;
                 } else {
                     over = 1;
                 }
-                i = i + 1;
+                i += 1;
             }
         }
     }
@@ -1374,16 +1403,16 @@ fn _net_dns_build(q, id, host): i64 {
             if (llen == 0) { return 0 - 1; }
             store8(q + lab, llen);
             lab = w;
-            w = w + 1;
+            w += 1;
             llen = 0;
         } else {
             if (c <= 32 || c == 127) { return 0 - 1; }
-            llen = llen + 1;
+            llen += 1;
             if (llen > 63) { return 0 - 1; }
             store8(q + w, c);
-            w = w + 1;
+            w += 1;
         }
-        i = i + 1;
+        i += 1;
     }
     if (llen == 0) { return 0 - 1; }
     store8(q + lab, llen);
@@ -1397,22 +1426,25 @@ fn _net_dns_build(q, id, host): i64 {
 
 # Offset just past the (possibly compressed) name at `off` in r[0..n), or -1 if it runs off
 # the end or uses a reserved label type. Pointers are not followed — only skipped.
+# 6.7.18 (the user's D1): this and _net_dns_answer read the peer's datagram through a fn-local
+# slice of r[0, n), checked in every build — a bound they get wrong is `slice bounds violation`,
+# never a read past the datagram (tests/gates/memory/net_parsers_read_through_slices.sh).
+# CHANGELOG [6.7.18]
 fn _net_dns_skip(r, n, off): i64 {
+    var s: [u8] = 0;
+    slice_set(&s, r, n);
     while (off < n) {
-        var b = load8(r + off);
+        var b = s[off];
         if (b == 0) { return off + 1; }
         if ((b & 0xC0) == 0xC0) {
             if (off + 2 > n) { return 0 - 1; }
             return off + 2;
         }
         if ((b & 0xC0) != 0) { return 0 - 1; }
-        off = off + 1 + b;
+        off += 1 + b;
     }
     return 0 - 1;
 }
-
-# Read the big-endian u16 at r + off.
-fn _net_be16(r, off): i64 { return (load8(r + off) << 8) | load8(r + off + 1); }
 
 # Judge the datagram r[0..n) against the query q[0..qlen). Returns the first A/IN address in
 # its answer section; -1 when it IS the reply to this query but carries none (NXDOMAIN,
@@ -1421,29 +1453,34 @@ fn _net_be16(r, off): i64 { return (load8(r + off) << 8) | load8(r + off + 1); }
 # datagram cannot end the lookup. Every read is bounded by `n`.
 fn _net_dns_answer(r, n, q, qlen): i64 {
     if (n < qlen) { return 0 - 2; }
-    if (load8(r) != load8(q) || load8(r + 1) != load8(q + 1)) { return 0 - 2; }
-    if ((load8(r + 2) & 0x80) == 0) { return 0 - 2; }
-    if (_net_be16(r, 4) != 1) { return 0 - 2; }
-    if (memeq(r + 12, q + 12, qlen - 12) != 1) { return 0 - 2; }
-    if ((load8(r + 3) & 0x0F) != 0) { return 0 - 1; }
-    var an = _net_be16(r, 6);
+    var s: [u8] = 0;
+    slice_set(&s, r, n);
+    var qs: [u8] = 0;
+    slice_set(&qs, q, qlen);
+    if (s[0] != qs[0] || s[1] != qs[1]) { return 0 - 2; }
+    if ((s[2] & 0x80) == 0) { return 0 - 2; }
+    if (slice_get_be(&s, 4, 2) != 1) { return 0 - 2; }
+    for (var qi = 12; qi < qlen; qi += 1) {
+        if (s[qi] != qs[qi]) { return 0 - 2; }
+    }
+    if ((s[3] & 0x0F) != 0) { return 0 - 1; }
+    var an = slice_get_be(&s, 6, 2);
     var off = qlen;
     var k = 0;
     while (k < an) {
         off = _net_dns_skip(r, n, off);
         if (off < 0) { return 0 - 1; }
         if (off + 10 > n) { return 0 - 1; }
-        var typ = _net_be16(r, off);
-        var cls = _net_be16(r, off + 2);
-        var rdl = _net_be16(r, off + 8);
-        off = off + 10;
+        var typ = slice_get_be(&s, off, 2);
+        var cls = slice_get_be(&s, off + 2, 2);
+        var rdl = slice_get_be(&s, off + 8, 2);
+        off += 10;
         if (off + rdl > n) { return 0 - 1; }
         if (typ == 1 && cls == 1 && rdl == 4) {
-            return (load8(r + off) | (load8(r + off + 1) << 8) | (load8(r + off + 2) << 16)
-              | (load8(r + off + 3) << 24));
+            return s[off] | (s[off + 1] << 8) | (s[off + 2] << 16) | (s[off + 3] << 24);
         }
-        off = off + rdl;
-        k = k + 1;
+        off += rdl;
+        k += 1;
     }
     return 0 - 1;
 }
@@ -1475,9 +1512,9 @@ fn net_dns_query_ipv4(host, ns, port): i64 {
             var rt, rn = sock_recv(fd, &r, 512);
             if (is_err_result(rt) == 1) { reads = 8; }
             elif (rn <= 0) { reads = 8; }
-            else { found = _net_dns_answer(&r, rn, &q, qlen); reads = reads + 1; }
+            else { found = _net_dns_answer(&r, rn, &q, qlen); reads += 1; }
         }
-        tries = tries + 1;
+        tries += 1;
     }
     sock_close(fd);
     if (found < 0) { return 0 - 1; }
@@ -1495,7 +1532,7 @@ fn net_resolve_ipv4(host): i64 {
     if (load8(host) == 0) { return 0 - 1; }
     var lit = net_parse_ipv4(host);
     if (lit != 0 - 1) { return lit; }
-    if (_net_is_localhost(host) == 1) { return INADDR_LOOPBACK(); }
+    if (_net_is_localhost(host)) { return INADDR_LOOPBACK(); }
     #ifdef CYRIUS_TARGET_WIN
     var w = _net_resolve_win(host);
     return w;
@@ -1530,7 +1567,7 @@ fn _net_resolve_win(host): i64 {
     while (i < n) {
         var c = load8(host + i);
         if (c <= 32 || c >= 127) { return 0 - 1; }
-        i = i + 1;
+        i += 1;
     }
     if (_net_wsa_init() != 0) { return 0 - 1; }
     var hints[48];                                  # ADDRINFOA

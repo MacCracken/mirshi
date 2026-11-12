@@ -20,12 +20,21 @@
 # guard them: fail clearly (cyr_mmap → -1; callers' `< 0` paths return 0) rather
 # than silently invoke the wrong kernel call. Defensive — no agnos consumer
 # reaches these (issue 2026-06-23-agnos-portability-sweep-residuals, part 2).
+# cx fails the same way: cxvm forwarded the guest's mmap to the HOST kernel, which mapped it and
+# handed back a HOST address no guest load or store can reach (cxvm traps the first one), so
+# mmap_anon returned a non-zero pointer its caller's null check passed. Now -1, so mmap_anon
+# answers 0 — the same refusal lib/thread.cyr's cx arm makes for its stacks. CHANGELOG [6.7.12]
 fn cyr_mmap(addr, length, prot, flags, fd, offset): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;
     #endif
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 1;
+    #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_CX
     return syscall(9, addr, length, prot, flags, fd, offset);
+    #endif
     #endif
 }
 

@@ -44,9 +44,10 @@ var CHAN_BLOCKING = 0;        # the serial ring: nothing waits (lib/thread.cyr's
 # parent. The serial path shares one process-global TLS array, so we emulate
 # that contract — snapshot the caller's slots, hand the body a zeroed view, run
 # it, then restore. Without this the body's thread-local writes (e.g. sigil's
-# crypto_bank_set(worker_bank)) would persist past join and corrupt the main
-# thread's invariant (cbank()==0 on the main/serial path) — a latent
-# wrong-scratch-lane bug for any crypto run on main after a batch fans out.
+# crypto-lane slot: a lane the body took for life would replace the caller's,
+# whose own lane then stays held in sigil 3.13.14's pool forever; through 3.13.13
+# the slot held crypto_bank_set's bank) would persist past join into the
+# caller's slots — per-thread state a real thread never shares.
 # Returns a fake non-zero handle so callers' null-checks pass + join is valid.
 fn thread_create(fp, arg): i64 {
     _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before the spawn

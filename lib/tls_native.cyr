@@ -283,6 +283,9 @@ enum TlsSignatureScheme {
 # trailer (TLSInnerPlaintext, §5.2) ≤ 256 bytes of headroom.
 var TLS_RECORD_HEADER_LEN = 5;
 # 6.7.6: a const that sizes a buffer elsewhere in the stack keeps its public var for the API.
+# The protocol's 2^14, not a tunable (the user's decision D17, 2026-10-15), and the var a read-only mirror of
+# `_TLS_RECORD_MAX_PLAINTEXT` (D16): every record limit, fragment clamp and buffer in the stack reads the const, so a
+# write to the var changes nothing. CHANGELOG [6.7.12]
 const _TLS_RECORD_MAX_PLAINTEXT = 16384;          # 2^14, §5.1
 var TLS_RECORD_MAX_PLAINTEXT = _TLS_RECORD_MAX_PLAINTEXT;
 var TLS_RECORD_MAX_CIPHERTEXT = 16640;            # 16384 + 256, §5.2
@@ -290,7 +293,12 @@ var TLS_RECORD_MAX_CIPHERTEXT = 16640;            # 16384 + 256, §5.2
 # tls_native_read drains before yielding to the caller — bounds a peer that
 # floods post-handshake messages instead of sending application data.
 var TLS_POST_HANDSHAKE_DRAIN_MAX = 32;
+# The KeyUpdates a peer may send back to back, with no application data between them, before the
+# connection fails (OpenSSL's MAX_KEY_UPDATE_MESSAGES and BoringSSL's kMaxKeyUpdates are 32). Each
+# costs a key derivation, and an update_requested one a record back. CHANGELOG [6.7.18]
+const _TN_KEY_UPDATE_MAX = 32;
 const _TLS_AEAD_NONCE_LEN = 12;                   # 96-bit per §5.3
+# Read-only mirror of `_TLS_AEAD_NONCE_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS_AEAD_NONCE_LEN = _TLS_AEAD_NONCE_LEN;
 var TLS_AEAD_TAG_LEN = 16;                        # Poly1305 + GCM both 128-bit
 var TLS_SEQ_NUM_LEN = 8;                          # 64-bit counter

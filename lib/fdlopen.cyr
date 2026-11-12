@@ -108,7 +108,8 @@
 # differently).
 
 # 6.6.9: alloc / memcpy / cyr_munmap / the dynlib_auxv_* helpers were all called and none
-# included. CHANGELOG [6.6.9]
+# included. CHANGELOG [6.6.9] — and 6.7.18's secure-exec test calls the uid / gid wrappers.
+include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/mmap.cyr"
@@ -338,7 +339,55 @@ fn dl_longjmp(buf, val): i64 {
 # the setuid privilege-escalation vector where a non-root caller's $HOME copy
 # would be execve'd as root. See the proposal in docs/development/proposals/.
 var _fdl_trusted_mode = 0;
-var _FDL_SYSTEM_HELPER = "/usr/lib/cyrius/dlopen-helper";
+const _FDL_SYSTEM_HELPER = "/usr/lib/cyrius/dlopen-helper";
+
+# ⛔ CYRIUS-2026-0041 (6.7.18): the TRUSTED path is taken whenever this process runs with
+# privileges its invoker lacks — a setuid / setgid exec, file capabilities, an LSM transition —
+# not only when the caller asks for it. lib/tls.cyr's libssl backend called fdlopen_init_full,
+# which read HOME from /proc/self/environ (the invoker's, kept across a setuid exec) and ran
+# $HOME/.cyrius/dlopen-helper in-process: a setuid-root program on that backend ran a local
+# user's code as root, and offered no way to ask for fdlopen_init_trusted. Now
+# `_fdlopen_secure_exec` (the kernel's AT_SECURE, a real/effective uid or gid mismatch, or an
+# auxv this process may not read) sends every entry — the path, `fdlopen_helper_available`,
+# `fdlopen_init_full` — to the root-owned system helper, verified, or -9 (FDL_ERR_UNTRUSTED);
+# `fdlopen_trusted_only(1)` asks for the same in any process. CHANGELOG [6.7.18]
+var _fdl_trusted_only = 0;
+# Test-only seam: while 1, `_fdlopen_secure_exec` answers 1 (a setuid run needs root to make).
+# Nothing outside tests/ sets it.
+var _fdl_secure_test = 0;
+
+# Take the trusted, root-owned helper for EVERY fdlopen init in this process (1), or only when
+# the process is a secure exec (0, the default). A setuid consumer may call it first to make the
+# choice explicit; it is already the answer there. Returns the previous setting.
+fn fdlopen_trusted_only(on): i64 {
+    var was = _fdl_trusted_only;
+    _fdl_trusted_only = 0;
+    if (on != 0) { _fdl_trusted_only = 1; }
+    return was;
+}
+
+# 1 when this process may not trust its invoker's environment: the kernel set AT_SECURE (23) in
+# its auxv, its real and effective uid or gid differ, or its auxv cannot be read (a non-dumpable
+# process — every secure exec that is not root — reads /proc/self/auxv as EACCES): fail closed.
+fn _fdlopen_secure_exec(): i64 {
+    if (_fdl_secure_test == 1) { return 1; }
+    #ifdef CYRIUS_TARGET_LINUX
+    var ab[4096];
+    var an = dynlib_read_auxv(&ab, 4096);
+    if (an <= 0) { return 1; }
+    if (dynlib_auxv_get(&ab, an, 23) != 0) { return 1; }
+    if (sys_getuid() != sys_geteuid()) { return 1; }
+    if (sys_getgid() != sys_getegid()) { return 1; }
+    #endif
+    return 0;
+}
+
+# 1 when the next init must take the trusted path (asked for, or a secure exec).
+fn _fdlopen_must_trust(): i64 {
+    if (_fdl_trusted_mode == 1) { return 1; }
+    if (_fdl_trusted_only == 1) { return 1; }
+    return _fdlopen_secure_exec();
+}
 
 # Build the dlopen-helper path into `buf`, returning length on success or 0.
 # Default: `$HOME/.cyrius/dlopen-helper`. In trusted mode: the root-owned
@@ -352,13 +401,9 @@ fn _fdlopen_helper_path(buf, bufsz): i64 {
     #endif
     if (buf == 0) { return 0; }
     if (bufsz < 64) { return 0; }
-    if (_fdl_trusted_mode == 1) {
-        var c = 0;
-        while (load8(_FDL_SYSTEM_HELPER + c) != 0) {
-            store8(buf + c, load8(_FDL_SYSTEM_HELPER + c));
-            c = c + 1;
-        }
-        store8(buf + c, 0);
+    if (_fdlopen_must_trust() == 1) {   # never $HOME in a secure exec (CYRIUS-2026-0041)
+        var c = strlen(_FDL_SYSTEM_HELPER);
+        memcpy(buf, _FDL_SYSTEM_HELPER, c + 1);   # with its NUL
         return c;
     }
     # Read HOME from environ via getenv-style walk. Since we may
@@ -382,42 +427,22 @@ fn _fdlopen_helper_path(buf, bufsz): i64 {
         var j = i;
         while (j < n) {
             if (load8(envbuf + j) == 0) { break; }
-            j = j + 1;
+            j += 1;
         }
         # Check if it starts with "HOME="
-        if (j - i >= 5) {
-            if (load8(entry_start + 0) == 72) {        # 'H'
-                if (load8(entry_start + 1) == 79) {    # 'O'
-                    if (load8(entry_start + 2) == 77) {# 'M'
-                        if (load8(entry_start + 3) == 69) {  # 'E'
-                            if (load8(entry_start + 4) == 61) {  # '='
-                                home = entry_start + 5;
-                                home_len = (j - i) - 5;
-                            }
-                        }
-                    }
-                }
-            }
+        if (j - i >= 5 && memeq(entry_start, "HOME=", 5) == 1) {
+            home = entry_start + 5;
+            home_len = (j - i) - 5;
         }
         i = j + 1;
     }
     if (home == 0) { return 0; }
     if (home_len + 24 > bufsz) { return 0; }
 
-    # Copy HOME + "/.cyrius/dlopen-helper" into buf
-    var k = 0;
-    while (k < home_len) {
-        store8(buf + k, load8(home + k));
-        k = k + 1;
-    }
-    var suffix = "/.cyrius/dlopen-helper";
-    var s = 0;
-    while (load8(suffix + s) != 0) {
-        store8(buf + home_len + s, load8(suffix + s));
-        s = s + 1;
-    }
-    store8(buf + home_len + s, 0);
-    return home_len + s;
+    # Copy HOME + "/.cyrius/dlopen-helper" (22 bytes and its NUL) into buf
+    memcpy(buf, home, home_len);
+    memcpy(buf + home_len, "/.cyrius/dlopen-helper", 23);
+    return home_len + 22;
 }
 
 # Check whether `$HOME/.cyrius/dlopen-helper` exists. Returns 1 if
@@ -433,6 +458,10 @@ fn fdlopen_helper_available(): i64 {
     # agree, or a consumer (lib/tls.cyr:218) sees "available" and then fails to init.
     return 0;
     #endif
+    # A secure exec (or a caller that asked) has a helper only when the root-owned system one
+    # verifies — never "available" for one that fdlopen_init_full would then refuse.
+    # CHANGELOG [6.7.18]
+    if (_fdlopen_must_trust() == 1) { return _fdlopen_verify_trusted(_FDL_SYSTEM_HELPER); }
     var pathbuf = alloc(512);
     if (pathbuf == 0) { return 0; }
     var pl = _fdlopen_helper_path(pathbuf, 512);
@@ -453,7 +482,7 @@ fn fdlopen_helper_available(): i64 {
 # fdlopen state buffer passed to `fdlopen_init` / `fdlopen_init_full`.
 # Currently 256 bytes; jmp_buf (128) + fn-pointer slots (88) + status
 # (8) + flags (8) + reserved (24).
-fn fdlopen_state_size(): i64 { return 256; }
+fn fdlopen_state_size(): i64 { return FDL_STATE_SIZE; }
 
 # ---------------------------------------------------------------
 # Minimal ELF PT_LOAD mapper (PIE ET_DYN).
@@ -470,7 +499,13 @@ fn fdlopen_state_size(): i64 { return 256; }
 #   out_info+32 : phentsize
 # Returns 0 on success, negative error code on failure.
 # ---------------------------------------------------------------
-fn _fdlopen_mmap_elf(path, out_info): i64 {
+fn _fdlopen_mmap_elf(path, out_info): i64 { return _fdlopen_mmap_elf_v(path, out_info, 0); }
+
+# `verify` 1 (the trusted helper): the file is opened O_NOFOLLOW and the OPEN FD is checked — a
+# regular file, uid 0, not group/other-writable — before a byte is mapped, else -9
+# (FDL_ERR_UNTRUSTED). `_fdlopen_verify_trusted` lstat'ed the NAME and this reopened it, so the
+# inode mapped need not be the one checked. CYRIUS-2026-0041, CHANGELOG [6.7.18]
+fn _fdlopen_mmap_elf_v(path, out_info, verify): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;   # Linux-host-only (raw open/fstat/mmap mis-dispatch on agnos)
     #endif
@@ -481,8 +516,13 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
     # proceed into x86-only code. CHANGELOG [6.6.4]
     return 0 - 1;
     #endif
-    var fd = syscall(2, path, 0, 0);   # O_RDONLY
-    if (fd < 0) { return 0 - 1; }
+    var oflags = 0;                    # O_RDONLY
+    if (verify == 1) { oflags = 0x20000; }   # | O_NOFOLLOW (x86_64 Linux)
+    var fd = syscall(2, path, oflags, 0);
+    if (fd < 0) {
+        if (verify == 1 && fd == 0 - 40) { return 0 - 9; }   # ELOOP: a link at the name
+        return 0 - 1;
+    }
 
     # fstat for file size
     var stbuf = alloc(144);
@@ -490,6 +530,15 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
     var sr = syscall(5, fd, stbuf);    # fstat
     if (sr < 0) { syscall(3, fd); return 0 - 1; }
     var fsize = load64(stbuf + 48);    # st_size at offset 48
+    if (verify == 1) {
+        var vmode = load32(stbuf + 24);    # st_mode
+        var vuid = load32(stbuf + 28);     # st_uid
+        var vbad = 0;
+        if ((vmode & 0xF000) != 0x8000) { vbad = 1; }   # not a regular file
+        if (vuid != 0) { vbad = 1; }                    # not root-owned
+        if ((vmode & 0x12) != 0) { vbad = 1; }          # group/other-writable
+        if (vbad == 1) { syscall(3, fd); return 0 - 9; }
+    }
 
     # mmap file read-only
     var fmap = syscall(9, 0, fsize, 1, 2, fd, 0);   # PROT_READ, MAP_PRIVATE
@@ -524,7 +573,7 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
             var end = va + ms;
             if (end > span) { span = end; }
         }
-        pi = pi + 1;
+        pi += 1;
     }
     # Page-align span up
     span = (span + 4095) / 4096 * 4096;
@@ -546,13 +595,9 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
             # Copy file bytes
             memcpy(base + p_va, fmap + p_off, p_fz);
             # BSS zero-fill (alloc_anon already zero, but belt-and-braces)
-            var zi = p_fz;
-            while (zi < p_mz) {
-                store8(base + p_va + zi, 0);
-                zi = zi + 1;
-            }
+            if (p_mz > p_fz) { memset(base + p_va + p_fz, 0, p_mz - p_fz); }
         }
-        pi = pi + 1;
+        pi += 1;
     }
 
     # Second pass: mprotect per p_flags. NB — PF bits and PROT bits
@@ -563,7 +608,6 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
     # PF_X→prot+=1, making PF_R-only segments execute-only (reads
     # SIGSEGV'd silently, which is why v5.5.29's helper main was
     # never reached — ld.so's auxv walk hit unreadable pages).
-    # cyrius lacks bitwise AND so each bit is extracted via div+mod.
     pi = 0;
     while (pi < ephnum) {
         var ph3 = fmap + ephoff + pi * ephent;
@@ -572,24 +616,16 @@ fn _fdlopen_mmap_elf(path, out_info): i64 {
             var p_va2 = load64(ph3 + 16);
             var p_mz2 = load64(ph3 + 40);
             var prot = 0;
-            # PF_R (bit 2, value 4) → PROT_READ (value 1)
-            var r_half = p_fl / 4;
-            var r_quarter = r_half / 2;
-            if (r_half - r_quarter * 2 == 1) { prot = prot + 1; }
-            # PF_W (bit 1, value 2) → PROT_WRITE (value 2)
-            var w_half = p_fl / 2;
-            var w_quarter = w_half / 2;
-            if (w_half - w_quarter * 2 == 1) { prot = prot + 2; }
-            # PF_X (bit 0, value 1) → PROT_EXEC (value 4)
-            var x_half = p_fl / 2;
-            if (p_fl - x_half * 2 == 1) { prot = prot + 4; }
+            if ((p_fl & 4) != 0) { prot |= 1; }        # PF_R (4) → PROT_READ (1)
+            if ((p_fl & 2) != 0) { prot |= 2; }        # PF_W (2) → PROT_WRITE (2)
+            if ((p_fl & 1) != 0) { prot |= 4; }        # PF_X (1) → PROT_EXEC (4)
             # Page-align vaddr down, length up
             var vpg = p_va2 / 4096 * 4096;
             var vend = (p_va2 + p_mz2 + 4095) / 4096 * 4096;
             if (prot == 0) { prot = 1; }                # PROT_READ fallback
             syscall(10, base + vpg, vend - vpg, prot);
         }
-        pi = pi + 1;
+        pi += 1;
     }
 
     # Munmap the file backing — we've copied what we need
@@ -629,7 +665,7 @@ fn _fdlopen_hex64(v, out): i64 {
             store8(out + i, 87 + d);        # 'a'..'f'  (97 - 10)
         }
         v = v / 16;
-        i = i - 1;
+        i -= 1;
     }
     store8(out + 16, 0);
     return 17;
@@ -646,6 +682,18 @@ fn _fdlopen_hex64(v, out): i64 {
 #                     auxv pairs, AT_NULL
 # RSP must be 16-byte aligned at ld.so entry.
 # ---------------------------------------------------------------
+# Its words: argc, argv[0..3), argv's NULL and the empty envp's NULL (6), then the 16 auxv pairs
+# written below and AT_NULL (34).
+const _FDL_STACK_WORDS = 6 + 2 * 17;
+
+# Store the two words (a, b) at p — an auxv (tag, value), or two of the words before the auxv —
+# and return the address past them.
+fn _fdl_put2(p, a, b): i64 {
+    store64(p, a);
+    store64(p + 8, b);
+    return p + 16;
+}
+
 fn _fdlopen_build_stack(region, region_size, helper_info, ldso_info,
   auxv_buf, auxv_len, state_addr, cb_addr) {
     var region_top = region + region_size;
@@ -653,21 +701,21 @@ fn _fdlopen_build_stack(region, region_size, helper_info, ldso_info,
     # String table at the high end
     var sptr = region_top;
     # 16 random bytes for AT_RANDOM (synth — use address as entropy seed)
-    sptr = sptr - 16;
+    sptr -= 16;
     var rand_ptr = sptr;
     var hi = 0;
     while (hi < 16) {
         store8(rand_ptr + hi, hi + 1);      # any deterministic fill
-        hi = hi + 1;
+        hi += 1;
     }
 
     # cb_hex
-    sptr = sptr - 17;
+    sptr -= 17;
     var cb_hex_ptr = sptr;
     _fdlopen_hex64(cb_addr, cb_hex_ptr);
 
     # state_hex
-    sptr = sptr - 17;
+    sptr -= 17;
     var state_hex_ptr = sptr;
     _fdlopen_hex64(state_addr, state_hex_ptr);
 
@@ -678,31 +726,23 @@ fn _fdlopen_build_stack(region, region_size, helper_info, ldso_info,
     if (pl == 0) { return 0; }
     sptr = sptr - (pl + 1);
     var path_ptr = sptr;
-    var ci = 0;
-    while (ci < pl) {
-        store8(path_ptr + ci, load8(pathbuf + ci));
-        ci = ci + 1;
-    }
-    store8(path_ptr + pl, 0);
+    memcpy(path_ptr, pathbuf, pl + 1);                 # with its NUL
 
     # Align string-table bottom to 16 bytes (downward)
     sptr = sptr / 16 * 16;
 
-    # Space budget:
-    #   argc(1) + argv[0..2](3) + argv_null(1) + envp_null(1) = 6 u64
-    #   auxv pairs: 15 tag/value pairs + AT_NULL = 32 u64
-    #   Total 38 u64 = 304 bytes. Align down to 16.
-    var rsp = sptr - 304;
+    # Space budget (_FDL_STACK_WORDS): argc(1) + argv[0..2](3) + argv_null(1) + envp_null(1) = 6
+    # u64, then 16 auxv tag/value pairs + AT_NULL = 34 u64: 40 u64 = 320 bytes. Align down to 16.
+    # 6.7.18: the budget said 15 pairs (304 bytes), so AT_NULL landed on the first bytes of the
+    # helper path above it, and argv[0] / AT_EXECFN named "". CHANGELOG [6.7.18]
+    var rsp = sptr - _FDL_STACK_WORDS * 8;
     rsp = rsp / 16 * 16;
 
     # Fill forward from rsp
     var p = rsp;
-    store64(p, 3); p = p + 8;                          # argc
-    store64(p, path_ptr); p = p + 8;                   # argv[0]
-    store64(p, state_hex_ptr); p = p + 8;              # argv[1]
-    store64(p, cb_hex_ptr); p = p + 8;                 # argv[2]
-    store64(p, 0); p = p + 8;                          # argv terminator
-    store64(p, 0); p = p + 8;                          # envp (empty)
+    p = _fdl_put2(p, 3, path_ptr);                      # argc, argv[0]
+    p = _fdl_put2(p, state_hex_ptr, cb_hex_ptr);        # argv[1], argv[2]
+    p = _fdl_put2(p, 0, 0);                             # argv terminator, envp (empty)
 
     # auxv entries (tag, value). Tags needed by ld.so:
     #   3 AT_PHDR, 4 AT_PHENT, 5 AT_PHNUM, 6 AT_PAGESZ, 7 AT_BASE,
@@ -710,43 +750,26 @@ fn _fdlopen_build_stack(region, region_size, helper_info, ldso_info,
     #   14 AT_EGID, 16 AT_HWCAP, 23 AT_SECURE, 25 AT_RANDOM,
     #   31 AT_EXECFN, 33 AT_SYSINFO_EHDR, 0 AT_NULL
 
-    store64(p, 3);  p = p + 8;
-    store64(p, load64(helper_info + 16)); p = p + 8;   # phdr
-    store64(p, 4);  p = p + 8;
-    store64(p, load64(helper_info + 32)); p = p + 8;   # phentsize
-    store64(p, 5);  p = p + 8;
-    store64(p, load64(helper_info + 24)); p = p + 8;   # phnum
-    store64(p, 6);  p = p + 8;
-    store64(p, 4096); p = p + 8;                       # AT_PAGESZ
-    store64(p, 7);  p = p + 8;
-    store64(p, load64(ldso_info + 0)); p = p + 8;      # AT_BASE
-    store64(p, 8);  p = p + 8;
-    store64(p, 0); p = p + 8;                          # AT_FLAGS = 0
-    store64(p, 9);  p = p + 8;
-    store64(p, load64(helper_info + 8)); p = p + 8;    # AT_ENTRY
-    # AT_UID / AT_EUID / AT_GID / AT_EGID — source from our auxv
-    store64(p, 11); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 11)); p = p + 8;
-    store64(p, 12); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 12)); p = p + 8;
-    store64(p, 13); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 13)); p = p + 8;
-    store64(p, 14); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 14)); p = p + 8;
-    store64(p, 16); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 16)); p = p + 8;  # AT_HWCAP
-    store64(p, 23); p = p + 8;
-    store64(p, 0); p = p + 8;                          # AT_SECURE=0 (regular exe)
-    store64(p, 25); p = p + 8;
+    p = _fdl_put2(p, 3, load64(helper_info + 16));       # AT_PHDR
+    p = _fdl_put2(p, 4, load64(helper_info + 32));       # AT_PHENT
+    p = _fdl_put2(p, 5, load64(helper_info + 24));       # AT_PHNUM
+    p = _fdl_put2(p, 6, 4096);                           # AT_PAGESZ
+    p = _fdl_put2(p, 7, load64(ldso_info + 0));          # AT_BASE
+    p = _fdl_put2(p, 8, 0);                              # AT_FLAGS = 0
+    p = _fdl_put2(p, 9, load64(helper_info + 8));        # AT_ENTRY
+    # AT_UID / AT_EUID / AT_GID / AT_EGID / AT_HWCAP — source from our auxv
+    p = _fdl_put2(p, 11, dynlib_auxv_get(auxv_buf, auxv_len, 11));
+    p = _fdl_put2(p, 12, dynlib_auxv_get(auxv_buf, auxv_len, 12));
+    p = _fdl_put2(p, 13, dynlib_auxv_get(auxv_buf, auxv_len, 13));
+    p = _fdl_put2(p, 14, dynlib_auxv_get(auxv_buf, auxv_len, 14));
+    p = _fdl_put2(p, 16, dynlib_auxv_get(auxv_buf, auxv_len, 16));
+    p = _fdl_put2(p, 23, _fdlopen_secure_exec());       # AT_SECURE: this process's (6.7.18)
     var real_rnd = dynlib_auxv_get(auxv_buf, auxv_len, 25);
     if (real_rnd == 0) { real_rnd = rand_ptr; }
-    store64(p, real_rnd); p = p + 8;                   # AT_RANDOM
-    store64(p, 31); p = p + 8;
-    store64(p, path_ptr); p = p + 8;                   # AT_EXECFN
-    store64(p, 33); p = p + 8;
-    store64(p, dynlib_auxv_get(auxv_buf, auxv_len, 33)); p = p + 8;  # AT_SYSINFO_EHDR
-    store64(p, 0); p = p + 8;                          # AT_NULL tag
-    store64(p, 0); p = p + 8;                          # AT_NULL val
+    p = _fdl_put2(p, 25, real_rnd);                      # AT_RANDOM
+    p = _fdl_put2(p, 31, path_ptr);                      # AT_EXECFN
+    p = _fdl_put2(p, 33, dynlib_auxv_get(auxv_buf, auxv_len, 33));   # AT_SYSINFO_EHDR
+    p = _fdl_put2(p, 0, 0);                              # AT_NULL
 
     return rsp;
 }
@@ -795,7 +818,7 @@ fn _fdlopen_run_loader(state): i64 {
     # Map helper ELF
     var helper_info = alloc(64);
     if (helper_info == 0) { return 0 - 3; }
-    var hr = _fdlopen_mmap_elf(hpath, helper_info);
+    var hr = _fdlopen_mmap_elf_v(hpath, helper_info, _fdlopen_must_trust());   # 6.7.18
     if (hr != 0) { return hr; }
 
     # Map ld.so (canonical path — future work: read helper's PT_INTERP)
@@ -807,7 +830,7 @@ fn _fdlopen_run_loader(state): i64 {
     # Allocate fresh 64 KB stack region
     # (renamed from `stack` → `stk_region` in v5.5.36 because `stack`
     # became a reserved keyword for stack-local array declarations)
-    var stack_sz = 0x10000;
+    var stack_sz = FDL_STACK_SIZE;
     var stk_region = syscall(9, 0, stack_sz, 3, 34, 0 - 1, 0);
     if (stk_region < 0) { return 0 - 3; }
 
@@ -832,7 +855,7 @@ fn _fdlopen_run_loader(state): i64 {
 
     # rt != 0 means helper invoked callback and longjmp'd us back.
     # Validate state was populated.
-    if (load64(state + 128) == 0) { return 0 - 7; }
+    if (load64(state + FDL_DLOPEN) == 0) { return 0 - 7; }
     return 0;
 }
 
@@ -843,21 +866,20 @@ fn _fdlopen_run_loader(state): i64 {
 # continues (see the log at the end of this file).
 fn fdlopen_init(state): i64 {
     if (state == 0) { return 0 - 3; }
-    var i = 0;
-    while (i < 256) { store8(state + i, 0); i = i + 1; }
+    memset(state, 0, FDL_STATE_SIZE);
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
     if (fdlopen_helper_available() == 0) {
-        store64(state + 216, 0 - 1);
+        store64(state + FDL_STATUS, 0 - 1);
         return 0 - 1;
     }
     # Shape-stable return: orchestration callers must explicitly
     # opt in via fdlopen_init_full.
-    store64(state + 216, 0 - 8);
+    store64(state + FDL_STATUS, 0 - 8);
     return 0 - 8;
     #endif
     #endif
-    store64(state + 216, 0 - 6);
+    store64(state + FDL_STATUS, 0 - 6);
     return 0 - 6;
 }
 
@@ -876,25 +898,29 @@ fn fdlopen_init(state): i64 {
 # `dlsym("getpid")` → `fncall0(...) == syscall(39)` round-trip).
 fn fdlopen_init_full(state): i64 {
     if (state == 0) { return 0 - 3; }
-    var i = 0;
-    while (i < 256) { store8(state + i, 0); i = i + 1; }
+    # A secure exec, or a process that asked: the trusted entry, -9 without a verified system
+    # helper (CYRIUS-2026-0041). CHANGELOG [6.7.18]
+    if (_fdl_trusted_mode == 0) {
+        if (_fdlopen_must_trust() == 1) { return fdlopen_init_trusted(state); }
+    }
+    memset(state, 0, FDL_STATE_SIZE);
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
     if (fdlopen_helper_available() == 0) {
-        store64(state + 216, 0 - 1);
+        store64(state + FDL_STATUS, 0 - 1);
         return 0 - 1;
     }
     _fdlopen_state_global = state;
     var rc = _fdlopen_run_loader(state);
     if (rc != 0) {
-        store64(state + 216, rc);
+        store64(state + FDL_STATUS, rc);
         return rc;
     }
-    store64(state + 216, 1);
+    store64(state + FDL_STATUS, 1);
     return 0;
     #endif
     #endif
-    store64(state + 216, 0 - 6);
+    store64(state + FDL_STATUS, 0 - 6);
     return 0 - 6;
 }
 
@@ -948,7 +974,7 @@ fn fdlopen_init_trusted(state): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
     if (_fdlopen_verify_trusted(_FDL_SYSTEM_HELPER) == 0) {
-        if (state != 0) { store64(state + 216, 0 - 9); }
+        if (state != 0) { store64(state + FDL_STATUS, 0 - 9); }
         return 0 - 9;
     }
     _fdl_trusted_mode = 1;
@@ -958,7 +984,7 @@ fn fdlopen_init_trusted(state): i64 {
     #endif
     #endif
     # Non-x86-Linux: foreign-dlopen is glibc-shaped; unsupported here.
-    if (state != 0) { store64(state + 216, 0 - 6); }
+    if (state != 0) { store64(state + FDL_STATUS, 0 - 6); }
     return 0 - 6;
 }
 
@@ -966,36 +992,36 @@ fn fdlopen_init_trusted(state): i64 {
 # 0 if the state is uninitialised.
 fn fdlopen_slot(state, off): i64 {
     if (state == 0) { return 0; }
-    if (load64(state + 216) != 1) { return 0; }   # FDL_STATUS check
+    if (load64(state + FDL_STATUS) != 1) { return 0; }
     return load64(state + off);
 }
 
 # Returns fn pointer to real glibc `dlopen`, or 0 if state uninit.
-fn fdlopen_dlopen(state): i64 { return fdlopen_slot(state, 128); }
+fn fdlopen_dlopen(state): i64 { return fdlopen_slot(state, FDL_DLOPEN); }
 # Returns fn pointer to real glibc `dlsym`, or 0 if state uninit.
-fn fdlopen_dlsym(state): i64 { return fdlopen_slot(state, 136); }
+fn fdlopen_dlsym(state): i64 { return fdlopen_slot(state, FDL_DLSYM); }
 # Returns fn pointer to real glibc `dlclose`, or 0 if state uninit.
-fn fdlopen_dlclose(state): i64 { return fdlopen_slot(state, 144); }
+fn fdlopen_dlclose(state): i64 { return fdlopen_slot(state, FDL_DLCLOSE); }
 # Returns fn pointer to real glibc `dlerror`, or 0 if state uninit.
-fn fdlopen_dlerror(state): i64 { return fdlopen_slot(state, 152); }
+fn fdlopen_dlerror(state): i64 { return fdlopen_slot(state, FDL_DLERROR); }
 # Returns fn pointer to real glibc `getaddrinfo`, or 0 if state uninit.
-fn fdlopen_getaddrinfo(state): i64 { return fdlopen_slot(state, 160); }
+fn fdlopen_getaddrinfo(state): i64 { return fdlopen_slot(state, FDL_GETADDRINFO); }
 # Returns fn pointer to real glibc `freeaddrinfo`, or 0 if state uninit.
-fn fdlopen_freeaddrinfo(state): i64 { return fdlopen_slot(state, 168); }
+fn fdlopen_freeaddrinfo(state): i64 { return fdlopen_slot(state, FDL_FREEADDRINFO); }
 # Returns fn pointer to real glibc `gai_strerror`, or 0 if state uninit.
-fn fdlopen_gai_strerror(state): i64 { return fdlopen_slot(state, 176); }
+fn fdlopen_gai_strerror(state): i64 { return fdlopen_slot(state, FDL_GAI_STRERROR); }
 # Returns fn pointer to real glibc `strerror`, or 0 if state uninit.
-fn fdlopen_strerror(state): i64 { return fdlopen_slot(state, 184); }
+fn fdlopen_strerror(state): i64 { return fdlopen_slot(state, FDL_STRERROR); }
 # Returns fn pointer to real glibc `setlocale`, or 0 if state uninit.
-fn fdlopen_setlocale(state): i64 { return fdlopen_slot(state, 192); }
+fn fdlopen_setlocale(state): i64 { return fdlopen_slot(state, FDL_SETLOCALE); }
 # Returns fn pointer to real glibc `setenv`, or 0 if state uninit.
-fn fdlopen_setenv(state): i64 { return fdlopen_slot(state, 200); }
+fn fdlopen_setenv(state): i64 { return fdlopen_slot(state, FDL_SETENV); }
 # Returns fn pointer to real glibc `unsetenv`, or 0 if state uninit.
-fn fdlopen_unsetenv(state): i64 { return fdlopen_slot(state, 208); }
+fn fdlopen_unsetenv(state): i64 { return fdlopen_slot(state, FDL_UNSETENV); }
 
 # Report the status code in a state buffer (0 = uninit, 1 = init OK,
 # negative = FdlopenErr code from the last init attempt).
 fn fdlopen_status(state): i64 {
     if (state == 0) { return 0 - 8; }  # FDL_ERR_UNINIT
-    return load64(state + 216);
+    return load64(state + FDL_STATUS);
 }

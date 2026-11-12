@@ -10,7 +10,7 @@
 #
 # 6.6.9: this file INCLUDES lib/fdlopen.cyr (below). It used to tell callers to include it first,
 # on the grounds that the preprocessor's 1 MB output cap could not absorb it; that cap is 24 MB
-# (lex_pp.cyr), and a caller that skipped the include got fdlopen_helper_available /
+# (lex/pp/pass.cyr), and a caller that skipped the include got fdlopen_helper_available /
 # fdlopen_init_full / fdlopen_dlopen / fdlopen_dlsym as ud2 stubs — every libssl call a SIGILL.
 # CHANGELOG [6.6.9]
 #
@@ -130,11 +130,11 @@ fn tls_get_backend(): i64 { return _tls_backend; }
 # +8 (0) or a native handle (the native ctx, not an SSL_CTX) to libssl, which wrote into native
 # memory: tls_ctx_set_max_early_data changed 4 bytes at offset 1024 of a 616-byte native ctx
 # (measured). CHANGELOG [6.6.16]
-fn _tls_backend_is_native(): i64 {
+fn _tls_backend_is_native(): bool {
     #ifndef CYRIUS_TLS_LIBSSL
-    if (_tls_backend == 1) { return 1; }
+    if (_tls_backend == 1) { return true; }
     #endif
-    return 0;
+    return false;
 }
 
 # ⛔ 6.6.17 — EVERY VERB DISPATCHES ON THE CTX IT IS GIVEN, NOT ON THE ACTIVE BACKEND. The global
@@ -147,21 +147,21 @@ fn _tls_backend_is_native(): i64 {
 # 1 when the 40-byte shim `ctx` (tls_connect_alloc / tls_accept_alloc) is the native backend's.
 # The tag is +8: libssl's SSL*, never 0 on a libssl shim (both constructors return 0 when SSL_new
 # fails), and always 0 on a native one. (+24 is not: libssl keeps its deadline there, any value.)
-fn _tls_shim_native(ctx): i64 {
+fn _tls_shim_native(ctx): bool {
     #ifndef CYRIUS_TLS_LIBSSL
-    if (load64(ctx + 8) == 0) { return 1; }
+    if (load64(ctx + 8) == 0) { return true; }
     #endif
-    return 0;
+    return false;
 }
 
 # 1 when the hook handle `h` (what tls_connect_with_ctx_hook / tls_accept_alloc's hook receives) is
 # a native ctx — it carries the backend tag _tn_ctx_new_in writes (TLS_CTX_OFF_BACKEND_TAG) — and 0
 # for a libssl SSL_CTX*.
-fn _tls_handle_native(h): i64 {
+fn _tls_handle_native(h): bool {
     #ifndef CYRIUS_TLS_LIBSSL
-    if (load64(h + TLS_CTX_OFF_BACKEND_TAG) == _TN_CTX_TAG) { return 1; }
+    if (load64(h + TLS_CTX_OFF_BACKEND_TAG) == _TN_CTX_TAG) { return true; }
     #endif
-    return 0;
+    return false;
 }
 
 # OpenSSL constants
@@ -226,13 +226,13 @@ var _tls_ok = 0;
 # worker's cold first use hung (measured on 6.6.13). Off the main thread every libssl verb now
 # refuses with its own failure value — TLS_ERR_WRONG_THREAD from tls_read / tls_write /
 # tls_set_deadline — without touching libssl. Roadmap backlog (i); CHANGELOG [6.6.14]
-fn _tls_libssl_thread_ok(): i64 {
+fn _tls_libssl_thread_ok(): bool {
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
-    if (syscall(SYS_GETTID) != syscall(SYS_GETPID)) { return 0; }
+    if (syscall(SYS_GETTID) != syscall(SYS_GETPID)) { return false; }
     #endif
     #endif
-    return 1;
+    return true;
 }
 
 # fdlopen state: 256-byte scratch region holding setjmp buf + real
@@ -363,6 +363,10 @@ fn _tls_init_resolve(): i64 {
     # at toolchain install time). If the helper isn't present, TLS
     # is unavailable; callers see tls_available()==0 and fall back
     # to plain HTTP or error out.
+    # ⛔ A setuid / setgid (AT_SECURE) process never takes the invoker's $HOME copy: fdlopen
+    # resolves only the root-owned, verified /usr/lib/cyrius/dlopen-helper there, else
+    # tls_available()==0 (fail closed). Any program may ask for the same with
+    # fdlopen_trusted_only(1) before its first TLS use. CYRIUS-2026-0041, CHANGELOG [6.7.18]
     if (fdlopen_helper_available() == 0) { return 0; }
 
     var rc = fdlopen_init_full(&_tls_fdl_state);
@@ -506,8 +510,8 @@ fn _tls_native_alloc_in(a, sock, host, hook_fp, hook_ctx): i64 {
 }
 
 # Read the whole file at `path` into a buffer of EXACTLY its size, drawn from Allocator `a` (0 = the
-# global heap). Returns the buffer and writes the byte count through `out_len`, or returns 0 (and
-# writes 0) when the file cannot be opened or read, is empty, or is larger than `max` bytes.
+# global heap). Returns (the buffer, its byte count), or (0, 0) when the file cannot be opened or
+# read, is empty, or is larger than `max` bytes.
 # Two passes over file_open / file_read / file_close, no stat: the first counts the bytes through
 # a stack scratch (and stops at `max + 1`), the second reads at most that many into the buffer —
 # so a file that grows between the passes is cut at the counted size, never overruns it, and one
@@ -516,41 +520,34 @@ fn _tls_native_alloc_in(a, sock, host, hook_fp, hook_ctx): i64 {
 # (1,054,864 B retained per call for a one-cert CA, measured); the buffer is now the file's size
 # and comes from the ctx's allocator, so an arena-backed ctx gives it back on reset_via.
 # Issue 2026-09-30-tls-client-memory-and-alert-gaps (a); CHANGELOG [6.6.13].
-fn _tls_read_file_in(a, path, max, out_len): i64 {
-    store64(out_len, 0);
-    if (path == 0) { return 0; }
+fn _tls_read_file_in(a, path, max): (i64, i64) {
+    if (path == 0) { return (0, 0); }
     var fd = file_open(path, 0, 0);
-    if (fd < 0) { return 0; }
+    if (fd < 0) { return (0, 0); }
     var scratch[4096];
     var size = 0;
-    var more = 1;
-    while (more == 1) {
+    loop {
         var r = file_read(fd, &scratch, 4096);
-        if (r < 0) { file_close(fd); return 0; }
-        if (r == 0) { more = 0; }
-        size = size + r;
-        if (size > max) { more = 0; }
+        if (r < 0) { file_close(fd); return (0, 0); }
+        size += r;
+        if (r == 0 || size > max) { break; }
     }
     file_close(fd);
-    if (size <= 0) { return 0; }
-    if (size > max) { return 0; }
+    if (size <= 0 || size > max) { return (0, 0); }
     var buf = _tn_alloc_a(a, size);
-    if (buf == 0) { return 0; }
+    if (buf == 0) { return (0, 0); }
     fd = file_open(path, 0, 0);
-    if (fd < 0) { return 0; }
+    if (fd < 0) { return (0, 0); }
     var total = 0;
-    more = 1;
-    while (more == 1) {
+    loop {
         var n = file_read(fd, buf + total, size - total);
-        if (n < 0) { file_close(fd); return 0; }
-        if (n == 0) { more = 0; }
-        total = total + n;
-        if (total >= size) { more = 0; }
+        if (n < 0) { file_close(fd); return (0, 0); }
+        total += n;
+        if (n == 0 || total >= size) { break; }
     }
     file_close(fd);
-    if (total <= 0) { return 0; }
-    store64(out_len, total);
-    return buf;
+    if (total <= 0) { return (0, 0); }
+    return (buf, total);
 }
 
 # The largest trust bundle tls_ctx_load_verify_locations reads (an OS store is ~250 KB).
@@ -732,16 +729,16 @@ fn tls_set_verify(handle, mode, callback): i64 {
 # store) is honoured only under libssl — native has no directory store, so the
 # native path reads `cafile` (at most TLS_CAFILE_MAX bytes) and installs it via the CA bundle.
 # Native: the file buffer and the parsed roots come from the ctx's allocator, so a call retains
-# about twice the file's size plus 272 B per root — not the megabyte it kept per call before 6.6.13
-# — and an arena-backed ctx returns all of it on reset_via. tls_native_ca_skipped(handle) counts
+# about twice the file's size plus X509_CERT_SIZE (304 B since sigil 3.13.14) per root — not the
+# megabyte it kept per call before 6.6.13 — and an arena-backed ctx returns all of it on
+# reset_via. tls_native_ca_skipped(handle) counts
 # the blocks it could not use — a malformed block (6.6.14) among them, skipped while the rest
 # install. Returns 1/0/-1.
 fn tls_ctx_load_verify_locations(handle, cafile, capath): i64 {
     if (handle == 0) { return 0 - 1; }
     #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_handle_native(handle) == 1) {
-        var n = 0;
-        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), cafile, TLS_CAFILE_MAX, &n);
+        var buf, n = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), cafile, TLS_CAFILE_MAX);
         if (buf == 0) { return 0; }
         if (tls_native_set_ca_bundle(handle, buf, n, 0) == TLS_OK) { return 1; }
         return 0;
@@ -784,8 +781,7 @@ fn tls_ctx_use_certificate_file(handle, path, type): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_handle_native(handle) == 1) {
         if (load64(handle + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) { return 0; }
-        var n = 0;
-        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX, &n);
+        var buf, n = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX);
         if (buf == 0) { return 0; }
         var is_der = 0;
         if (type == 2) { is_der = 1; }
@@ -807,8 +803,7 @@ fn tls_ctx_use_private_key_file(handle, path, type): i64 {
     #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_handle_native(handle) == 1) {
         if (load64(handle + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) { return 0; }
-        var n = 0;
-        var buf = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX, &n);
+        var buf, n = _tls_read_file_in(load64(handle + TLS_CTX_OFF_ALLOC), path, TLS_CREDFILE_MAX);
         if (buf == 0) { return 0; }
         if (tls_native_set_client_key(handle, buf, n) == TLS_OK) { return 1; }
         return 0;
@@ -847,11 +842,10 @@ var _tls_introspect_state        = 0;   # 0 / 1 resolving / 2 done (6.6.14)
 # from the stack sent it down the native arm with a garbage pointer, SIGSEGV in a minimal
 # environment). The state is read first, so a process that never claimed it pays one load; a
 # worker never treats the main thread's in-flight claim as an orphan.
-fn _tls_introspect_orphaned(): i64 {
-    if (atomic_load(&_tls_introspect_state) != 1) { return 0; }
-    if (_tls_introspect_resolved == 1) { return 0; }        # published, just before its state
-    if (_tls_libssl_thread_ok() == 0) { return 0; }
-    return 1;
+fn _tls_introspect_orphaned(): bool {
+    if (atomic_load(&_tls_introspect_state) != 1) { return false; }
+    if (_tls_introspect_resolved == 1) { return false; }    # published, just before its state
+    return _tls_libssl_thread_ok();
 }
 
 fn _tls_resolve_introspect(): i64 {
@@ -904,8 +898,7 @@ fn tls_get_alpn_selected(ctx, buf, bufmax): i64 {
     if (dlen <= 0) { return 0; }
     if (data == 0) { return 0; }
     if (dlen > bufmax) { return 0; }
-    var i = 0;
-    while (i < dlen) { store8(buf + i, load8(data + i)); i = i + 1; }
+    memcpy(buf, data, dlen);
     return dlen;
 }
 
@@ -937,13 +930,13 @@ fn tls_get_peer_spki_der(ctx, buf, bufmax): i64 {
     # and was handed back as the SPKI length. Sign-extend both results (CYRIUS-2026-0016's class, the
     # same mapper's sibling site). CHANGELOG [6.6.13]
     var size = fncall2(_fn_i2d_PUBKEY_v, pkey, 0) & 0xFFFFFFFF;   # NULL → required size
-    if (size > 0x7FFFFFFF) { size = size - 0x100000000; }
+    if (size > 0x7FFFFFFF) { size -= 0x100000000; }
     if (size > 0) {
         if (size <= bufmax) {
             var pc[8];
             store64(&pc, buf);
             var written = fncall2(_fn_i2d_PUBKEY_v, pkey, &pc) & 0xFFFFFFFF;
-            if (written > 0x7FFFFFFF) { written = written - 0x100000000; }
+            if (written > 0x7FFFFFFF) { written -= 0x100000000; }
             if (written > 0) { if (written <= bufmax) { ret = written; } }
         }
     }
@@ -1483,10 +1476,10 @@ fn tls_write(ctx, buf, len): i64 {
         var off = 0;
         while (off < len) {
             var chunk = len - off;
-            if (chunk > TLS_RECORD_MAX_PLAINTEXT) { chunk = TLS_RECORD_MAX_PLAINTEXT; }
+            if (chunk > _TLS_RECORD_MAX_PLAINTEXT) { chunk = _TLS_RECORD_MAX_PLAINTEXT; }
             var w = tls_native_write(nctx, buf + off, chunk);
             if (w < 0) { return w; }
-            off = off + w;
+            off += w;
         }
         return len;
     }
@@ -1562,7 +1555,7 @@ fn _tls_libssl_sticky(ctx, r): i64 {
 # Issue 2026-09-30-tls-client-memory-and-alert-gaps (c); CHANGELOG [6.6.13].
 fn _tls_ssl_io_ret(ssl, r): i64 {
     var v = r & 0xFFFFFFFF;                     # the C int; the high half is not part of it
-    if (v > 0x7FFFFFFF) { v = v - 0x100000000; }   # sign-extend (`>>` is logical: no shift)
+    if (v > 0x7FFFFFFF) { v -= 0x100000000; }   # sign-extend (`>>` is logical: no shift)
     if (v > 0) { return v; }
     if (_fn_SSL_get_error == 0) { return TLS_ERR_IO; }
     var e = fncall2(_fn_SSL_get_error, ssl, v) & 0xFFFFFFFF;
@@ -1623,7 +1616,7 @@ fn _tls_ssl_call(op, ssl, buf, n, out): i64 {
 }
 
 # SIGPIPE is bit 12 of a kernel sigset (signal 13).
-var _TLS_SIGPIPE_BIT = 0x1000;
+const _TLS_SIGPIPE_BIT = 0x1000;
 
 # Block SIGPIPE in the CALLING THREAD for one libssl call, libpq's pq_block_sigpipe pattern: the
 # process-wide disposition is never touched, so a consumer's own SIGPIPE handling, and every other
@@ -1644,7 +1637,7 @@ fn _tls_sigpipe_hold(sp): i64 {
         var pend[8];
         store64(&pend, 0);
         syscall(127, &pend, 8);                                          # rt_sigpending
-        if ((load64(&pend) & _TLS_SIGPIPE_BIT) != 0) { fl = fl | 2; }
+        if ((load64(&pend) & _TLS_SIGPIPE_BIT) != 0) { fl |= 2; }
     }
     store64(sp + 8, fl);
     #endif
@@ -1711,7 +1704,7 @@ fn _tls_ssl_io(ctx, op, buf, n): i64 {
             if (_fn_ERR_clear_error != 0) { fncall0(_fn_ERR_clear_error); }
             var r = _tls_ssl_call(op, ssl, buf, n, 0);
             var v = r & 0xFFFFFFFF;                     # the C int (see _tls_ssl_io_ret)
-            if (v > 0x7FFFFFFF) { v = v - 0x100000000; }
+            if (v > 0x7FFFFFFF) { v -= 0x100000000; }
             if (v > 0) {
                 res = v;
                 more = 0;

@@ -11,7 +11,7 @@
 # CHANGELOG entry. Runtime-verified on cass (Windows x86_64) at v6.0.51 — the
 # spawn-runtime smoke landed here; v6.0.52 carries only the ai-hwaccel wheel.
 #
-# Win32 call numbers (PE-internal; mirror the parse_expr.cyr dispatch):
+# Win32 call numbers (PE-internal; mirror the parse/expr/factor.cyr dispatch):
 #   0xF001 (61441) WaitForSingleObject(handle, timeout)
 #   0xF002 (61442) GetExitCodeProcess(handle, &code)
 #   0xF003 (61443) SetHandleInformation(handle, mask, flags)

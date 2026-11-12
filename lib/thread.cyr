@@ -153,6 +153,12 @@ var THREAD_GUARD_SIZE = 4096;
 # (overflow) end; a stack overflow then SIGSEGVs instead of corrupting the
 # adjacent allocator region. Usable stack = [base+GUARD, base+GUARD+size).
 fn mmap_stack(size): i64 {
+    # cx: -1, the caller's `< 0` path. cxvm cannot map guest memory, and a raw mmap here handed
+    # back a HOST address no guest load or store can reach — 6.7.12's D13 arm (lib/mmap.cyr
+    # cyr_mmap), which this raw path missed. CHANGELOG [6.7.14]
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 1;
+    #endif
     var prot = PROT_READ | PROT_WRITE;
     var flags = MAP_PRIVATE | MAP_ANONYMOUS;
     var base = syscall(SYS_MMAP, 0, size + THREAD_GUARD_SIZE, prot, flags, 0 - 1, 0);

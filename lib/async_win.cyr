@@ -321,6 +321,7 @@ fn _asw_wsa_err(): i64 {
 
 # Read up to `len` bytes from `fd`: recv on a socket, ReadFile on any other HANDLE.
 fn _asw_relay_read(fd, buf, len): i64 {
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }   # never a descriptor (6.7.16)
     var n = len;
     if (n > 0x7FFFFFFF) { n = 0x7FFFFFFF; }          # recv takes an int length
     var r = syscall(0xF048, fd, buf, n, 0);          # recv
@@ -332,6 +333,7 @@ fn _asw_relay_read(fd, buf, len): i64 {
 
 # Write `len` bytes to `fd`: send on a socket (a short send is legal), WriteFile on any other HANDLE.
 fn _asw_relay_write(fd, buf, len): i64 {
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }   # never a descriptor (6.7.16)
     var n = len;
     if (n > 0x7FFFFFFF) { n = 0x7FFFFFFF; }
     var w = syscall(0xF047, fd, buf, n, 0);          # send
@@ -406,6 +408,7 @@ fn async_connect(rt, addr, port): i64 {
 #   +0 OVERLAPPED(32) +32 task +40 step +48 accept +56 listen +64 rt +72 bytes +80 addrbuf(64) = 144.
 fn _async_accept_task(ctx): i64 {
     if (load64(ctx + 40) == 0) {
+        if (_win_fd_aliases(load64(ctx + 56)) == 1) { return 0 - 9; }   # the listener: never a descriptor (6.7.16)
         var rt = load64(ctx + 64);
         var acc = syscall(0xF022, 2, 1, 0, 0, 0, 1);         # WSASocketW (overlapped accept socket)
         if (acc == 0 - 1) { return 0 - 1; }
@@ -457,6 +460,7 @@ fn async_accept(rt, listen_sock): i64 {
 # on completion return the byte count (0 = EOF, <0 = error).
 fn _async_recv_task(ctx): i64 {
     if (load64(ctx + 40) == 0) {
+        if (_win_fd_aliases(load64(ctx + 48)) == 1) { return 0 - 9; }   # never a descriptor (6.7.16)
         var rt = load64(ctx + 72);
         store32(ctx + 80, load64(ctx + 64));             # WSABUF.len
         store64(ctx + 88, load64(ctx + 56));             # WSABUF.buf
@@ -493,6 +497,7 @@ fn async_recv(rt, fd, buf, len): i64 {
 # Reactor send task: issue an overlapped WSASend, park; on completion return bytes sent.
 fn _async_send_task(ctx): i64 {
     if (load64(ctx + 40) == 0) {
+        if (_win_fd_aliases(load64(ctx + 48)) == 1) { return 0 - 9; }   # never a descriptor (6.7.16)
         var rt = load64(ctx + 72);
         store32(ctx + 80, load64(ctx + 64));             # WSABUF.len
         store64(ctx + 88, load64(ctx + 56));             # WSABUF.buf

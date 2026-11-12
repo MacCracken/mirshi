@@ -62,7 +62,7 @@ fn tls_native_record_seal_12(cipher, key, iv, seq8, ct, plain, plain_len, out, o
     # the ciphertext-total cap below would otherwise let a ChaCha fragment
     # (explicit_len 0) reach 16624 before tripping, emitting an over-length
     # record a strict peer rejects with record_overflow. See CHANGELOG [6.0.72].
-    if (plain_len > TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
+    if (plain_len > _TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     var rec_len = explicit_len + plain_len + tag_len;
     if (rec_len > TLS_RECORD_MAX_CIPHERTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     var total = TLS_RECORD_HEADER_LEN + rec_len;
@@ -111,7 +111,7 @@ fn tls_native_record_open_12(cipher, key, iv, seq8, record, record_len, out, out
     # RFC 5246 §6.2.3: a received fragment exceeding 2^14 is a
     # record_overflow condition — reject before decrypt (incoming-DoS
     # defense + symmetry with seal_12's cap). See CHANGELOG [6.0.72].
-    if (pt_len > TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
+    if (pt_len > _TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     if (pt_len > out_max) { return TLS_ERR_BUFFER_FULL; }
     var body = record + TLS_RECORD_HEADER_LEN;
     var nonce[_TLS_AEAD_NONCE_LEN];
@@ -145,10 +145,15 @@ fn tls_native_record_open_12(cipher, key, iv, seq8, record, record_len, out, out
 
 var TLS12_MASTER_SECRET_LEN = 48;       # RFC 5246 §8.1 (fixed 48 bytes)
 const _TLS12_VERIFY_DATA_LEN = 12;      # RFC 5246 §7.4.9 (default 12)
+# Read-only mirror of `_TLS12_VERIFY_DATA_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS12_VERIFY_DATA_LEN   = _TLS12_VERIFY_DATA_LEN;
 const _TLS12_RANDOM_LEN     = 32;       # client/server Random (RFC 5246 §7.4.1.2)
+# Read-only mirror of `_TLS12_RANDOM_LEN`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
 var TLS12_RANDOM_LEN        = _TLS12_RANDOM_LEN;
 const _TLS12_SEED_LEN       = 2 * _TLS12_RANDOM_LEN;   # the PRF seed: one Random after the other
+# The key_block an AEAD suite needs (2 * key_len + 2 * iv_len, at most 2 * 32 + 2 * 12 = 88), rounded up to
+# whole words: tls_native_12_derive_keys's buffer and its guard. CHANGELOG [6.7.18]
+const _TLS12_KEY_BLOCK_MAX  = 96;
 
 # TLS 1.2 "fixed_iv_length" per ciphersuite — distinct from the 1.3
 # 12-byte IV: AES-GCM uses a 4-byte implicit salt (the 8-byte explicit
@@ -190,8 +195,8 @@ fn tls_native_12_prf(cipher, sec, secret_len, label, label_len, seed, seed_len, 
 # `client_random` / `server_random` are 32 bytes each; `out48` gets 48 bytes.
 fn tls_native_12_master_secret(cipher, pre_master, pm_len, client_random, server_random, out48): i64 {
     var seed[_TLS12_SEED_LEN];
-    memcpy(&seed,                     client_random, TLS12_RANDOM_LEN);
-    memcpy(&seed + TLS12_RANDOM_LEN,  server_random, TLS12_RANDOM_LEN);
+    memcpy(&seed,                     client_random, _TLS12_RANDOM_LEN);
+    memcpy(&seed + _TLS12_RANDOM_LEN,  server_random, _TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, pre_master, pm_len, "master secret", 13,
       &seed, _TLS12_SEED_LEN, out48, TLS12_MASTER_SECRET_LEN);
 }
@@ -214,8 +219,8 @@ fn tls_native_12_master_secret_ems(cipher, pre_master, pm_len, session_hash, sh_
 # Caller sizes `out` via tls_native_12_key_block_len.
 fn tls_native_12_key_block(cipher, master48, client_random, server_random, out, out_len): i64 {
     var seed[_TLS12_SEED_LEN];
-    memcpy(&seed,                     server_random, TLS12_RANDOM_LEN);
-    memcpy(&seed + TLS12_RANDOM_LEN,  client_random, TLS12_RANDOM_LEN);
+    memcpy(&seed,                     server_random, _TLS12_RANDOM_LEN);
+    memcpy(&seed + _TLS12_RANDOM_LEN,  client_random, _TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, master48, TLS12_MASTER_SECRET_LEN, "key expansion", 13,
       &seed, _TLS12_SEED_LEN, out, out_len);
 }
@@ -254,7 +259,7 @@ fn tls_native_12_partition_keys(cipher, key_block, cw_key, sw_key, cw_iv, sw_iv)
 # transcript. Writes 12 bytes to `out12`.
 fn tls_native_12_verify_data(cipher, master48, label, label_len, handshake_hash, hh_len, out12): i64 {
     return tls_native_12_prf(cipher, master48, TLS12_MASTER_SECRET_LEN,
-      label, label_len, handshake_hash, hh_len, out12, TLS12_VERIFY_DATA_LEN);
+      label, label_len, handshake_hash, hh_len, out12, _TLS12_VERIFY_DATA_LEN);
 }
 
 # ================================================================
@@ -284,9 +289,9 @@ fn tls_native_12_build_client_hello(ctx, out, out_max): i64 {
     if (load64(ctx + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) {
         return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
     }
-    var crand = _tn_alloc(ctx, TLS_RANDOM_LEN);
+    var crand = _tn_alloc(ctx, _TLS_RANDOM_LEN);
     if (crand == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-    if (_tn_rand_bytes(crand, TLS_RANDOM_LEN) != TLS_RANDOM_LEN) {
+    if (_tn_rand_bytes(crand, _TLS_RANDOM_LEN) != _TLS_RANDOM_LEN) {
         return _tn_ctx_fail(ctx, TLS_ERR_INTERNAL);
     }
     store64(ctx + TLS_CTX_OFF_CLIENT_RANDOM, crand);
@@ -317,10 +322,10 @@ fn tls_native_12_build_client_hello(ctx, out, out_max): i64 {
     var ext_block = sni_ext + sg_ext + 6 + 20 + 5 + 4 + alpn_ext;
     # cipher_suites = 2-byte len + six supported suites (12 bytes; .83 added RSA + AES-128)
     var body_len = 2 + 32 + 1 + 2 + 12 + 2 + 2 + ext_block;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return _tn_ctx_fail(ctx, TLS_ERR_BUFFER_FULL); }
     tls_native_handshake_write_header(out, TLS_HS_CLIENT_HELLO, body_len);
-    var p = out + TLS_HANDSHAKE_HEADER_LEN;
+    var p = out + _TLS_HANDSHAKE_HEADER_LEN;
     _tn_be16_w(p, 0x0303); p = p + 2;
     memcpy(p, crand, 32); p = p + 32;
     store8(p, 0); p = p + 1;                          # legacy_session_id (empty)
@@ -400,10 +405,10 @@ fn _tn_build_server_hello_12(ctx, out, out_max, want_ecpf): i64 {
     if (alpn_sel != 0) { alpn_ext = 4 + 2 + 1 + (load8(alpn_sel) & 0xFF); }
     var ext_block = 5 + ecpf_ext + ems_ext + alpn_ext; # renegotiation_info(5) + ec_point_formats + EMS + ALPN
     var body_len = 2 + 32 + 1 + sid_len + 2 + 1 + 2 + ext_block;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_SERVER_HELLO, body_len);
-    var p = out + TLS_HANDSHAKE_HEADER_LEN;
+    var p = out + _TLS_HANDSHAKE_HEADER_LEN;
     _tn_be16_w(p, 0x0303); p = p + 2;
     memcpy(p, load64(ctx + TLS_CTX_OFF_SERVER_RANDOM), 32); p = p + 32;
     store8(p, sid_len & 0xFF); p = p + 1;
@@ -449,8 +454,8 @@ fn _tn_sh_is_tls13(sh, sh_len): i64 {
     var blen = 0;
     if (tls_native_handshake_read_header(sh, sh_len, &ht, &blen) < 0) { return 0 - 1; }
     if (ht != TLS_HS_SERVER_HELLO) { return 0 - 1; }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > sh_len) { return 0 - 1; }
-    var body = sh + TLS_HANDSHAKE_HEADER_LEN;
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > sh_len) { return 0 - 1; }
+    var body = sh + _TLS_HANDSHAKE_HEADER_LEN;
     var pos = 2 + 32;                                  # version + random
     if (pos + 1 > blen) { return 0 - 1; }
     var sid_len = load8(body + pos) & 0xFF;
@@ -472,15 +477,35 @@ fn _tn_sh_is_tls13(sh, sh_len): i64 {
     return 0;
 }
 
-# Client: parse a TLS 1.2 ServerHello (RFC 5246 §7.4.1.3). Validates
-# the legacy_version (0x0303), asserts supported_versions is ABSENT
+# Client: parse a TLS 1.2 ServerHello (RFC 5246 §7.4.1.3) answering the
+# ClientHello this ctx built (tls_native_12_build_client_hello, buffered
+# at CH_BUF). Validates the legacy_version (0x0303), caps the session id
+# at 32 bytes (SessionID<0..32>), asserts supported_versions is ABSENT
 # (its presence means a 1.3 server — a protocol error on this path),
-# validates the secure-renegotiation echo (RFC 5746), and reverse-maps
-# the chosen wire ciphersuite to the internal AEAD identity (rejecting
-# unsupported), storing the identity at OFF_CIPHER plus the server
-# random and version 0x0303. (No RFC 8446 §4.1.3 downgrade-sentinel
-# check — a 1.2-pinned client never offered 1.3, so there is nothing to
-# downgrade from.) Returns TLS_OK or a negative TLS_ERR_* (ctx → ERROR).
+# walks every extension (_tn_client_ext_walk: one our ClientHello did
+# not carry, or one carried twice, is refused), validates the
+# secure-renegotiation echo (RFC 5746) and the ALPN answer
+# (_tn_client_alpn_answer: exactly one name we offered), and
+# reverse-maps the chosen wire ciphersuite to the internal AEAD identity
+# (rejecting unsupported), storing the identity at OFF_CIPHER plus the
+# server random and version 0x0303. (No RFC 8446 §4.1.3
+# downgrade-sentinel check — a 1.2-pinned client never offered 1.3, so
+# there is nothing to downgrade from.) Returns TLS_OK or a negative
+# TLS_ERR_* (ctx → ERROR) with the alert for the server recorded
+# (_tn_hs_refuse; tls_native_connect_12 sends it): malformed, a session
+# id over 32 bytes or a non-empty extended_master_secret echo
+# (decode_error); a message other than a ServerHello
+# (unexpected_message); a version other than 0x0303
+# (protocol_version); an extension we did not offer, supported_versions
+# included (unsupported_extension); a suite we did not offer, a
+# non-null compression method, an extension carried twice, an ALPN
+# protocol we did not offer (illegal_parameter); a renegotiation_info
+# that is not empty (handshake_failure, RFC 5746 §3.4).
+# ⛔ 6.7.14 — WHY. This looked up supported_versions, renegotiation_info,
+# extended_master_secret and ALPN and accepted the rest of the block — an
+# unsolicited extension, an ALPN answer to no offer or naming a protocol
+# not offered, a 33-byte session id — and recorded no alert for any
+# refusal. CHANGELOG [6.7.14]
 fn tls_native_client_parse_server_hello_12(ctx, sh, sh_len): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     if (load64(ctx + TLS_CTX_OFF_ROLE) != TLS_ROLE_CLIENT) {
@@ -489,61 +514,72 @@ fn tls_native_client_parse_server_hello_12(ctx, sh, sh_len): i64 {
     var ht = 0;
     var blen = 0;
     if (tls_native_handshake_read_header(sh, sh_len, &ht, &blen) < 0) {
-        return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE);
+        return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE);
     }
-    if (ht != TLS_HS_SERVER_HELLO) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > sh_len) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-    var body = sh + TLS_HANDSHAKE_HEADER_LEN;
-    if (blen < 2 + 32 + 1 + 2 + 1) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-    if (_tn_be16_r(body) != 0x0303) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+    if (ht != TLS_HS_SERVER_HELLO) { return _tn_hs_refuse(ctx, TLS_AD_UNEXPECTED_MESSAGE, TLS_ERR_BAD_HANDSHAKE); }
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > sh_len) {
+        return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE);
+    }
+    var body = sh + _TLS_HANDSHAKE_HEADER_LEN;
+    if (blen < 2 + 32 + 1 + 2 + 1) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+    if (_tn_be16_r(body) != 0x0303) { return _tn_hs_refuse(ctx, TLS_AD_PROTOCOL_VERSION, TLS_ERR_PROTOCOL); }
     var rnd = body + 2;
     # No RFC 8446 §4.1.3 downgrade-sentinel check here: this path is only
     # reached on a 1.2-pinned client (max_ver==1.2), which never offered
     # 1.3, so there is no downgrade to detect — and a 1.3-capable peer that
     # legitimately negotiates 1.2 sets the sentinel, so checking it would
     # wrongly abort conformant servers.
-    var srand = _tn_alloc(ctx, TLS_RANDOM_LEN);
+    var srand = _tn_alloc(ctx, _TLS_RANDOM_LEN);
     if (srand == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     memcpy(srand, rnd, 32);
     store64(ctx + TLS_CTX_OFF_SERVER_RANDOM, srand);
     var pos = 2 + 32;
     var sid_len = load8(body + pos) & 0xFF;
+    if (sid_len > 32) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
     pos = pos + 1 + sid_len;
-    if (pos + 2 + 1 > blen) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
+    if (pos + 2 + 1 > blen) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
     var wire = _tn_be16_r(body + pos);
     pos = pos + 2;
     var comp = load8(body + pos) & 0xFF;
     pos = pos + 1;
-    if (comp != 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+    if (comp != 0) { return _tn_hs_refuse(ctx, TLS_AD_ILLEGAL_PARAMETER, TLS_ERR_PROTOCOL); }
     var identity = tls_native_12_cipher_aead_identity(wire);
-    if (identity < 0) { return _tn_ctx_fail(ctx, TLS_ERR_HANDSHAKE_FAILED); }
-    if (tls_native_12_cipher_supported(wire) != 1) { return _tn_ctx_fail(ctx, TLS_ERR_CIPHER_NOT_SUPPORTED); }
+    if (identity < 0) { return _tn_hs_refuse(ctx, TLS_AD_ILLEGAL_PARAMETER, TLS_ERR_HANDSHAKE_FAILED); }
+    if (tls_native_12_cipher_supported(wire) != 1) {
+        return _tn_hs_refuse(ctx, TLS_AD_ILLEGAL_PARAMETER, TLS_ERR_CIPHER_NOT_SUPPORTED);
+    }
     # EMS (RFC 7627): the client always offered it (flag set to 1 in
     # build_client_hello). Default to legacy fallback — clear the flag now, then
     # set it back to 1 only if the server echoes the extension below. A legacy
     # server (no extension block, or a block without EMS) thus falls back to 0.
     store64(ctx + TLS_CTX_OFF_USE_EMS, 0);
-    # Extensions: supported_versions MUST be absent (else a 1.3 server).
+    # Extensions: supported_versions MUST be absent (else a 1.3 server). A block, when present,
+    # fills the rest of the message: a byte after it is decode_error, as in the 1.3 client's
+    # ServerHello since 6.7.14 (`>` let it through). CHANGELOG [6.7.15]
     if (pos < blen) {
-        if (pos + 2 > blen) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
+        if (pos + 2 > blen) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
         var ext_total = _tn_be16_r(body + pos);
         pos = pos + 2;
-        if (pos + ext_total > blen) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
+        if (pos + ext_total != blen) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
         var dp = 0;
         var dl = 0;
         var sv = _tn_find_ext(body + pos, ext_total, TLS_EXT_SUPPORTED_VERSIONS, &dp, &dl);
-        if (sv == 0 - 1) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-        if (sv == 1) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+        if (sv == 0 - 1) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+        if (sv == 1) { return _tn_hs_refuse(ctx, TLS_AD_UNSUPPORTED_EXTENSION, TLS_ERR_PROTOCOL); }
+        # Every extension: one the 1.2 ClientHello we sent did not carry is unsupported_extension
+        # (RFC 5246 §7.4.1.4: the client MUST abort), one carried twice illegal_parameter.
+        # CHANGELOG [6.7.14]
+        var xw = _tn_client_ext_walk(ctx, body + pos, ext_total, 2);
+        if (xw != TLS_OK) { return xw; }
         # Secure renegotiation (RFC 5746 §3.4): on an initial handshake the
         # server's renegotiation_info, if present, MUST carry an empty
         # renegotiated_connection (a single 0x00 length byte).
         var rp = 0;
         var rl2 = 0;
         var rn = _tn_find_ext(body + pos, ext_total, TLS_EXT_RENEGOTIATION_INFO, &rp, &rl2);
-        if (rn == 0 - 1) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
         if (rn == 1) {
-            if (rl2 != 1) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
-            if ((load8(rp) & 0xFF) != 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+            if (rl2 != 1) { return _tn_hs_refuse(ctx, TLS_AD_HANDSHAKE_FAILURE, TLS_ERR_PROTOCOL); }
+            if ((load8(rp) & 0xFF) != 0) { return _tn_hs_refuse(ctx, TLS_AD_HANDSHAKE_FAILURE, TLS_ERR_PROTOCOL); }
         }
         # Extended Master Secret echo (RFC 7627 §5.1): a present echo MUST be
         # empty; record EMS active. Absent → leave the flag at 0 (legacy
@@ -552,17 +588,14 @@ fn tls_native_client_parse_server_hello_12(ctx, sh, sh_len): i64 {
         var ep = 0;
         var el = 0;
         var ems = _tn_find_ext(body + pos, ext_total, TLS_EXT_EXTENDED_MASTER_SECRET, &ep, &el);
-        if (ems == 0 - 1) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
         if (ems == 1) {
-            if (el != 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+            if (el != 0) { return _tn_hs_refuse(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_PROTOCOL); }
             store64(ctx + TLS_CTX_OFF_USE_EMS, 1);
         }
-        # ALPN selection (RFC 7301): the 1.2 server returns it in the SH.
-        var alpn_ad = 0;
-        var alpn_al = 0;
-        if (_tn_find_ext(body + pos, ext_total, TLS_EXT_ALPN, &alpn_ad, &alpn_al) == 1) {
-            _tn_store_alpn_selected(ctx, alpn_ad, alpn_al);
-        }
+        # ALPN selection (RFC 7301): the 1.2 server returns it in the SH — exactly one name we
+        # offered (_tn_client_alpn_answer). CHANGELOG [6.7.14]
+        var aw = _tn_client_alpn_answer(ctx, body + pos, ext_total);
+        if (aw != TLS_OK) { return aw; }
     }
     store64(ctx + TLS_CTX_OFF_CIPHER, identity);
     store64(ctx + TLS_CTX_OFF_VERSION, TLS_VERSION_1_2);
@@ -584,10 +617,10 @@ fn _tn_build_certificate_12(ctx, out, out_max): i64 {
     if (cert_len > 0xFFFFFF - 6) { return TLS_ERR_CERT_INVALID; }
     var list_len = 3 + cert_len;
     var body_len = 3 + list_len;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_CERTIFICATE, body_len);
-    var p = out + TLS_HANDSHAKE_HEADER_LEN;
+    var p = out + _TLS_HANDSHAKE_HEADER_LEN;
     _tn_be24_w(p, list_len); p = p + 3;
     _tn_be24_w(p, cert_len); p = p + 3;
     memcpy(p, cert, cert_len);
@@ -598,9 +631,14 @@ fn _tn_build_certificate_12(ctx, out, out_max): i64 {
 # Explicit ordered bounds checks; rejects an empty certificate_list
 # (the server MUST authenticate) and a zero inner cert length; bounds
 # the cert against the list, not just the message. Parses the leaf via
-# sigil x509 and stores it at OFF_SERVER_CERT. Chain path-validation
-# is not performed in .74 (single-leaf only). Returns TLS_OK or a
+# sigil x509 and stores it at OFF_SERVER_CERT, and the certificates after it
+# (TLS order, up to 16; one that does not parse is skipped, as the TLS 1.3
+# client skips one) at OFF_SERVER_INTERS for _tn_verify_chain. Every entry
+# must be a non-empty ASN.1Cert inside the list. Returns TLS_OK or a
 # negative TLS_ERR_*.
+# ⛔ 6.7.18 — WHY the intermediates: this kept the leaf only, so a TLS 1.2 server
+# that sent its intermediate (most do) failed every verifying connect — no path
+# to a root — and no 1.2 chain ever met a CA's nameConstraints. CHANGELOG [6.7.18]
 fn _tn_parse_certificate_12(ctx, body, blen): i64 {
     if (blen < 3) { return TLS_ERR_BAD_HANDSHAKE; }
     var list_len = _tn_be24_r(body);
@@ -617,6 +655,29 @@ fn _tn_parse_certificate_12(ctx, body, blen): i64 {
     if (leaf == 0) { return TLS_ERR_OOM; }
     if (x509_parse_into(body + cp, cert_len, leaf, _tn_arena(ctx)) != 1) { return TLS_ERR_CERT_INVALID; }
     store64(ctx + TLS_CTX_OFF_SERVER_CERT, leaf);
+    var list_end = 3 + list_len;
+    cp = cp + cert_len;
+    var inters = _tn_alloc(ctx, 8 + 16 * 8);
+    if (inters == 0) { return TLS_ERR_OOM; }
+    var nint = 0;
+    while (cp < list_end) {
+        if (cp + 3 > list_end) { return TLS_ERR_BAD_HANDSHAKE; }
+        var il = _tn_be24_r(body + cp);
+        cp = cp + 3;
+        if (il == 0) { return TLS_ERR_BAD_HANDSHAKE; }                 # ASN.1Cert<1..2^24-1>
+        if (il > list_end - cp) { return TLS_ERR_BAD_HANDSHAKE; }
+        if (nint < 16) {
+            var ic = x509_cert_alloc_into(_tn_arena(ctx));
+            if (ic == 0) { return TLS_ERR_OOM; }
+            if (x509_parse_into(body + cp, il, ic, _tn_arena(ctx)) == 1) {
+                store64(inters + 8 + nint * 8, ic);
+                nint = nint + 1;
+            }
+        }
+        cp = cp + il;
+    }
+    store64(inters, nint);
+    store64(ctx + TLS_CTX_OFF_SERVER_INTERS, inters);
     return TLS_OK;
 }
 
@@ -651,10 +712,10 @@ fn _tn_12_build_server_kex(ctx, out, out_max): i64 {
     if (plen == 0) { return TLS_ERR_HANDSHAKE_FAILED; }
     var params_len = 4 + plen;
     # Worst case: 4 (hdr) + params + 2 (scheme) + 2 (siglen) + 128 (sig cap).
-    if (TLS_HANDSHAKE_HEADER_LEN + params_len + 4 + 128 > out_max) { return TLS_ERR_BUFFER_FULL; }
+    if (_TLS_HANDSHAKE_HEADER_LEN + params_len + 4 + 128 > out_max) { return TLS_ERR_BUFFER_FULL; }
     var epub = load64(ctx + TLS_CTX_OFF_EPH_PUB);
     if (epub == 0) { return TLS_ERR_PROTOCOL; }
-    var body = out + TLS_HANDSHAKE_HEADER_LEN;
+    var body = out + _TLS_HANDSHAKE_HEADER_LEN;
     store8(body, 3);                                   # curve_type named_curve(3)
     _tn_be16_w(body + 1, group);                       # namedcurve
     store8(body + 3, plen);                            # ECPoint length (1 byte)
@@ -669,7 +730,16 @@ fn _tn_12_build_server_kex(ctx, out, out_max): i64 {
     _tn_be16_w(body + params_len + 2, sig_len);
     memcpy(body + params_len + 4, sig, sig_len);
     tls_native_handshake_write_header(out, TLS_HS_SERVER_KEY_EXCHANGE, body_len);
-    return TLS_HANDSHAKE_HEADER_LEN + body_len;
+    return _TLS_HANDSHAKE_HEADER_LEN + body_len;
+}
+
+# The NamedGroup of a server leaf's ECDSA key (secp256r1 / secp384r1), 0 for any other key — the
+# curve the 1.2 client's supported_groups must list for that certificate. CHANGELOG [6.7.12]
+fn _tn_12_leaf_group(leaf): i64 {
+    var c = x509_cert_curve(leaf);
+    if (c == X509_CURVE_P256) { return TLS_GROUP_SECP256R1; }
+    if (c == X509_CURVE_P384) { return TLS_GROUP_SECP384R1; }
+    return 0;
 }
 
 # Client: parse + verify a TLS 1.2 ECDHE ServerKeyExchange body (header stripped).
@@ -677,7 +747,8 @@ fn _tn_12_build_server_kex(ctx, out, out_max): i64 {
 # namedcurve must be one we offered (_tn_groups: x25519, secp256r1, secp384r1 — 6.6.15) and the
 # point exactly that group's length (_tn_group_point_len). The signed content is client_random ‖
 # server_random ‖ the params exactly as sent (RFC 8422 §5.4), verified against the parsed
-# server-cert key per the SKE's SignatureScheme. Once it verifies, the group goes to OFF_GROUP
+# server-cert key per the SKE's SignatureScheme — an ECDSA certificate on a curve we did not list
+# is refused first (6.7.12). Once it verifies, the group goes to OFF_GROUP
 # and the point into OWNED storage at OFF_PEER_PUB (the record buffer is transient). An EC
 # point's validity — prefix 0x04, both coordinates below p, on the curve — is sigil's check, in
 # _tn_ecdhe_shared. Returns TLS_OK or a negative TLS_ERR_*.
@@ -694,7 +765,9 @@ fn _tn_12_parse_server_kex(ctx, body, body_len): i64 {
     if (body_len < plen + 4) { return TLS_ERR_BAD_HANDSHAKE; }
     var scheme = _tn_be16_r(body + plen);
     var sig_len = _tn_be16_r(body + plen + 2);
-    if (plen + 4 + sig_len > body_len) { return TLS_ERR_BAD_HANDSHAKE; }
+    # The signature fills the body exactly: a byte after it is refused like one missing (`>` let
+    # trailing bytes through, 6.7.12). CHANGELOG [6.7.12]
+    if (plen + 4 + sig_len != body_len) { return TLS_ERR_BAD_HANDSHAKE; }
     var sig = body + plen + 4;
     var content = _tn_alloc(ctx, 64 + plen);
     if (content == 0) { return TLS_ERR_OOM; }
@@ -703,6 +776,13 @@ fn _tn_12_parse_server_kex(ctx, body, body_len): i64 {
     memcpy(content + 64, body, plen);
     var leaf = load64(ctx + TLS_CTX_OFF_SERVER_CERT);
     if (leaf == 0) { return TLS_ERR_CERT_INVALID; }
+    # An ECDSA server certificate must be on a curve our supported_groups listed (RFC 8422 §5.1 —
+    # the 1.2 ClientHello lists _tn_groups(ctx) exactly; OpenSSL's client refuses it as "wrong
+    # curve"); an Ed25519 or RSA key is not bound by the list. CHANGELOG [6.7.12]
+    var lg = _tn_12_leaf_group(leaf);
+    if (lg != 0) {
+        if (_tn_groups_has(_tn_groups(ctx), lg) != 1) { return TLS_ERR_HANDSHAKE_FAILED; }
+    }
     # 1.2 SKE allows ECDSA (P-256/P-384), EdDSA, and RSA (PKCS#1 v1.5 or PSS,
     # per the SKE's SignatureAndHashAlgorithm). See CHANGELOG [6.0.83].
     # An ECDSA scheme names only the hash in TLS 1.2: a P-384 server key signs SHA-256 when we list
@@ -728,9 +808,9 @@ fn _tn_12_parse_server_kex(ctx, body, body_len): i64 {
 # Build a ServerHelloDone (RFC 5246 §7.4.5): a bare handshake header,
 # type 14, zero-length body. Returns 4 or TLS_ERR_BUFFER_FULL.
 fn tls_native_12_build_server_hello_done(out, out_max): i64 {
-    if (out_max < TLS_HANDSHAKE_HEADER_LEN) { return TLS_ERR_BUFFER_FULL; }
+    if (out_max < _TLS_HANDSHAKE_HEADER_LEN) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_SERVER_HELLO_DONE, 0);
-    return TLS_HANDSHAKE_HEADER_LEN;
+    return _TLS_HANDSHAKE_HEADER_LEN;
 }
 
 # Parse + validate a ServerHelloDone. Requires type 14 and an exactly
@@ -753,10 +833,10 @@ fn _tn_12_build_client_kex(point, point_len, out, out_max): i64 {
     if (point_len <= 0) { return TLS_ERR_INVALID_PARAM; }
     if (point_len > 255) { return TLS_ERR_INVALID_PARAM; }
     var body_len = 1 + point_len;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_CLIENT_KEY_EXCHANGE, body_len);
-    var p = out + TLS_HANDSHAKE_HEADER_LEN;
+    var p = out + _TLS_HANDSHAKE_HEADER_LEN;
     store8(p, point_len); p = p + 1;
     memcpy(p, point, point_len);
     return total;
@@ -779,9 +859,9 @@ fn _tn_12_parse_client_kex(msg, msg_len, point_len, out): i64 {
     var blen = 0;
     if (tls_native_handshake_read_header(msg, msg_len, &ht, &blen) < 0) { return TLS_ERR_BAD_HANDSHAKE; }
     if (ht != TLS_HS_CLIENT_KEY_EXCHANGE) { return TLS_ERR_BAD_HANDSHAKE; }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > msg_len) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > msg_len) { return TLS_ERR_BAD_HANDSHAKE; }
     if (blen != 1 + point_len) { return TLS_ERR_BAD_HANDSHAKE; }
-    var body = msg + TLS_HANDSHAKE_HEADER_LEN;
+    var body = msg + _TLS_HANDSHAKE_HEADER_LEN;
     if ((load8(body) & 0xFF) != point_len) { return TLS_ERR_HANDSHAKE_FAILED; }
     memcpy(out, body + 1, point_len);
     return TLS_OK;
@@ -818,10 +898,10 @@ var TLS12_CERT_TYPE_ECDSA_SIGN = 64;   # ClientCertificateType ecdsa_sign (RFC 8
 # certificate_authorities empty. Returns the message length (16) or TLS_ERR_BUFFER_FULL.
 fn _tn_12_build_cert_request(out, out_max): i64 {
     var body_len = 1 + 1 + 2 + 6 + 2;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_CERTIFICATE_REQUEST, body_len);
-    var p = out + TLS_HANDSHAKE_HEADER_LEN;
+    var p = out + _TLS_HANDSHAKE_HEADER_LEN;
     store8(p, 1); p = p + 1;                           # certificate_types length
     store8(p, TLS12_CERT_TYPE_ECDSA_SIGN); p = p + 1;
     _tn_be16_w(p, 6); p = p + 2;                       # supported_signature_algorithms length
@@ -884,10 +964,10 @@ fn _tn_12_parse_cert_request(ctx, body, blen): i64 {
 # Client: the TLS 1.2 Certificate message with no certificate (RFC 5246 §7.4.6: an empty
 # certificate_list, never an omitted message). Returns 7 or TLS_ERR_BUFFER_FULL.
 fn _tn_12_build_empty_certificate(out, out_max): i64 {
-    if (out_max < TLS_HANDSHAKE_HEADER_LEN + 3) { return TLS_ERR_BUFFER_FULL; }
+    if (out_max < _TLS_HANDSHAKE_HEADER_LEN + 3) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_CERTIFICATE, 3);
-    _tn_be24_w(out + TLS_HANDSHAKE_HEADER_LEN, 0);
-    return TLS_HANDSHAKE_HEADER_LEN + 3;
+    _tn_be24_w(out + _TLS_HANDSHAKE_HEADER_LEN, 0);
+    return _TLS_HANDSHAKE_HEADER_LEN + 3;
 }
 
 # The three spans a TLS 1.2 CertificateVerify signs — every handshake message before it, in
@@ -913,12 +993,12 @@ fn _tn_12_build_cert_verify(ctx, scheme, content, content_len, out, out_max): i6
     if (sig_len < 0) { return sig_len; }
     if (made != scheme) { return TLS_ERR_KEY_UNSUPPORTED; }
     var body_len = 2 + 2 + sig_len;
-    var total = TLS_HANDSHAKE_HEADER_LEN + body_len;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + body_len;
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     tls_native_handshake_write_header(out, TLS_HS_CERTIFICATE_VERIFY, body_len);
-    _tn_be16_w(out + TLS_HANDSHAKE_HEADER_LEN, scheme);
-    _tn_be16_w(out + TLS_HANDSHAKE_HEADER_LEN + 2, sig_len);
-    memcpy(out + TLS_HANDSHAKE_HEADER_LEN + 4, sig, sig_len);
+    _tn_be16_w(out + _TLS_HANDSHAKE_HEADER_LEN, scheme);
+    _tn_be16_w(out + _TLS_HANDSHAKE_HEADER_LEN + 2, sig_len);
+    memcpy(out + _TLS_HANDSHAKE_HEADER_LEN + 4, sig, sig_len);
     return total;
 }
 
@@ -929,7 +1009,7 @@ fn _tn_hs_plain_records(msgs, n, out, out_max): i64 {
     var w = 0;
     while (done < n) {
         var frag = n - done;
-        if (frag > TLS_RECORD_MAX_PLAINTEXT) { frag = TLS_RECORD_MAX_PLAINTEXT; }
+        if (frag > _TLS_RECORD_MAX_PLAINTEXT) { frag = _TLS_RECORD_MAX_PLAINTEXT; }
         if (w + TLS_RECORD_HEADER_LEN + frag > out_max) { return TLS_ERR_BUFFER_FULL; }
         tls_native_record_write_header(out + w, TLS_CT_HANDSHAKE, 0x0303, frag);
         memcpy(out + w + TLS_RECORD_HEADER_LEN, msgs + done, frag);
@@ -951,8 +1031,8 @@ fn _tn_12_srv_next_msg(ctx, fd, rbuf, rcap, hb, hcap, hlenp, hposp): i64 {
     var hl = load64(hlenp);
     var hp = load64(hposp);
     while (1 == 1) {
-        if (hp + TLS_HANDSHAKE_HEADER_LEN <= hl) {
-            var ml = TLS_HANDSHAKE_HEADER_LEN + _tn_be24_r(hb + hp + 1);
+        if (hp + _TLS_HANDSHAKE_HEADER_LEN <= hl) {
+            var ml = _TLS_HANDSHAKE_HEADER_LEN + _tn_be24_r(hb + hp + 1);
             if (hp + ml <= hl) {
                 store64(hposp, hp + ml);
                 return ml;
@@ -979,8 +1059,8 @@ fn _tn_12_srv_next_msg(ctx, fd, rbuf, rcap, hb, hcap, hlenp, hposp): i64 {
 # (_tn_server_take_client_chain), and its leaf is then at TLS_CTX_OFF_CLIENT_CERT. On failure the
 # client is told why (_tn_client_auth_alert) and the ctx fails. Returns TLS_OK or the failure.
 fn _tn_12_srv_client_cert(ctx, fd, msg, ml): i64 {
-    var blen = ml - TLS_HANDSHAKE_HEADER_LEN;
-    var body = msg + TLS_HANDSHAKE_HEADER_LEN;
+    var blen = ml - _TLS_HANDSHAKE_HEADER_LEN;
+    var body = msg + _TLS_HANDSHAKE_HEADER_LEN;
     if (blen < 3) { return _tn_client_auth_alert(ctx, fd, TLS_ERR_BAD_HANDSHAKE, 0, 0); }
     var list_len = _tn_be24_r(body);
     if (3 + list_len != blen) { return _tn_client_auth_alert(ctx, fd, TLS_ERR_BAD_HANDSHAKE, 0, 0); }
@@ -999,8 +1079,8 @@ fn _tn_12_srv_client_cert(ctx, fd, msg, ml): i64 {
 # handshake message before it). Returns TLS_OK, or the failure with the client told
 # (decrypt_error for a bad signature) and the ctx failed.
 fn _tn_12_srv_client_cv(ctx, fd, msg, ml, content, content_len): i64 {
-    var blen = ml - TLS_HANDSHAKE_HEADER_LEN;
-    var body = msg + TLS_HANDSHAKE_HEADER_LEN;
+    var blen = ml - _TLS_HANDSHAKE_HEADER_LEN;
+    var body = msg + _TLS_HANDSHAKE_HEADER_LEN;
     if (blen < 4) { return _tn_client_auth_alert(ctx, fd, TLS_ERR_BAD_HANDSHAKE, 0, 0); }
     var scheme = _tn_be16_r(body);
     var sig_len = _tn_be16_r(body + 2);
@@ -1100,6 +1180,9 @@ fn tls_native_12_compute_premaster(ctx, peer_pub, out): i64 {
 # both record sequences to 0 (the post-CCS epoch starts at seq 0).
 # Returns TLS_OK or a negative TLS_ERR_*.
 fn tls_native_12_derive_keys(ctx, premaster, pm_len): i64 {
+    # The key_block (every key and IV of the epoch, at most 2 * 32 + 2 * 12 = 88 bytes) is a
+    # `secret var`, zeroised on every return (it was a _tn_alloc abandoned un-wiped). CHANGELOG [6.7.18]
+    secret var kb_b[_TLS12_KEY_BLOCK_MAX];
     var identity = load64(ctx + TLS_CTX_OFF_CIPHER);
     var master = _tn_alloc(ctx, TLS12_MASTER_SECRET_LEN);
     if (master == 0) { return TLS_ERR_OOM; }
@@ -1134,8 +1217,8 @@ fn tls_native_12_derive_keys(ctx, premaster, pm_len): i64 {
     var sr = load64(ctx + TLS_CTX_OFF_SERVER_RANDOM);
     var kb_len = tls_native_12_key_block_len(identity);
     if (kb_len < 0) { return TLS_ERR_CIPHER_NOT_SUPPORTED; }
-    var kb = _tn_alloc(ctx, kb_len);
-    if (kb == 0) { return TLS_ERR_OOM; }
+    if (kb_len > _TLS12_KEY_BLOCK_MAX) { return TLS_ERR_INTERNAL; }
+    var kb = &kb_b;
     if (tls_native_12_key_block(identity, master, cr, sr, kb, kb_len) != TLS_OK) {
         return TLS_ERR_INTERNAL;
     }
@@ -1172,22 +1255,22 @@ fn tls_native_12_derive_keys(ctx, premaster, pm_len): i64 {
 # covers it). Returns 16 (the inner plaintext — the caller AEAD-seals
 # it) or a negative TLS_ERR_*.
 fn tls_native_12_build_finished(ctx, label, out, out_max): i64 {
-    if (out_max < TLS_HANDSHAKE_HEADER_LEN + TLS12_VERIFY_DATA_LEN) { return TLS_ERR_BUFFER_FULL; }
+    if (out_max < _TLS_HANDSHAKE_HEADER_LEN + _TLS12_VERIFY_DATA_LEN) { return TLS_ERR_BUFFER_FULL; }
     var ts = load64(ctx + TLS_CTX_OFF_TRANSCRIPT);
     var identity = load64(ctx + TLS_CTX_OFF_CIPHER);
     var master = load64(ctx + TLS_CTX_OFF_MASTER12);
     if (ts == 0) { return TLS_ERR_PROTOCOL; }
     if (master == 0) { return TLS_ERR_PROTOCOL; }
-    var hh = _tn_alloc(ctx, TLS_MAX_DIGEST_LEN);
+    var hh = _tn_alloc(ctx, _TLS_MAX_DIGEST_LEN);
     if (hh == 0) { return TLS_ERR_OOM; }
     var hh_len = tls_native_transcript_digest(ts, hh);
     if (hh_len < 0) { return TLS_ERR_INTERNAL; }
-    tls_native_handshake_write_header(out, TLS_HS_FINISHED, TLS12_VERIFY_DATA_LEN);
+    tls_native_handshake_write_header(out, TLS_HS_FINISHED, _TLS12_VERIFY_DATA_LEN);
     if (tls_native_12_verify_data(identity, master, label, 15, hh, hh_len,
-        out + TLS_HANDSHAKE_HEADER_LEN) != TLS_OK) {
+        out + _TLS_HANDSHAKE_HEADER_LEN) != TLS_OK) {
         return TLS_ERR_INTERNAL;
     }
-    var total = TLS_HANDSHAKE_HEADER_LEN + TLS12_VERIFY_DATA_LEN;
+    var total = _TLS_HANDSHAKE_HEADER_LEN + _TLS12_VERIFY_DATA_LEN;
     tls_native_transcript_update(ts, out, total);
     return total;
 }
@@ -1203,14 +1286,14 @@ fn tls_native_12_verify_finished(ctx, msg, msg_len, label): i64 {
     var blen = 0;
     if (tls_native_handshake_read_header(msg, msg_len, &ht, &blen) < 0) { return TLS_ERR_BAD_HANDSHAKE; }
     if (ht != TLS_HS_FINISHED) { return TLS_ERR_BAD_HANDSHAKE; }
-    if (blen != TLS12_VERIFY_DATA_LEN) { return TLS_ERR_BAD_HANDSHAKE; }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > msg_len) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (blen != _TLS12_VERIFY_DATA_LEN) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > msg_len) { return TLS_ERR_BAD_HANDSHAKE; }
     var ts = load64(ctx + TLS_CTX_OFF_TRANSCRIPT);
     var identity = load64(ctx + TLS_CTX_OFF_CIPHER);
     var master = load64(ctx + TLS_CTX_OFF_MASTER12);
     if (ts == 0) { return TLS_ERR_PROTOCOL; }
     if (master == 0) { return TLS_ERR_PROTOCOL; }
-    var hh = _tn_alloc(ctx, TLS_MAX_DIGEST_LEN);
+    var hh = _tn_alloc(ctx, _TLS_MAX_DIGEST_LEN);
     if (hh == 0) { return TLS_ERR_OOM; }
     var hh_len = tls_native_transcript_digest(ts, hh);
     if (hh_len < 0) { return TLS_ERR_INTERNAL; }
@@ -1218,10 +1301,10 @@ fn tls_native_12_verify_finished(ctx, msg, msg_len, label): i64 {
     if (tls_native_12_verify_data(identity, master, label, 15, hh, hh_len, &expected) != TLS_OK) {
         return TLS_ERR_INTERNAL;
     }
-    if (_tn_ct_eq(&expected, msg + TLS_HANDSHAKE_HEADER_LEN, TLS12_VERIFY_DATA_LEN) != 1) {
+    if (_tn_ct_eq(&expected, msg + _TLS_HANDSHAKE_HEADER_LEN, _TLS12_VERIFY_DATA_LEN) != 1) {
         return TLS_ERR_AUTHN;
     }
-    tls_native_transcript_update(ts, msg, TLS_HANDSHAKE_HEADER_LEN + TLS12_VERIFY_DATA_LEN);
+    tls_native_transcript_update(ts, msg, _TLS_HANDSHAKE_HEADER_LEN + _TLS12_VERIFY_DATA_LEN);
     return TLS_OK;
 }
 
@@ -1281,8 +1364,8 @@ fn _tn_ch_is_tls13(ch_msg, ch_len): i64 {
     var blen = 0;
     if (tls_native_handshake_read_header(ch_msg, ch_len, &ht, &blen) < 0) { return 0 - 1; }
     if (ht != TLS_HS_CLIENT_HELLO) { return 0 - 1; }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > ch_len) { return 0 - 1; }
-    var body = ch_msg + TLS_HANDSHAKE_HEADER_LEN;
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > ch_len) { return 0 - 1; }
+    var body = ch_msg + _TLS_HANDSHAKE_HEADER_LEN;
     var pos = 2 + 32;
     if (pos + 1 > blen) { return 0 - 1; }
     var sid_len = load8(body + pos) & 0xFF;
@@ -1335,18 +1418,20 @@ fn _tn_ch_is_tls13(ch_msg, ch_len): i64 {
 # ECDHE_ECDSA_AES128_GCM_SHA256 failed with no alert (the ServerHello cannot name it).
 # CHANGELOG [6.6.15]
 fn _tn_12_parse_client_hello(ctx, body, blen): i64 {
-    if (blen < 2 + 32 + 1) { return TLS_ERR_BAD_HANDSHAKE; }
-    var crand = _tn_alloc(ctx, TLS_RANDOM_LEN);
+    if (blen < 2 + 32 + 1) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+    var crand = _tn_alloc(ctx, _TLS_RANDOM_LEN);
     if (crand == 0) { return TLS_ERR_OOM; }
     memcpy(crand, body + 2, 32);
     store64(ctx + TLS_CTX_OFF_CLIENT_RANDOM, crand);
     var pos = 2 + 32;
     var sid_len = load8(body + pos) & 0xFF;
+    # SessionID<0..32> (RFC 5246 §7.4.1.2), as the 1.3 parser refuses. CHANGELOG [6.7.12]
+    if (sid_len > 32) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
     pos = pos + 1 + sid_len;
-    if (pos + 2 > blen) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (pos + 2 > blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
     var cs_len = _tn_be16_r(body + pos);
     pos = pos + 2;
-    if (pos + cs_len > blen) { return TLS_ERR_BAD_HANDSHAKE; }
+    if (pos + cs_len > blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
     var chosen = 0;
     var j = 0;
     while (j + 2 <= cs_len) {
@@ -1358,38 +1443,63 @@ fn _tn_12_parse_client_hello(ctx, body, blen): i64 {
             j = j + 2;
         }
     }
-    # Detect the client's extended_master_secret offer (RFC 7627). Walk past
-    # cipher_suites + compression_methods to the extensions block. All reads
-    # bounds-checked vs blen (untrusted CH); lenient — a malformed/absent ext
-    # block leaves EMS=0 and never fails the handshake. (The cipher loop used
-    # pos+j indexing and did not mutate pos, so pos is still at cipher_suites.)
+    # Past cipher_suites (the loop above indexed pos + j and left pos there) come
+    # compression_methods<1..2^8-1> (RFC 5246 §7.4.1.2) and the optional extension block; every
+    # read is bounds-checked against blen (an untrusted ClientHello). A hello that does not parse
+    # is decode_error, recorded so the driver sends it: no compression_methods byte, an empty list,
+    # a list overrunning the message, a block that does not fill the rest of the message (6.7.15's
+    # D40), an extension whose header or data overruns the block or a 1-3 byte tail after its last
+    # whole extension (_tn_ch_ext_walk — walked once, before any lookup, so a malformed list is
+    # never read as "absent": no extended master secret, no ALPN, the server's first group), and
+    # the three short-message refusals above. The answer the 1.3 server and both clients give
+    # (6.7.16's D32, the user, 2026-10-19; the 1.3 server's block tail, 6.7.16's D81). A hello
+    # that ends after compression_methods has no block: EMS 0, no ALPN, our first group.
+    # Once the whole hello parses, two values are refused with illegal_parameter (the user,
+    # 2026-10-20): a compression_methods list without the null method (RFC 5246 §7.4.1.2: it "MUST
+    # contain" it; 6.7.16's D83) and an extension type named twice (§7.4.1.4; 6.7.16's D82) — both
+    # negotiated before, the second on the first copy. CHANGELOG [6.7.16]
     pos = pos + cs_len;
     var group = 0;
-    if (pos + 1 <= blen) {
-        var cm_len = load8(body + pos) & 0xFF;
-        pos = pos + 1 + cm_len;
-        if (pos + 2 <= blen) {
-            var ext_total = _tn_be16_r(body + pos);
-            pos = pos + 2;
-            if (pos + ext_total <= blen) {
-                var ep = 0;
-                var el = 0;
-                var got = _tn_find_ext(body + pos, ext_total, TLS_EXT_EXTENDED_MASTER_SECRET, &ep, &el);
-                if (got == 1) { store64(ctx + TLS_CTX_OFF_USE_EMS, 1); }
-                # ALPN (RFC 7301): negotiate against the server's configured
-                # list; _tn_build_server_hello_12 emits the result. Lenient.
-                _tn_server_negotiate_alpn(ctx, body + pos, ext_total);
-                var sgp = 0;
-                var sgl = 0;
-                if (_tn_find_ext(body + pos, ext_total, TLS_EXT_SUPPORTED_GROUPS, &sgp, &sgl) == 1) {
-                    group = _tn_pick_group(ctx, sgp, sgl);
-                    if (group < 0) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
-                    if (group == 0) { return _tn_hs_fail(ctx, TLS_AD_HANDSHAKE_FAILURE, TLS_ERR_HANDSHAKE_FAILED); }
-                    var kc = _tn_12_key_curve(ctx);
-                    if (kc != 0) {
-                        if (_tn_sg_has(sgp, sgl, kc) != 1) { chosen = 0; }   # no ECDSA suite on this certificate
-                    }
-                }
+    if (pos + 1 > blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+    var cm_len = load8(body + pos) & 0xFF;
+    if (cm_len == 0) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+    if (pos + 1 + cm_len > blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+    var cmp = body + pos + 1;
+    pos = pos + 1 + cm_len;
+    var has_ext = 0;
+    var ext_total = 0;
+    var xw = 1;
+    if (pos < blen) {
+        if (pos + 2 > blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+        ext_total = _tn_be16_r(body + pos);
+        pos = pos + 2;
+        if (pos + ext_total != blen) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+        xw = _tn_ch_ext_walk(ctx, body + pos, ext_total);
+        if (xw < 0) { return xw; }
+        if (xw == 0) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+        has_ext = 1;
+    }
+    if (_tn_12_cm_has_null(cmp, cm_len) != 1) {
+        return _tn_hs_fail(ctx, TLS_AD_ILLEGAL_PARAMETER, TLS_ERR_HANDSHAKE_FAILED);
+    }
+    if (xw == 2) { return _tn_hs_fail(ctx, TLS_AD_ILLEGAL_PARAMETER, TLS_ERR_HANDSHAKE_FAILED); }
+    if (has_ext == 1) {
+        var ep = 0;
+        var el = 0;
+        var got = _tn_find_ext(body + pos, ext_total, TLS_EXT_EXTENDED_MASTER_SECRET, &ep, &el);
+        if (got == 1) { store64(ctx + TLS_CTX_OFF_USE_EMS, 1); }
+        # ALPN (RFC 7301): negotiate against the server's configured
+        # list; _tn_build_server_hello_12 emits the result. Lenient.
+        _tn_server_negotiate_alpn(ctx, body + pos, ext_total);
+        var sgp = 0;
+        var sgl = 0;
+        if (_tn_find_ext(body + pos, ext_total, TLS_EXT_SUPPORTED_GROUPS, &sgp, &sgl) == 1) {
+            group = _tn_pick_group(ctx, sgp, sgl);
+            if (group < 0) { return _tn_hs_fail(ctx, TLS_AD_DECODE_ERROR, TLS_ERR_BAD_HANDSHAKE); }
+            if (group == 0) { return _tn_hs_fail(ctx, TLS_AD_HANDSHAKE_FAILURE, TLS_ERR_HANDSHAKE_FAILED); }
+            var kc = _tn_12_key_curve(ctx);
+            if (kc != 0) {
+                if (_tn_sg_has(sgp, sgl, kc) != 1) { chosen = 0; }   # no ECDSA suite on this certificate
             }
         }
     }
@@ -1398,6 +1508,18 @@ fn _tn_12_parse_client_hello(ctx, body, blen): i64 {
     store64(ctx + TLS_CTX_OFF_GROUP, group);
     store64(ctx + TLS_CTX_OFF_CIPHER, tls_native_12_cipher_aead_identity(chosen));
     return chosen;
+}
+
+# 1 if a TLS 1.2 ClientHello's compression_methods (`cm`, `n` bytes, n >= 1) lists the null method
+# (0) anywhere, else 0 — RFC 5246 §7.4.1.2: the list "MUST contain" it, and the ServerHello names
+# it. CHANGELOG [6.7.16]
+fn _tn_12_cm_has_null(cm, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if ((load8(cm + i) & 0xFF) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # 1 if the TLS 1.2 server can negotiate wire suite `w`: an ECDHE suite whose ServerHello it can
@@ -1474,7 +1596,7 @@ fn _tn_12_client_consume_flight(ctx, flight, flight_len): i64 {
     # before it feeds the transcript or a parser — otherwise a hostile
     # server's oversized length drives an OOB read in sha*_update.
     if (tls_native_handshake_read_header(flight, flight_len, &ht, &blen) < 0) { return TLS_ERR_BAD_HANDSHAKE; }
-    var sh_len = TLS_HANDSHAKE_HEADER_LEN + blen;
+    var sh_len = _TLS_HANDSHAKE_HEADER_LEN + blen;
     if (sh_len > flight_len) { return TLS_ERR_BAD_HANDSHAKE; }
     var pr = tls_native_client_parse_server_hello_12(ctx, flight, sh_len);
     if (pr != TLS_OK) { return pr; }
@@ -1491,9 +1613,9 @@ fn _tn_12_client_consume_flight(ctx, flight, flight_len): i64 {
         return TLS_ERR_BAD_HANDSHAKE;
     }
     if (ht != TLS_HS_CERTIFICATE) { return TLS_ERR_BAD_HANDSHAKE; }
-    var cert_msg_len = TLS_HANDSHAKE_HEADER_LEN + blen;
+    var cert_msg_len = _TLS_HANDSHAKE_HEADER_LEN + blen;
     if (cert_msg_len > flight_len - pos) { return TLS_ERR_BAD_HANDSHAKE; }
-    var cr2 = _tn_parse_certificate_12(ctx, flight + pos + TLS_HANDSHAKE_HEADER_LEN, blen);
+    var cr2 = _tn_parse_certificate_12(ctx, flight + pos + _TLS_HANDSHAKE_HEADER_LEN, blen);
     if (cr2 != TLS_OK) { return cr2; }
     tls_native_transcript_update(ts, flight + pos, cert_msg_len);
     pos = pos + cert_msg_len;
@@ -1501,9 +1623,9 @@ fn _tn_12_client_consume_flight(ctx, flight, flight_len): i64 {
         return TLS_ERR_BAD_HANDSHAKE;
     }
     if (ht != TLS_HS_SERVER_KEY_EXCHANGE) { return TLS_ERR_BAD_HANDSHAKE; }
-    var ske_msg_len = TLS_HANDSHAKE_HEADER_LEN + blen;
+    var ske_msg_len = _TLS_HANDSHAKE_HEADER_LEN + blen;
     if (ske_msg_len > flight_len - pos) { return TLS_ERR_BAD_HANDSHAKE; }
-    var sr2 = _tn_12_parse_server_kex(ctx, flight + pos + TLS_HANDSHAKE_HEADER_LEN, blen);
+    var sr2 = _tn_12_parse_server_kex(ctx, flight + pos + _TLS_HANDSHAKE_HEADER_LEN, blen);
     if (sr2 != TLS_OK) { return sr2; }
     tls_native_transcript_update(ts, flight + pos, ske_msg_len);
     pos = pos + ske_msg_len;
@@ -1511,9 +1633,9 @@ fn _tn_12_client_consume_flight(ctx, flight, flight_len): i64 {
         return TLS_ERR_BAD_HANDSHAKE;
     }
     if (ht == TLS_HS_CERTIFICATE_REQUEST) {
-        var crq_msg_len = TLS_HANDSHAKE_HEADER_LEN + blen;
+        var crq_msg_len = _TLS_HANDSHAKE_HEADER_LEN + blen;
         if (crq_msg_len > flight_len - pos) { return TLS_ERR_BAD_HANDSHAKE; }
-        var qr = _tn_12_parse_cert_request(ctx, flight + pos + TLS_HANDSHAKE_HEADER_LEN, blen);
+        var qr = _tn_12_parse_cert_request(ctx, flight + pos + _TLS_HANDSHAKE_HEADER_LEN, blen);
         if (qr != TLS_OK) { return qr; }
         tls_native_transcript_update(ts, flight + pos, crq_msg_len);
         pos = pos + crq_msg_len;
@@ -1521,7 +1643,7 @@ fn _tn_12_client_consume_flight(ctx, flight, flight_len): i64 {
             return TLS_ERR_BAD_HANDSHAKE;
         }
     }
-    var shd_msg_len = TLS_HANDSHAKE_HEADER_LEN + blen;
+    var shd_msg_len = _TLS_HANDSHAKE_HEADER_LEN + blen;
     if (shd_msg_len > flight_len - pos) { return TLS_ERR_BAD_HANDSHAKE; }
     var dr = tls_native_12_parse_server_hello_done(flight + pos, shd_msg_len);
     if (dr != TLS_OK) { return dr; }
@@ -1574,7 +1696,10 @@ fn tls_native_connect_12(ctx, sock_fd): i64 {
         fdone = _tn_flight_complete(fbuf, flen, TLS_HS_SERVER_HELLO_DONE);
     }
     var cf = _tn_12_client_consume_flight(ctx, fbuf, flen);
-    if (cf < 0) { return _tn_ctx_fail(ctx, cf); }
+    if (cf < 0) {
+        _tn_send_hs_alert(ctx, sock_fd);               # the alert a refused ServerHello recorded (6.7.14)
+        return _tn_ctx_fail(ctx, cf);
+    }
     var group = load64(ctx + TLS_CTX_OFF_GROUP);
     var pm_len = _tn_12_client_premaster(ctx);
     if (pm_len < 0) { return _tn_ctx_fail(ctx, pm_len); }
@@ -1626,7 +1751,7 @@ fn tls_native_connect_12(ctx, sock_fd): i64 {
             hn = hn + cvn;
         }
     }
-    var ckcap = hn + TLS_RECORD_HEADER_LEN * (1 + hn / TLS_RECORD_MAX_PLAINTEXT);
+    var ckcap = hn + TLS_RECORD_HEADER_LEN * (1 + hn / _TLS_RECORD_MAX_PLAINTEXT);
     var ckerec = _tn_alloc(ctx, ckcap);
     if (ckerec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var ckrn = _tn_hs_plain_records(hm, hn, ckerec, ckcap);
@@ -1696,17 +1821,17 @@ fn _tn_12_server_hs(ctx, sock_fd, ch_msg, ch_len): i64 {
         return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE);
     }
     if (ht != TLS_HS_CLIENT_HELLO) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-    if (TLS_HANDSHAKE_HEADER_LEN + blen > ch_len) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-    var chosen = _tn_12_parse_client_hello(ctx, ch_msg + TLS_HANDSHAKE_HEADER_LEN, blen);
+    if (_TLS_HANDSHAKE_HEADER_LEN + blen > ch_len) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
+    var chosen = _tn_12_parse_client_hello(ctx, ch_msg + _TLS_HANDSHAKE_HEADER_LEN, blen);
     if (chosen < 0) {
         _tn_send_hs_alert(ctx, sock_fd);
         return _tn_ctx_fail(ctx, chosen);
     }
     store64(ctx + TLS_CTX_OFF_VERSION, TLS_VERSION_1_2);
     var group = load64(ctx + TLS_CTX_OFF_GROUP);       # chosen from the client's supported_groups
-    var srand = _tn_alloc(ctx, TLS_RANDOM_LEN);
+    var srand = _tn_alloc(ctx, _TLS_RANDOM_LEN);
     if (srand == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-    if (_tn_rand_bytes(srand, TLS_RANDOM_LEN) != TLS_RANDOM_LEN) {
+    if (_tn_rand_bytes(srand, _TLS_RANDOM_LEN) != _TLS_RANDOM_LEN) {
         return _tn_ctx_fail(ctx, TLS_ERR_INTERNAL);
     }
     store64(ctx + TLS_CTX_OFF_SERVER_RANDOM, srand);
@@ -1716,7 +1841,7 @@ fn _tn_12_server_hs(ctx, sock_fd, ch_msg, ch_len): i64 {
     var ts = tls_native_transcript_init_in(load64(ctx + TLS_CTX_OFF_ALLOC), tls_native_cipher_hash_algo(identity));
     if (ts == 0) { return _tn_ctx_fail(ctx, TLS_ERR_INTERNAL); }
     store64(ctx + TLS_CTX_OFF_TRANSCRIPT, ts);
-    tls_native_transcript_update(ts, ch_msg, TLS_HANDSHAKE_HEADER_LEN + blen);
+    tls_native_transcript_update(ts, ch_msg, _TLS_HANDSHAKE_HEADER_LEN + blen);
     var flight = _tn_alloc(ctx, 4096);
     if (flight == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var fl = tls_native_12_build_server_flight(ctx, flight, 4096);
@@ -1739,7 +1864,7 @@ fn _tn_12_server_hs(ctx, sock_fd, ch_msg, ch_len): i64 {
     var mtls = 0;
     if (load64(ctx + TLS_CTX_OFF_VERIFY) != TLS_VERIFY_NONE) { mtls = 1; }
     var hcap = 512;
-    if (mtls == 1) { hcap = TLS_RECORD_MAX_PLAINTEXT; }
+    if (mtls == 1) { hcap = _TLS_RECORD_MAX_PLAINTEXT; }
     var hb = _tn_alloc(ctx, hcap);
     if (hb == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var hlen = 0;
@@ -1794,9 +1919,9 @@ fn _tn_12_server_hs(ctx, sock_fd, ch_msg, ch_len): i64 {
         var cvp = hb + hpos - cvm;
         tls_native_handshake_read_header(cvp, cvm, &mt, &mb);
         if (mt != TLS_HS_CERTIFICATE_VERIFY) { return _tn_ctx_fail(ctx, TLS_ERR_BAD_HANDSHAKE); }
-        var cvc = _tn_12_cv_content(ctx, ch_msg, TLS_HANDSHAKE_HEADER_LEN + blen, flight, fl, hb, cv_at);
+        var cvc = _tn_12_cv_content(ctx, ch_msg, _TLS_HANDSHAKE_HEADER_LEN + blen, flight, fl, hb, cv_at);
         if (cvc == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-        var cvr = _tn_12_srv_client_cv(ctx, sock_fd, cvp, cvm, cvc, TLS_HANDSHAKE_HEADER_LEN + blen + fl + cv_at);
+        var cvr = _tn_12_srv_client_cv(ctx, sock_fd, cvp, cvm, cvc, _TLS_HANDSHAKE_HEADER_LEN + blen + fl + cv_at);
         if (cvr != TLS_OK) { return cvr; }
         tls_native_transcript_update(ts, cvp, cvm);
     }
@@ -1855,6 +1980,10 @@ fn tls_native_accept_12(ctx, sock_fd): i64 {
 # the key schedule, and reset both direction sequence numbers. Call
 # after the handshake secret is derived (.18).
 fn tls_native_server_install_handshake_keys(ctx): i64 {
+    # The two handshake-traffic secrets the keys derive from are `secret var`s, zeroised on every
+    # return (they were _tn_alloc copies abandoned un-wiped). CHANGELOG [6.7.18]
+    secret var ss_b[_TLS_MAX_DIGEST_LEN];
+    secret var cs_b[_TLS_MAX_DIGEST_LEN];
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     var ks = load64(ctx + TLS_CTX_OFF_KEYSCHED);
     if (ks == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
@@ -1863,8 +1992,7 @@ fn tls_native_server_install_handshake_keys(ctx): i64 {
     var key_len = tls_native_cipher_key_len(cipher);
     var iv_len = tls_native_cipher_iv_len(cipher);
     var hlen = _tn_hash_len(hash_algo);
-    var ss = _tn_alloc(ctx, TLS_MAX_DIGEST_LEN);
-    if (ss == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+    var ss = &ss_b;
     if (tls_native_keysched_get_secret(ks, TLS_KS_SERVER_HANDSHAKE, ss) < 0) {
         return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
     }
@@ -1876,8 +2004,7 @@ fn tls_native_server_install_handshake_keys(ctx): i64 {
     tls_native_derive_iv(ss, hlen, hash_algo, siv, iv_len);
     store64(ctx + TLS_CTX_OFF_SRV_HS_KEY, sk);
     store64(ctx + TLS_CTX_OFF_SRV_HS_IV, siv);
-    var cs = _tn_alloc(ctx, TLS_MAX_DIGEST_LEN);
-    if (cs == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
+    var cs = &cs_b;
     if (tls_native_keysched_get_secret(ks, TLS_KS_CLIENT_HANDSHAKE, cs) < 0) {
         return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
     }
@@ -1939,18 +2066,16 @@ fn tls_native_set_alpn(ctx, protos, protos_len): i64 {
     return TLS_OK;
 }
 
-# Parse a server-sent ALPN extension body (RFC 7301 §3.1: a 2-byte
-# ProtocolNameList length, then exactly ONE 1-byte-len-prefixed protocol)
-# and store the selected protocol on the ctx as [u8 len][proto]. `ext_data`
-# points at the extension_data; `ext_len` is its length. Lenient: a malformed
-# ALPN ext is ignored (selected stays unset). Returns TLS_OK always.
+# Store a server-sent ALPN extension body's protocol (RFC 7301 §3.1: a 2-byte
+# ProtocolNameList length, then exactly ONE 1-byte-len-prefixed protocol) on
+# the ctx as [u8 len][proto]. `ext_data` points at the extension_data;
+# `ext_len` is its length. A body that is not exactly one well-formed name
+# (_tn_alpn_answer_ok) stores nothing — the client refuses it first
+# (_tn_client_alpn_answer, decode_error); 6.7.12 stored the first name of a
+# list of two. Returns TLS_OK always. CHANGELOG [6.7.14]
 fn _tn_store_alpn_selected(ctx, ext_data, ext_len): i64 {
-    if (ext_len < 3) { return TLS_OK; }
-    var list_len = _tn_be16_r(ext_data);
-    if (list_len + 2 > ext_len) { return TLS_OK; }
+    if (_tn_alpn_answer_ok(ext_data, ext_len) != 1) { return TLS_OK; }
     var plen = load8(ext_data + 2) & 0xFF;
-    if (plen == 0) { return TLS_OK; }
-    if (plen + 1 > list_len) { return TLS_OK; }
     var sel = _tn_alloc(ctx, 1 + plen);
     if (sel == 0) { return TLS_OK; }
     store8(sel, plen);
@@ -1986,8 +2111,8 @@ fn tls_native_set_verify(ctx, mode): i64 {
 # (.78: was a single root; now a set so system bundles + multi-root PEM work.)
 # TLS_CA_MAX_ROOTS bounds nothing: a trust bundle's chain scratch is sized from its own block count
 # (6.6.13, _tn_ca_parse_set) and so is a client certificate's leaf decode (6.7.9,
-# tls_native_set_client_cert). The public name is kept, so a program that assigns it still
-# compiles; retiring it is a removed-symbol decision. CHANGELOG [6.7.9]
+# tls_native_set_client_cert). The public name is kept (the user's decision D15, 2026-10-15), so a
+# program that reads or assigns it still compiles, and a write changes nothing. CHANGELOG [6.7.9] [6.7.12]
 var TLS_CA_MAX_ROOTS = 300;
 
 # Parse a trust bundle into a root set [count][root ptrs...] — the layout verify_chain reads.
@@ -2075,6 +2200,7 @@ fn tls_native_set_ca_bundle(ctx, pem_bundle, bundle_len, is_der): i64 {
     store64(ctx + TLS_CTX_OFF_CA_SKIPPED, skipped);
     if (set < 0) { return set; }
     store64(ctx + TLS_CTX_OFF_CA_ROOT, set);
+    store64(ctx + TLS_CTX_OFF_CA_POLICY, 0);    # a caller's bundle: no system trust policy (6.7.12)
     return TLS_OK;
 }
 
@@ -2087,10 +2213,10 @@ fn tls_native_set_ca_bundle(ctx, pem_bundle, bundle_len, is_der): i64 {
 # rest of the bundle installs; it used to fail the whole install. After an
 # install that failed TLS_ERR_CERT_INVALID it is that bundle's count (every block). Returns >= 0;
 # 0 before any install; TLS_ERR_INVALID_PARAM for ctx == 0.
-# Windows' system store (6.6.14) also counts the roots it refuses — a dated distrust (Disable or
-# NotBefore) covering TLS or root-program name constraints, which the native verifier cannot apply, or
-# a property it cannot read (cass: 12) — and any root that did not fit the 1 MiB bundle: installed +
-# skipped == the store's TLS roots (`_tn_ca_sys_refused`).
+# Windows' system store (6.6.14) also counts the roots it refuses — a Disable date covering TLS or
+# root-program name constraints, which the native verifier cannot apply, or a property it cannot read
+# (cass: 6; a NotBefore date no longer refuses a root since 6.7.12 — it bounds it) — and any root that
+# did not fit the 1 MiB bundle: installed + skipped == the store's TLS roots (`_tn_ca_sys_refused`).
 # Issue 2026-09-30-tls-client-memory-and-alert-gaps (e); CHANGELOG [6.6.13], [6.6.14].
 fn tls_native_ca_skipped(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
@@ -2148,6 +2274,9 @@ var _tn_ca_sys_skipped = 0;  # blocks of the bundle the set could not use       
 # not in the bundle, counted into `_tn_ca_sys_skipped`. Always 0 elsewhere.
 # Written by the claim holder only, in _tn_ca_read_win. CHANGELOG [6.6.14]
 var _tn_ca_sys_refused = 0;
+# 6.7.12: the set's trust policy (_tn_pol_new; Windows only, 0 elsewhere) — published with the set, at
+# state 2, and installed with it. CHANGELOG [6.7.12]
+var _tn_ca_sys_pol = 0;
 # ⛔ CYRIUS-2026-0027 — THE STORE'S PURPOSE IS THE CHAIN'S PURPOSE. The set above is the system roots
 # trusted for SERVER authentication, which a CLIENT ctx anchors a server chain to. A SERVER ctx
 # anchors CLIENT chains (mTLS, _TN_PURPOSE_CLIENT), and Windows records per root which purposes
@@ -2164,6 +2293,7 @@ var _tn_ca_cl_len = 0;
 var _tn_ca_cl_set = 0;
 var _tn_ca_cl_skipped = 0;
 var _tn_ca_cl_refused = 0;
+var _tn_ca_cl_pol = 0;
 
 # Load and parse the bundle once per process: returns TLS_OK once `_tn_ca_buf`/`_tn_ca_len` and
 # the shared root set are published (a cached "none readable" and a cached unusable bundle
@@ -2171,21 +2301,22 @@ var _tn_ca_cl_refused = 0;
 # tries again. Safe from any thread.
 fn _tn_ca_load(): i64 {
     return _tn_ca_load_into(&_tn_ca_state, &_tn_ca_buf, &_tn_ca_len, &_tn_ca_sys_set,
-      &_tn_ca_sys_skipped, &_tn_ca_sys_refused, _TN_PURPOSE_SERVER);
+      &_tn_ca_sys_skipped, &_tn_ca_sys_refused, &_tn_ca_sys_pol, _TN_PURPOSE_SERVER);
 }
 
 # _tn_ca_load for the CLIENT-purpose set a Windows server ctx installs (the `_tn_ca_cl_*` cells).
 fn _tn_ca_load_client(): i64 {
     return _tn_ca_load_into(&_tn_ca_cl_state, &_tn_ca_cl_buf, &_tn_ca_cl_len, &_tn_ca_cl_set,
-      &_tn_ca_cl_skipped, &_tn_ca_cl_refused, _TN_PURPOSE_CLIENT);
+      &_tn_ca_cl_skipped, &_tn_ca_cl_refused, &_tn_ca_cl_pol, _TN_PURPOSE_CLIENT);
 }
 
 # The once-per-process load behind both: the cells are the state, the bundle bytes and length, the
-# set, its skipped count and the store's refused count, for roots trusted for `purpose`.
+# set, its skipped count, the store's refused count and the set's trust policy, for roots trusted
+# for `purpose`.
 # ⚠ Nothing between the claim and the publish may `return`: the state would stay 1 and every later
 # connect would spin forever. The build lives in `_tn_ca_read` and `_tn_ca_parse_set`; the only
 # exits here are the two OOM rollbacks, each of which releases the claim itself.
-fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, purpose): i64 {
+fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, ppol, purpose): i64 {
     var s = atomic_load(st);
     while (s != 2) {
         if (s == 0) {
@@ -2196,7 +2327,8 @@ fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, purpose): i64 {
                     atomic_store(st, 0);
                     return TLS_ERR_OOM;
                 }
-                var total = _tn_ca_read(buf, cap, pref, purpose);
+                var pol = 0;
+                var total = _tn_ca_read(buf, cap, pref, &pol, purpose);
                 var set = 0;
                 var skipped = 0;
                 if (total > 0) {
@@ -2211,6 +2343,7 @@ fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, purpose): i64 {
                 store64(plen, total);
                 store64(pset, set);
                 store64(pskip, skipped + load64(pref));
+                store64(ppol, pol);
                 # Release half: the bytes, the set, the pointer and the length before the 2. aarch64 only
                 # — x86 (TSO) keeps store order, so a fence there is pure tax (lib/freelist.cyr).
                 #ifdef CYRIUS_ARCH_AARCH64
@@ -2243,17 +2376,18 @@ fn tls_native_set_ca_system(ctx): i64 {
     if (load64(ctx + TLS_CTX_OFF_ROLE) == TLS_ROLE_SERVER) {
         var cr = _tn_ca_load_client();
         if (cr != TLS_OK) { return cr; }
-        return _tn_ca_install(ctx, _tn_ca_cl_len, _tn_ca_cl_set, _tn_ca_cl_skipped);
+        return _tn_ca_install(ctx, _tn_ca_cl_len, _tn_ca_cl_set, _tn_ca_cl_skipped, _tn_ca_cl_pol);
     }
     #endif
     var lr = _tn_ca_load();
     if (lr != TLS_OK) { return lr; }
-    return _tn_ca_install(ctx, _tn_ca_len, _tn_ca_sys_set, _tn_ca_sys_skipped);
+    return _tn_ca_install(ctx, _tn_ca_len, _tn_ca_sys_set, _tn_ca_sys_skipped, _tn_ca_sys_pol);
 }
 
-# Store a published system set on `ctx`: `len` < 0 is no bundle (TLS_ERR_IO), a negative `set` an
-# unusable one; `skipped` goes to tls_native_ca_skipped either way.
-fn _tn_ca_install(ctx, len, set, skipped): i64 {
+# Store a published system set on `ctx`, with its trust policy `pol` (0 = none): `len` < 0 is no
+# bundle (TLS_ERR_IO), a negative `set` an unusable one; `skipped` goes to tls_native_ca_skipped
+# either way.
+fn _tn_ca_install(ctx, len, set, skipped, pol): i64 {
     if (len < 0) {
         # No bundle. On Windows that includes a store whose every TLS root was refused: report those
         # through tls_native_ca_skipped, or the reason the ctx has no roots is invisible. CHANGELOG [6.6.14]
@@ -2263,22 +2397,26 @@ fn _tn_ca_install(ctx, len, set, skipped): i64 {
     store64(ctx + TLS_CTX_OFF_CA_SKIPPED, skipped);
     if (set < 0) { return set; }
     store64(ctx + TLS_CTX_OFF_CA_ROOT, set);
+    store64(ctx + TLS_CTX_OFF_CA_POLICY, pol);
     return TLS_OK;
 }
 
 # Read the first readable system bundle into `buf` (`cap` bytes). Returns the byte count, or -1
 # when no candidate is readable (the caller caches that). Called only by the claim holder. `refused`
-# receives the roots the store refused (Windows; 0 elsewhere), `purpose` the TlsChainPurpose the
-# roots must be trusted for — a POSIX bundle has no per-root purpose, so it is read the same for both.
+# receives the roots the store refused (Windows; 0 elsewhere), `ppol` the set's trust policy
+# (Windows; 0 elsewhere — a POSIX bundle is a list of roots and nothing more), `purpose` the
+# TlsChainPurpose the roots must be trusted for — a POSIX bundle has no per-root purpose, so it is
+# read the same for both.
 # ⛔ CYRIUS-2026-0020 (6.6.14) — NEVER THE POSIX PATHS ON WINDOWS. There a rooted path is DRIVE-RELATIVE:
 # "/etc/ssl/cert.pem" is C:\etc\ssl\cert.pem, and any authenticated user may create folders at the
 # root of the system drive, so one local user could plant trust anchors every native TLS client on
 # the box then trusted (measured on cass: a planted cert.pem installed as the only root). Windows
 # reads its own store instead (_tn_ca_read_win) — CYRIUS-2026-0012 / CYRIUS-2026-0014's class. CHANGELOG [6.6.14]
-fn _tn_ca_read(buf, cap, refused, purpose): i64 {
+fn _tn_ca_read(buf, cap, refused, ppol, purpose): i64 {
     store64(refused, 0);
+    store64(ppol, 0);
     #ifdef CYRIUS_TARGET_WIN
-    var w = _tn_ca_read_win(buf, cap, refused, purpose);
+    var w = _tn_ca_read_win(buf, cap, refused, ppol, purpose);
     return w;
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -2318,6 +2456,14 @@ fn _tn_ca_read(buf, cap, refused, purpose): i64 {
 # process — and it is a LOGICAL store that already holds LocalMachine\ROOT, the third-party
 # (AuthRoot) roots and Group Policy / Enterprise roots (measured on cass: CurrentUser\ROOT 59 ⊇
 # LocalMachine\ROOT 59 ⊇ AuthRoot 47).
+# ⛔ 6.7.12 — THE ProtectedRoots POLICY IS APPLIED BY THAT OPEN, NOT HERE. crypt32 reads `Flags` under
+# HKLM\SOFTWARE\Policies\Microsoft\SystemCertificates\Root\ProtectedRoots when the logical store is
+# opened and builds it from the physical stores the policy leaves (CERT_PROT_ROOT_DISABLE_CURRENT_USER_FLAG,
+# 1, drops the user's own .Default store). Measured on cass: Flags = 8 took CurrentUser\ROOT from 59 roots
+# to 12 at the next open; the same value under HKLM\SOFTWARE\Microsoft\...\Root\ProtectedRoots changed
+# nothing — Windows reads only the Policies key. So this export already follows the policy exactly as
+# the chain engine does; reading the flags here and opening LocalMachine stores instead could only
+# diverge from it. Issue 2026-10-08-windows-trust-store-parity-gaps (1); CHANGELOG [6.7.12]
 # WHICH ROOTS: the ones the root's own properties and the Disallowed store say Windows trusts for TLS
 # server authentication — the policy only ever REMOVES roots, and anything it cannot judge is refused.
 # (A server ctx's set asks the same of CLIENT authentication — every "serverAuth" below reads
@@ -2328,23 +2474,36 @@ fn _tn_ca_read(buf, cap, refused, purpose): i64 {
 #   - the root program distrusts by DATE two ways, each scoped by a purpose list (absent = every
 #     purpose): a DISABLE date (CERT_DISALLOWED_FILETIME_PROP_ID 104, scope 122), after which the root
 #     is not trusted at all, and a NOTBEFORE date (CERT_NOT_BEFORE_FILETIME_PROP_ID 126, scope 127),
-#     after which the certificates it issues are not. A root with either covering serverAuth is
-#     REFUSED whole — the verifier has neither a clock-dependent root set nor a per-root issuance
-#     bound, so it fails closed (cass: Disable — StartCom, DST Root CA X3, AddTrust, QuoVadis,
-#     Baltimore, VeriSign G5; NotBefore — the three Entrust roots, SecureTrust CA, Certum CA, Class 3
-#     PCA). Refused roots, and any that would not fit `cap`, are counted in tls_native_ca_skipped
-#     (`_tn_ca_sys_refused`);
+#     after which the certificates it issues are not. A root with a Disable date covering serverAuth is
+#     REFUSED whole — the verifier has no clock-dependent root set, so it fails closed (cass: StartCom,
+#     DST Root CA X3, AddTrust, QuoVadis, Baltimore, VeriSign G5). A root with a NotBefore date
+#     covering serverAuth is TAKEN WITH AN ISSUANCE BOUND (6.7.12, D9): it anchors only a leaf whose
+#     notBefore precedes the date, as SChannel does (cass: the three Entrust roots, SecureTrust CA,
+#     Certum CA, Class 3 PCA — refused whole before 6.7.12, so a leaf they issued earlier failed here);
+#     the bound rides the set's trust policy (_tn_pol_anchor_ok). A date that is not a FILETIME, or a
+#     scope that cannot be read, still refuses the root. Refused roots, and any that would not fit
+#     `cap`, are counted in tls_native_ca_skipped (`_tn_ca_sys_refused`);
 #   - a root carrying root-program NAME CONSTRAINTS (CERT_ROOT_PROGRAM_NAME_CONSTRAINTS_PROP_ID 84)
 #     is refused the same way: Windows confines it to the names listed, the verifier has no per-root
 #     name constraint (none on cass today);
 #   - a certificate in the Disallowed store is never a root (Windows' explicit distrust); a Disallowed
-#     store that cannot be opened makes the whole store unusable rather than unfiltered.
-# ⚠ NOT "never trusts more than Windows". The chain engine also distrusts what this cannot see: the
-# auto-updated disallowed CTL (HKLM ...\AuthRoot\AutoUpdate\DisallowedCertEncodedCtl) is NOT
-# consulted — only the Disallowed STORE is (on cass the store is empty while the CTL holds ~97
-# hashes, none of them a ROOT certificate there) — and Disallowed is applied to ROOTS only, never to
-# the intermediates and leaves a server sends. The other way, roots Windows would fetch on demand
-# (automatic root update) are not in the store, so those servers fail closed here.
+#     store that cannot be opened makes the whole store unusable rather than unfiltered;
+#   - 6.7.12: the auto-updated disallowed CTL (HKLM ...\AuthRoot\AutoUpdate\DisallowedCertEncodedCtl,
+#     _tn_w_ctl_keys) is read too, and with the Disallowed store it binds EVERY certificate of a path,
+#     not only roots: the set's trust policy (_tn_pol_new) carries the CTL's public-key entries and the
+#     store's certificates, and _tn_verify_chain refuses a leaf, and skips a CA, that either names; a
+#     root either names is not exported. A CTL value that is present but cannot be read or parsed makes
+#     the whole store unusable, as the Disallowed store does; an absent one (wine) is an empty list.
+#     The CTL's identifiers are not certificate hashes but crypt32's two distrust keys (_TN_POL_LEN):
+#     a 16-byte entry (82 of 88 on cass) is the MD5 of a certificate's public key (prop 25); a 20, 32,
+#     48 or 64-byte entry is a certificate's signature hash (prop 15) — its tbsCertificate hashed with
+#     its own signature digest, SHA-1 / SHA-256 / SHA-384 / SHA-512 (the 6 others on cass are 48-byte,
+#     6.7.14; the other lengths since 6.7.15). An MD2 / MD5-signed certificate's signature hash is 16
+#     bytes too, so a 16-byte entry is applied under both readings (6.7.16). All are applied; an entry
+#     of any other length is not.
+# ⚠ NOT "never trusts more than Windows" in every case: roots Windows would fetch on demand (automatic
+# root update) are not in the store, so those servers fail closed here — deliberately (D9, 6.7.12): the
+# stdlib takes no network action of its own.
 # Each root is written into `buf` as a PEM block, so `_tn_ca_buf` is the same thing on every target
 # (the system bundle, PEM) and _tn_ca_parse_set counts what it cannot parse exactly as for a file.
 # HOW: crypt32 is loaded at first use with LoadLibraryExA(LOAD_LIBRARY_SEARCH_SYSTEM32), resolved
@@ -2362,6 +2521,10 @@ var _TN_W_PROP_DISABLE_EKU = 122;       # CERT_DISALLOWED_ENHKEY_USAGE_PROP_ID: 
 var _TN_W_PROP_NOTBEFORE = 126;         # CERT_NOT_BEFORE_FILETIME_PROP_ID: issued after it, not trusted
 var _TN_W_PROP_NOTBEFORE_EKU = 127;     # CERT_NOT_BEFORE_ENHKEY_USAGE_PROP_ID: for these purposes
 var _TN_W_NOT_FOUND = 0x80092004;       # CRYPT_E_NOT_FOUND: the property is absent
+var _TN_W_HKLM = 0 - 2147483646;        # HKEY_LOCAL_MACHINE, (HKEY)(LONG)0x80000002 sign-extended
+var _TN_W_RRF_BINARY = 8;               # RRF_RT_REG_BINARY
+var _TN_W_NO_VALUE = 2;                 # ERROR_FILE_NOT_FOUND: the key or the value is absent
+var _TN_W_ENC = 0x10001;                # X509_ASN_ENCODING | PKCS_7_ASN_ENCODING
 
 # Load crypt32 from System32 and resolve the four entry points into fns[0..4): CertOpenStore,
 # CertEnumCertificatesInStore, CertCloseStore, CertGetCertificateContextProperty. 1, or 0.
@@ -2489,13 +2652,38 @@ fn _tn_w_dated(fns, cc, date_id, eku_id, scratch, scap, purpose): i64 {
     return 0;
 }
 
+# The NotBefore distrust (props 126 / 127) of the store certificate `cc` for `purpose`: 0 = none
+# covers it, 1 = one does — its issuance bound (Unix seconds, rounded up: see _TN_POL_LEN) is stored
+# at `pb` — and -1 = it cannot be judged (the date is not one readable 8-byte FILETIME, or its scope
+# cannot be read or is malformed), which refuses the root. An absent scope covers every purpose.
+# CHANGELOG [6.7.12]
+fn _tn_w_notbefore(fns, cc, scratch, scap, purpose, pb): i64 {
+    var n = _tn_w_prop(fns, cc, _TN_W_PROP_NOTBEFORE, scratch, scap);
+    if (n == 0 - 1) { return 0; }
+    if (n != 8) { return 0 - 1; }
+    var ft = load64(scratch);
+    if (ft < 0) { return 0 - 1; }
+    var m = _tn_w_prop(fns, cc, _TN_W_PROP_NOTBEFORE_EKU, scratch, scap);
+    if (m == 0 - 2) { return 0 - 1; }
+    if (m >= 0) {
+        var e = _tn_w_eku_purpose(scratch, m, purpose);
+        if (e < 0) { return 0 - 1; }
+        if (e == 0) { return 0; }
+    }
+    store64(pb, (ft + 9999999) / 10000000 - 11644473600);
+    return 1;
+}
+
 # How Windows trusts the store certificate `cc` (a PCCERT_CONTEXT) for TLS `purpose` (TlsChainPurpose:
 # server or client authentication): 1 = as an anchor, 0 = not at all (its purposes leave that one
-# out), 2 = refused (a dated distrust covers it, it carries root-program name constraints, or a
+# out), 2 = refused (a Disable date covers it, it carries root-program name constraints, or a
 # property cannot be read or is malformed — it cannot be judged, so it is refused and COUNTED). Any
-# failure other than "property absent" fails closed. Property values are read into scratch[0..scap)
-# — the unused tail of the bundle buffer.
-fn _tn_w_policy(fns, cc, scratch, scap, purpose): i64 {
+# failure other than "property absent" fails closed. A NotBefore date covering `purpose` does not
+# refuse it (6.7.12, D9): the answer is 1 and its issuance bound is stored at `pbound` (1 = it has
+# one) and `pbound + 8` (the bound); `pbound` reads 0 otherwise. Property values are read into
+# scratch[0..scap) — the unused tail of the bundle buffer.
+fn _tn_w_policy(fns, cc, scratch, scap, purpose, pbound): i64 {
+    store64(pbound, 0);
     var n = _tn_w_prop(fns, cc, _TN_W_PROP_EKU, scratch, scap);
     if (n == 0 - 2) { return 2; }
     if (n >= 0) {
@@ -2505,7 +2693,9 @@ fn _tn_w_policy(fns, cc, scratch, scap, purpose): i64 {
     }
     if (_tn_w_prop(fns, cc, _TN_W_PROP_NAMES, scratch, scap) != 0 - 1) { return 2; }
     if (_tn_w_dated(fns, cc, _TN_W_PROP_DISABLE, _TN_W_PROP_DISABLE_EKU, scratch, scap, purpose) == 1) { return 2; }
-    if (_tn_w_dated(fns, cc, _TN_W_PROP_NOTBEFORE, _TN_W_PROP_NOTBEFORE_EKU, scratch, scap, purpose) == 1) { return 2; }
+    var nb = _tn_w_notbefore(fns, cc, scratch, scap, purpose, pbound + 8);
+    if (nb < 0) { return 2; }
+    store64(pbound, nb);
     return 1;
 }
 
@@ -2563,26 +2753,72 @@ fn _tn_w_pem_put(buf, pos, cap, der, dlen): i64 {
     return o + 26;
 }
 
-# Walk the store `root` and write every certificate the policy takes for `purpose` — and `dis` (the
-# Disallowed store) does not hold — into buf[0..cap) as PEM. The byte count (0 when none
-# qualified); the number refused (policy 2, or a block that did not fit) is stored at `refused`.
-# Takes the two store handles so the policy can be exercised on stores built in memory
-# (tests/tcyr/crossos/tls_system_trust_store.tcyr). CHANGELOG [6.6.14]
-fn _tn_w_export(fns, root, dis, buf, cap, refused, purpose): i64 {
+# Append to the trust policy `pol` the issuance bound `bound` of the root der[0..dlen) (the DER is
+# copied: the store's context is released by the walk). 1, or 0 on OOM. The bound list grows by
+# doubling from 8 entries — its capacity follows from its count.
+fn _tn_w_bound_add(pol, der, dlen, bound): i64 {
+    var n = load64(pol + 32);
+    var b = load64(pol + 40);
+    var grow = 0;
+    if (n == 0) { grow = 8; }
+    if (n >= 8) {
+        if ((n & (n - 1)) == 0) { grow = n * 2; }
+    }
+    if (grow > 0) {
+        var nb = alloc(grow * 24);
+        if (nb == 0) { return 0; }
+        if (n > 0) { memcpy(nb, b, n * 24); }
+        b = nb;
+    }
+    var cp = alloc(dlen);
+    if (cp == 0) { return 0; }
+    memcpy(cp, der, dlen);
+    store64(b + n * 24, cp);
+    store64(b + n * 24 + 8, dlen);
+    store64(b + n * 24 + 16, bound);
+    store64(pol + 40, b);
+    store64(pol + 32, n + 1);
+    return 1;
+}
+
+# Walk the store `root` and write every certificate the policy takes for `purpose` — and neither `dis`
+# (the Disallowed store) nor the trust policy `pol` (its deny keys and certs; _tn_pol_new) distrusts —
+# into buf[0..cap) as PEM. A root taken with a NotBefore distrust gets its issuance bound appended to
+# `pol` (6.7.12). The byte count (0 when none qualified); the number refused (policy 2, a root whose key
+# cannot be read against the deny keys, a block that did not fit, or a bound that could not be recorded)
+# is stored at `refused`. Takes the store handles and the policy so the rules can be exercised on
+# stores built in memory (tests/tcyr/crossos/tls_system_trust_store.tcyr). CHANGELOG [6.6.14], [6.7.12]
+fn _tn_w_export(fns, root, dis, buf, cap, refused, purpose, pol): i64 {
     var en = load64(fns + 8);
     var total = 0;
     var nref = 0;
+    var bd[16];                         # [has a bound][the bound] (_tn_w_policy)
     var c = callptr(en, root, 0);
     while (c != 0) {
         var der = load64(c + 8);
         var dlen = load32(c + 16);
-        var pol = _tn_w_policy(fns, c, buf + total, cap - total, purpose);
-        if (pol != 0) {
-            if (_tn_w_in_store(fns, dis, der, dlen) == 1) { pol = 0; }
+        var code = _tn_w_policy(fns, c, buf + total, cap - total, purpose, &bd);
+        if (code != 0) {
+            if (_tn_w_in_store(fns, dis, der, dlen) == 1) { code = 0; }
         }
-        if (pol == 2) { nref = nref + 1; }
-        if (pol == 1) {
+        if (code != 0) {
+            if (pol != 0) {
+                var dn = _tn_pol_der_denied(pol, der, dlen);
+                if (dn == 1) { code = 0; }
+                if (dn == 2) { code = 2; }
+            }
+        }
+        if (code == 2) { nref = nref + 1; }
+        if (code == 1) {
             var np = _tn_w_pem_put(buf, total, cap, der, dlen);
+            if (np >= 0) {
+                if (load64(&bd) == 1) {
+                    if (pol == 0) { np = 0 - 1; }   # no policy to carry the bound: refused, never unbounded
+                    if (np >= 0) {
+                        if (_tn_w_bound_add(pol, der, dlen, load64(&bd + 8)) == 0) { np = 0 - 1; }
+                    }
+                }
+            }
             if (np < 0) { nref = nref + 1; }
             if (np >= 0) { total = np; }
         }
@@ -2592,12 +2828,185 @@ fn _tn_w_export(fns, root, dis, buf, cap, refused, purpose): i64 {
     return total;
 }
 
+# ASCII `s` as NUL-terminated UTF-16LE into w[0..cap) bytes. 1, or 0 when it does not fit.
+fn _tn_w_widen(s, w, cap): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) {
+        if (i * 2 + 4 > cap) { return 0; }
+        store16(w + i * 2, load8(s + i) & 0xFF);
+        i = i + 1;
+    }
+    store16(w + i * 2, 0);
+    return 1;
+}
+
+# The entries of the parsed disallowed CTL `ctl` (a PCCTL_CONTEXT), copied: the 16-byte entries — the
+# public-key MD5s, read as MD2 / MD5 signature hashes too (6.7.16, _TN_POL_LEN) — are returned (0 when
+# it has none) with their count at `pn`, and the other signature hashes go into the 64-byte table
+# `sig` — the policy's layout (_TN_POL_LEN): a {count, ptr} pair for each of the 20, 32, 48 and
+# 64-byte entries, in that order (ptr 0 when none). -1 when it is not a list of this kind (its
+# SubjectAlgorithm is not szOID_DISALLOWED_HASH) or a copy cannot be allocated. An entry of any other
+# length is not applied — see the store header. CHANGELOG [6.7.12], [6.7.14], [6.7.15], [6.7.16]
+fn _tn_w_ctl_copy(ctl, pn, sig): i64 {
+    store64(pn, 0);
+    memset(sig, 0, 64);
+    var info = load64(ctl + 24);                    # CTL_CONTEXT.pCtlInfo
+    if (info == 0) { return 0 - 1; }
+    var oid = load64(info + 72);                    # CTL_INFO.SubjectAlgorithm.pszObjId
+    if (oid == 0) { return 0 - 1; }
+    if (strlen(oid) != 24) { return 0 - 1; }
+    if (memeq(oid, "1.3.6.1.4.1.311.10.11.15", 24) != 1) { return 0 - 1; }
+    var ne = load32(info + 96);                     # cCTLEntry
+    var ents = load64(info + 104);                  # rgCTLEntry: CTL_ENTRY, 32 B each
+    var k = 0;
+    while (k < 4) {
+        var h = _tn_w_ctl_take(ents, ne, _tn_sig_len_at(k), sig + k * 16);
+        if (h < 0) { return 0 - 1; }
+        store64(sig + k * 16 + 8, h);
+        k = k + 1;
+    }
+    return _tn_w_ctl_take(ents, ne, 16, pn);
+}
+
+# The `ne` CTL entries at `ents` whose SubjectIdentifier is exactly `len` bytes, copied back to back
+# into one allocation (returned; 0 when there are none) with their count at `pn`; -1 on OOM.
+fn _tn_w_ctl_take(ents, ne, len, pn): i64 {
+    store64(pn, 0);
+    var m = 0;
+    var i = 0;
+    while (i < ne) {
+        if (load32(ents + i * 32) == len) { m = m + 1; }    # SubjectIdentifier.cbData
+        i = i + 1;
+    }
+    if (m == 0) { return 0; }
+    var out = alloc(m * len);
+    if (out == 0) { return 0 - 1; }
+    var k = 0;
+    i = 0;
+    while (i < ne) {
+        if (load32(ents + i * 32) == len) {
+            memcpy(out + k * len, load64(ents + i * 32 + 8), len);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    store64(pn, m);
+    return out;
+}
+
+# The auto-updated disallowed CTL's entries (HKLM\SOFTWARE\Microsoft\SystemCertificates\
+# AuthRoot\AutoUpdate, value DisallowedCertEncodedCtl, through advapi32!RegGetValueW and
+# crypt32!CertCreateCTLContext, both loaded from System32 like crypt32 above), as _tn_w_ctl_copy
+# splits them: the copied 16-byte entries (public-key MD5s, and MD2 / MD5 signature hashes, 6.7.16)
+# with their count at `pn`, the other signature hashes in the 64-byte table `sig`. 0 (and no hashes)
+# when the value is absent (none listed — wine has none), -1 when it is present but cannot be read or
+# parsed: the caller then fails the whole store closed. CHANGELOG [6.7.12], [6.7.14], [6.7.15], [6.7.16]
+fn _tn_w_ctl_keys(pn, sig): i64 {
+    store64(pn, 0);
+    memset(sig, 0, 64);
+    var k = syscall(0xF013, "kernel32.dll");
+    if (k == 0) { return 0 - 1; }
+    var ll = syscall(0xF014, k, "LoadLibraryExA");
+    if (ll == 0) { return 0 - 1; }
+    var adv = callptr(ll, "advapi32.dll", 0, _TN_W_SEARCH_SYSTEM32);
+    if (adv == 0) { return 0 - 1; }
+    var c32 = callptr(ll, "crypt32.dll", 0, _TN_W_SEARCH_SYSTEM32);
+    if (c32 == 0) { return 0 - 1; }
+    var reg = syscall(0xF014, adv, "RegGetValueW");
+    var mk = syscall(0xF014, c32, "CertCreateCTLContext");
+    var fr = syscall(0xF014, c32, "CertFreeCTLContext");
+    if (reg == 0) { return 0 - 1; }
+    if (mk == 0) { return 0 - 1; }
+    if (fr == 0) { return 0 - 1; }
+    var ws[128];
+    var wv[64];
+    var sub = "SOFTWARE\\Microsoft\\SystemCertificates\\AuthRoot\\AutoUpdate";
+    if (_tn_w_widen(sub, &ws, 128) == 0) { return 0 - 1; }
+    if (_tn_w_widen("DisallowedCertEncodedCtl", &wv, 64) == 0) { return 0 - 1; }
+    var cb[8];
+    store64(&cb, 0);
+    var r = callptr(reg, _TN_W_HKLM, &ws, &wv, _TN_W_RRF_BINARY, 0, 0, &cb) & 0xFFFFFFFF;
+    if (r == _TN_W_NO_VALUE) { return 0; }
+    if (r != 0) { return 0 - 1; }
+    var n = load32(&cb);
+    if (n <= 0) { return 0 - 1; }
+    var raw = alloc(n);
+    if (raw == 0) { return 0 - 1; }
+    r = callptr(reg, _TN_W_HKLM, &ws, &wv, _TN_W_RRF_BINARY, 0, raw, &cb) & 0xFFFFFFFF;
+    if (r != 0) { return 0 - 1; }
+    var ctl = callptr(mk, _TN_W_ENC, raw, load32(&cb));
+    if (ctl == 0) { return 0 - 1; }
+    var keys = _tn_w_ctl_copy(ctl, pn, sig);
+    callptr(fr, ctl);
+    return keys;
+}
+
+# Every certificate of the store `st`, copied as [der ptr][der len] pairs (16 B each), its count at
+# `pn`; 0 when it holds none, -1 on OOM.
+fn _tn_w_store_ders(fns, st, pn): i64 {
+    store64(pn, 0);
+    var en = load64(fns + 8);
+    var n = 0;
+    var c = callptr(en, st, 0);
+    while (c != 0) {
+        n = n + 1;
+        c = callptr(en, st, c);
+    }
+    if (n == 0) { return 0; }
+    var list = alloc(n * 16);
+    if (list == 0) { return 0 - 1; }
+    var k = 0;
+    var bad = 0;
+    c = callptr(en, st, 0);
+    while (c != 0) {
+        if (k < n) {
+            var l = load32(c + 16);
+            var cp = alloc(l);
+            if (cp == 0) { bad = 1; }
+            if (cp != 0) {
+                memcpy(cp, load64(c + 8), l);
+                store64(list + k * 16, cp);
+                store64(list + k * 16 + 8, l);
+                k = k + 1;
+            }
+        }
+        c = callptr(en, st, c);
+    }
+    if (bad == 1) { return 0 - 1; }
+    store64(pn, k);
+    return list;
+}
+
+# The trust policy Windows' explicit distrust gives the system set (_tn_pol_new): the disallowed CTL's
+# public-key entries and signature hashes (every length, 6.7.15), and the Disallowed store `dis`'s
+# certificates; bounds are added by the export. 0 when either cannot be read (the store then fails
+# closed).
+fn _tn_w_store_policy(fns, dis): i64 {
+    var nk = 0;
+    var sig[64];
+    var keys = _tn_w_ctl_keys(&nk, &sig);
+    if (keys < 0) { return 0; }
+    var nc = 0;
+    var certs = _tn_w_store_ders(fns, dis, &nc);
+    if (certs < 0) { return 0; }
+    var pol = _tn_pol_new(nk, keys, nc, certs, 0, 0);
+    if (pol == 0) { return 0; }
+    var k = 0;
+    while (k < 4) {
+        _tn_pol_set_sighash(pol, _tn_sig_len_at(k), load64(&sig + k * 16), load64(&sig + k * 16 + 8));
+        k = k + 1;
+    }
+    return pol;
+}
+
 # The Windows system store for _tn_ca_read: every root Windows trusts as an anchor for `purpose`, as
-# a PEM bundle in buf[0..cap). The byte count, or -1 for no store (crypt32 or a store would not
-# open, or no root qualified) — the caller caches that as TLS_ERR_IO. Writes the refused count
+# a PEM bundle in buf[0..cap), and the set's trust policy at `ppol`. The byte count, or -1 for no
+# store (crypt32 or a store would not open, the disallowed CTL or the Disallowed store could not be
+# read, or no root qualified) — the caller caches that as TLS_ERR_IO. Writes the refused count
 # through `refused`.
-fn _tn_ca_read_win(buf, cap, refused, purpose): i64 {
+fn _tn_ca_read_win(buf, cap, refused, ppol, purpose): i64 {
     store64(refused, 0);
+    store64(ppol, 0);
     var fns[32];
     if (_tn_w_crypt32(&fns) == 0) { return 0 - 1; }
     var root = _tn_w_open(&fns, "ROOT");
@@ -2608,10 +3017,13 @@ fn _tn_ca_read_win(buf, cap, refused, purpose): i64 {
         callptr(cl, root, 0);
         return 0 - 1;
     }
-    var total = _tn_w_export(&fns, root, dis, buf, cap, refused, purpose);
+    var pol = _tn_w_store_policy(&fns, dis);
+    var total = 0 - 1;
+    if (pol != 0) { total = _tn_w_export(&fns, root, dis, buf, cap, refused, purpose, pol); }
     callptr(cl, dis, 0);
     callptr(cl, root, 0);
     if (total <= 0) { return 0 - 1; }
+    store64(ppol, pol);
     return total;
 }
 #endif
@@ -2813,6 +3225,633 @@ fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
     return _tn_eku_purpose_ok(leaf, purpose);
 }
 
+# ── The trust policy a root set carries beyond its certificates (6.7.12) ─────────────────────────
+# Windows' chain engine distrusts more than a root set can say, and _tn_verify_chain applies it to
+# EVERY certificate of a path when the ctx holds a policy (TLS_CTX_OFF_CA_POLICY; tls_native_set_ca_system
+# installs the system store's, any other install clears it, so POSIX ctxs never have one):
+#   - DENY KEYS: 16-byte MD5s of a certificate's subjectPublicKey (the BIT STRING's key bytes, its
+#     unused-bits octet excluded). The auto-updated disallowed CTL lists distrusted certificates this
+#     way — measured on cass: its entry for DigiNotar Root CA is exactly that MD5 (crypt32's
+#     CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID, 25), and the chain engine reports DigiNotar
+#     CERT_TRUST_IS_EXPLICIT_DISTRUST with the Disallowed store empty; the eleven Fina 1.1.1.1
+#     certificates of 2025 match the same way. So every certificate on that KEY is distrusted. The
+#     same 16-byte list is also read as signature hashes (6.7.16): an md5WithRSA / md2WithRSA
+#     certificate's prop 15 is 16 bytes too — the MD5 / MD2 of its TBS (measured on cass, 2026-10-19:
+#     Thawte Timestamping CA e8a598be ... 013576b2, VeriSign Class 3 Public Primary CA d7c63be0 ...
+#     5f986ad8) — so one listed by it is distrusted, the reading below, unconfirmed as it is (no
+#     read-only probe shows which property the chain engine compares a 16-byte entry with:
+#     CertFindSubjectInCTL does not apply the CTL's algorithm at all, finding not even a listed
+#     48-byte entry; none of the six MD2 / MD5-signed roots on cass is listed today).
+#   - DENY SIGNATURE HASHES (6.7.14, every length 6.7.15): crypt32's signature hash of a certificate
+#     (CERT_SIGNATURE_HASH_PROP_ID 15) — its tbsCertificate (the whole TLV) hashed with its own
+#     signature digest: 20 bytes for sha1WithRSA / ecdsa-with-SHA1, 32 for SHA-256, 48 for SHA-384, 64
+#     for SHA-512 (measured on cass's ROOT store, 2026-10-18: 22 SHA-1-signed roots 20 B, 16 SHA-256 32 B,
+#     15 SHA-384 48 B; md2 / md5WithRSA 16 B). The CTL's 48-byte entries are exactly that — measured on
+#     cass (2026-10-16): its six are the six DarkMatter intermediates QuoVadis issued in 2016-2017
+#     (sha384WithRSA), whose public-key MD5s it does not list, and the chain engine reports each
+#     CERT_TRUST_IS_EXPLICIT_DISTRUST with the Disallowed store empty. A 20 / 32 / 64-byte entry is
+#     read the same way — 6.7.14's D57 reading carried to every length, unconfirmed as it is (none in
+#     the CTL today), in 6.7.12's D9 direction: a wrong reading matches nothing, and a match only
+#     distrusts. A certificate is judged only by the list of its own digest's length — an MD2 / MD5-signed
+#     one by the deny keys (6.7.16); one signed otherwise (RSASSA-PSS, Ed25519, ...) is not judged by
+#     them.
+#   - DENY CERTS: certificates distrusted byte for byte (the Disallowed store's), [der ptr][der len].
+#   - BOUNDS: a root whose root-program NotBefore distrust (CERT_NOT_BEFORE_FILETIME_PROP_ID 126) covers
+#     the purpose anchors only a leaf whose notBefore PRECEDES the date — [der ptr][der len][bound], the
+#     bound in Unix seconds rounded up, so `notBefore >= bound` is exactly "on or after the FILETIME".
+# A denied certificate is skipped while the path is built (a duplicate on another key still serves); a
+# denied leaf fails. Layout: [0] deny-key count [8] keys (16 B each) [16] deny-cert count [24] certs
+# (16 B each) [32] bound count [40] bounds (24 B each) [48..112) the deny signature hashes, a {count,
+# ptr} pair per digest length — [48] 20 B (SHA-1) [64] 32 B (SHA-256) [80] 48 B (SHA-384) [96] 64 B
+# (SHA-512), each list `count` hashes back to back (_tn_pol_sig_off); the 16-byte signature hashes
+# are the deny keys at [0]. Immutable once installed. CHANGELOG [6.7.12], [6.7.14], [6.7.15], [6.7.16]
+var _TN_POL_LEN = 112;
+
+# A policy from its three lists (counts and pointers as in the layout above), with no signature hashes
+# (_tn_pol_set_sighash adds them); 0 on OOM.
+fn _tn_pol_new(nkeys, keys, ncerts, certs, nbounds, bounds): i64 {
+    var p = alloc(_TN_POL_LEN);
+    if (p == 0) { return 0; }
+    memset(p, 0, _TN_POL_LEN);
+    store64(p, nkeys);
+    store64(p + 8, keys);
+    store64(p + 16, ncerts);
+    store64(p + 24, certs);
+    store64(p + 32, nbounds);
+    store64(p + 40, bounds);
+    return p;
+}
+
+# The signature-hash lengths the policy keeps, by index: 20, 32, 48, 64.
+fn _tn_sig_len_at(k): i64 {
+    if (k == 0) { return 20; }
+    return 16 + k * 16;
+}
+
+# The policy offset of the {count, ptr} pair of `len`-byte signature hashes, or 0 for any other length.
+fn _tn_pol_sig_off(len): i64 {
+    if (len == 20) { return 48; }
+    if (len == 32) { return 64; }
+    if (len == 48) { return 80; }
+    if (len == 64) { return 96; }
+    return 0;
+}
+
+# Give the policy `pol` its deny signature hashes of `len` bytes (20, 32, 48 or 64): `n` of them at
+# `hashes`, back to back. Returns `pol`; 0 for another length (no list of that kind).
+fn _tn_pol_set_sighash(pol, len, n, hashes): i64 {
+    var o = _tn_pol_sig_off(len);
+    if (o == 0) { return 0; }
+    store64(pol + o, n);
+    store64(pol + o + 8, hashes);
+    return pol;
+}
+
+# The MD5 round constants K[0..64) (RFC 1321 §3.4), little-endian, into t[0..256).
+fn _tn_md5_k(t): i64 {
+    memcpy(t, "\x78\xa4\x6a\xd7\x56\xb7\xc7\xe8\xdb\x70\x20\x24\xee\xce\xbd\xc1", 16);
+    memcpy(t + 16, "\xaf\x0f\x7c\xf5\x2a\xc6\x87\x47\x13\x46\x30\xa8\x01\x95\x46\xfd", 16);
+    memcpy(t + 32, "\xd8\x98\x80\x69\xaf\xf7\x44\x8b\xb1\x5b\xff\xff\xbe\xd7\x5c\x89", 16);
+    memcpy(t + 48, "\x22\x11\x90\x6b\x93\x71\x98\xfd\x8e\x43\x79\xa6\x21\x08\xb4\x49", 16);
+    memcpy(t + 64, "\x62\x25\x1e\xf6\x40\xb3\x40\xc0\x51\x5a\x5e\x26\xaa\xc7\xb6\xe9", 16);
+    memcpy(t + 80, "\x5d\x10\x2f\xd6\x53\x14\x44\x02\x81\xe6\xa1\xd8\xc8\xfb\xd3\xe7", 16);
+    memcpy(t + 96, "\xe6\xcd\xe1\x21\xd6\x07\x37\xc3\x87\x0d\xd5\xf4\xed\x14\x5a\x45", 16);
+    memcpy(t + 112, "\x05\xe9\xe3\xa9\xf8\xa3\xef\xfc\xd9\x02\x6f\x67\x8a\x4c\x2a\x8d", 16);
+    memcpy(t + 128, "\x42\x39\xfa\xff\x81\xf6\x71\x87\x22\x61\x9d\x6d\x0c\x38\xe5\xfd", 16);
+    memcpy(t + 144, "\x44\xea\xbe\xa4\xa9\xcf\xde\x4b\x60\x4b\xbb\xf6\x70\xbc\xbf\xbe", 16);
+    memcpy(t + 160, "\xc6\x7e\x9b\x28\xfa\x27\xa1\xea\x85\x30\xef\xd4\x05\x1d\x88\x04", 16);
+    memcpy(t + 176, "\x39\xd0\xd4\xd9\xe5\x99\xdb\xe6\xf8\x7c\xa2\x1f\x65\x56\xac\xc4", 16);
+    memcpy(t + 192, "\x44\x22\x29\xf4\x97\xff\x2a\x43\xa7\x23\x94\xab\x39\xa0\x93\xfc", 16);
+    memcpy(t + 208, "\xc3\x59\x5b\x65\x92\xcc\x0c\x8f\x7d\xf4\xef\xff\xd1\x5d\x84\x85", 16);
+    memcpy(t + 224, "\x4f\x7e\xa8\x6f\xe0\xe6\x2c\xfe\x14\x43\x01\xa3\xa1\x11\x08\x4e", 16);
+    memcpy(t + 240, "\x82\x7e\x53\xf7\x35\xf2\x3a\xbd\xbb\xd2\xd7\x2a\x91\xd3\x86\xeb", 16);
+    return 0;
+}
+
+# One MD5 compression of the 64-byte block `m` into the state st[0..4) (32-bit words in i64 slots),
+# with `k` the constant table (_tn_md5_k).
+fn _tn_md5_block(st, m, k): i64 {
+    var a = load64(st);
+    var b = load64(st + 8);
+    var c = load64(st + 16);
+    var d = load64(st + 24);
+    var i = 0;
+    while (i < 64) {
+        var f = 0;
+        var g = i;
+        var s = 0;
+        var r = i >> 4;
+        if (r == 0) {
+            f = (b & c) | ((~b) & d);
+            s = 7 + (i & 3) * 5;                           # 7 12 17 22
+        }
+        if (r == 1) {
+            f = (d & b) | ((~d) & c);
+            g = (5 * i + 1) & 15;
+            s = 5;                                          # 5 9 14 20
+            if ((i & 3) == 1) { s = 9; }
+            if ((i & 3) == 2) { s = 14; }
+            if ((i & 3) == 3) { s = 20; }
+        }
+        if (r == 2) {
+            f = b ^ c ^ d;
+            g = (3 * i + 5) & 15;
+            s = 4;                                          # 4 11 16 23
+            if ((i & 3) == 1) { s = 11; }
+            if ((i & 3) == 2) { s = 16; }
+            if ((i & 3) == 3) { s = 23; }
+        }
+        if (r == 3) {
+            f = c ^ (b | (~d));
+            g = (7 * i) & 15;
+            s = 6;                                          # 6 10 15 21
+            if ((i & 3) == 1) { s = 10; }
+            if ((i & 3) == 2) { s = 15; }
+            if ((i & 3) == 3) { s = 21; }
+        }
+        f = (f + a + load32(k + i * 4) + load32(m + g * 4)) & 0xFFFFFFFF;
+        a = d;
+        d = c;
+        c = b;
+        b = (b + (((f << s) | (f >> (32 - s))) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    store64(st, (load64(st) + a) & 0xFFFFFFFF);
+    store64(st + 8, (load64(st + 8) + b) & 0xFFFFFFFF);
+    store64(st + 16, (load64(st + 16) + c) & 0xFFFFFFFF);
+    store64(st + 24, (load64(st + 24) + d) & 0xFFFFFFFF);
+    return 0;
+}
+
+# MD5 (RFC 1321) of p[0..n) into out[0..16). Allocates nothing — the verifier runs it per connect, and
+# lib/sha1.cyr's allocating one-shot shows what a per-call heap block costs on the no-free heap. Used
+# ONLY to read Windows' disallowed list, whose identifiers are MD5s (_TN_POL_LEN above): a match can
+# only distrust, so MD5's collisions cannot make anything trusted.
+fn _tn_md5(p, n, out): i64 {
+    var k[256];
+    var st[32];
+    var tail[128];
+    _tn_md5_k(&k);
+    store64(&st, 0x67452301);
+    store64(&st + 8, 0xEFCDAB89);
+    store64(&st + 16, 0x98BADCFE);
+    store64(&st + 24, 0x10325476);
+    var off = 0;
+    while (off + 64 <= n) {
+        _tn_md5_block(&st, p + off, &k);
+        off = off + 64;
+    }
+    var rem = n - off;
+    memset(&tail, 0, 128);
+    memcpy(&tail, p + off, rem);
+    store8(&tail + rem, 0x80);
+    var tl = 64;
+    if (rem >= 56) { tl = 128; }
+    store64(&tail + tl - 8, n * 8);                         # the bit length, little-endian
+    _tn_md5_block(&st, &tail, &k);
+    if (tl == 128) { _tn_md5_block(&st, &tail + 64, &k); }
+    var i = 0;
+    while (i < 4) {
+        store32(out + i * 4, load64(&st + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The MD2 substitution table S (RFC 1319 §3.2, from the digits of pi) into t[0..256).
+fn _tn_md2_s(t): i64 {
+    memcpy(t, "\x29\x2e\x43\xc9\xa2\xd8\x7c\x01\x3d\x36\x54\xa1\xec\xf0\x06\x13", 16);
+    memcpy(t + 16, "\x62\xa7\x05\xf3\xc0\xc7\x73\x8c\x98\x93\x2b\xd9\xbc\x4c\x82\xca", 16);
+    memcpy(t + 32, "\x1e\x9b\x57\x3c\xfd\xd4\xe0\x16\x67\x42\x6f\x18\x8a\x17\xe5\x12", 16);
+    memcpy(t + 48, "\xbe\x4e\xc4\xd6\xda\x9e\xde\x49\xa0\xfb\xf5\x8e\xbb\x2f\xee\x7a", 16);
+    memcpy(t + 64, "\xa9\x68\x79\x91\x15\xb2\x07\x3f\x94\xc2\x10\x89\x0b\x22\x5f\x21", 16);
+    memcpy(t + 80, "\x80\x7f\x5d\x9a\x5a\x90\x32\x27\x35\x3e\xcc\xe7\xbf\xf7\x97\x03", 16);
+    memcpy(t + 96, "\xff\x19\x30\xb3\x48\xa5\xb5\xd1\xd7\x5e\x92\x2a\xac\x56\xaa\xc6", 16);
+    memcpy(t + 112, "\x4f\xb8\x38\xd2\x96\xa4\x7d\xb6\x76\xfc\x6b\xe2\x9c\x74\x04\xf1", 16);
+    memcpy(t + 128, "\x45\x9d\x70\x59\x64\x71\x87\x20\x86\x5b\xcf\x65\xe6\x2d\xa8\x02", 16);
+    memcpy(t + 144, "\x1b\x60\x25\xad\xae\xb0\xb9\xf6\x1c\x46\x61\x69\x34\x40\x7e\x0f", 16);
+    memcpy(t + 160, "\x55\x47\xa3\x23\xdd\x51\xaf\x3a\xc3\x5c\xf9\xce\xba\xc5\xea\x26", 16);
+    memcpy(t + 176, "\x2c\x53\x0d\x6e\x85\x28\x84\x09\xd3\xdf\xcd\xf4\x41\x81\x4d\x52", 16);
+    memcpy(t + 192, "\x6a\xdc\x37\xc8\x6c\xc1\xab\xfa\x24\xe1\x7b\x08\x0c\xbd\xb1\x4a", 16);
+    memcpy(t + 208, "\x78\x88\x95\x8b\xe3\x63\xe8\x6d\xe9\xcb\xd5\xfe\x3b\x00\x1d\x39", 16);
+    memcpy(t + 224, "\xf2\xef\xb7\x0e\x66\x58\xd0\xe4\xa6\x77\x72\xf8\xeb\x75\x4b\x0a", 16);
+    memcpy(t + 240, "\x31\x44\x50\xb4\x8f\xed\x1f\x1a\xdb\x99\x8d\x33\x9f\x11\x83\x14", 16);
+    return 0;
+}
+
+# MD2's checksum step (RFC 1319 §3.3, with its erratum: C[j] is XORed, not set) over the 16-byte block
+# m: c[0..16) the checksum, c[16] the running byte L.
+fn _tn_md2_sum(c, m, s): i64 {
+    var l = load8(c + 16) & 0xFF;
+    var j = 0;
+    while (j < 16) {
+        l = (load8(c + j) & 0xFF) ^ (load8(s + ((load8(m + j) & 0xFF) ^ l)) & 0xFF);
+        store8(c + j, l);
+        j = j + 1;
+    }
+    store8(c + 16, l);
+    return 0;
+}
+
+# MD2's compression (RFC 1319 §3.4) of the 16-byte block m into the 48-byte state x.
+fn _tn_md2_block(x, m, s): i64 {
+    var j = 0;
+    while (j < 16) {
+        var b = load8(m + j) & 0xFF;
+        store8(x + 16 + j, b);
+        store8(x + 32 + j, b ^ (load8(x + j) & 0xFF));
+        j = j + 1;
+    }
+    var t = 0;
+    j = 0;
+    while (j < 18) {
+        var k = 0;
+        while (k < 48) {
+            t = (load8(x + k) & 0xFF) ^ (load8(s + t) & 0xFF);
+            store8(x + k, t);
+            k = k + 1;
+        }
+        t = (t + j) & 0xFF;
+        j = j + 1;
+    }
+    return 0;
+}
+
+# MD2 (RFC 1319) of p[0..n) into out[0..16). Allocates nothing, as _tn_md5. Used ONLY to read Windows'
+# disallowed list: the signature hash (crypt32's prop 15) of an md2WithRSA certificate is the MD2 of
+# its tbsCertificate (measured on cass: VeriSign's Class 3 Public Primary Certification Authority,
+# d7c63be0 ... 5f986ad8), and a match can only distrust, so MD2's weakness cannot make anything
+# trusted. CHANGELOG [6.7.16]
+fn _tn_md2(p, n, out): i64 {
+    var s[256];
+    var x[48];
+    var c[24];
+    var tail[16];
+    _tn_md2_s(&s);
+    memset(&x, 0, 48);
+    memset(&c, 0, 24);
+    var off = 0;
+    while (off + 16 <= n) {
+        _tn_md2_sum(&c, p + off, &s);
+        _tn_md2_block(&x, p + off, &s);
+        off = off + 16;
+    }
+    var rem = n - off;
+    memcpy(&tail, p + off, rem);
+    memset(&tail + rem, 16 - rem, 16 - rem);         # i bytes of value i (RFC 1319 §3.1)
+    _tn_md2_sum(&c, &tail, &s);
+    _tn_md2_block(&x, &tail, &s);
+    _tn_md2_block(&x, &c, &s);                       # the checksum, the last block (§3.3)
+    memcpy(out, &x, 16);
+    return 0;
+}
+
+# The MD5 of the subjectPublicKey of the DER certificate der[0..dlen) into out[0..16) — the key bytes
+# of SubjectPublicKeyInfo's BIT STRING, its unused-bits octet excluded (crypt32's prop 25). 1, or 0
+# when the DER does not have that shape.
+fn _tn_spki_md5(der, dlen, out): i64 {
+    var cp = 0;
+    var cl = 0;
+    if (_tn_der_hdr(der, dlen, 0, &cp, &cl) != 0x30) { return 0; }      # Certificate
+    var tp = 0;
+    var tl = 0;
+    if (_tn_der_hdr(der, dlen, cp, &tp, &tl) != 0x30) { return 0; }     # tbsCertificate
+    var end = tp + tl;
+    var pos = tp;
+    var xp = 0;
+    var xl = 0;
+    var tag = _tn_der_hdr(der, end, pos, &xp, &xl);
+    if (tag == 0xA0) {                                                  # [0] version
+        pos = xp + xl;
+        tag = _tn_der_hdr(der, end, pos, &xp, &xl);
+    }
+    var skip = 0;                       # serial, signature, issuer, validity, subject
+    while (skip < 5) {
+        if (tag < 0) { return 0; }
+        pos = xp + xl;
+        tag = _tn_der_hdr(der, end, pos, &xp, &xl);
+        skip = skip + 1;
+    }
+    if (tag != 0x30) { return 0; }                                      # subjectPublicKeyInfo
+    var send = xp + xl;
+    var ap = 0;
+    var al = 0;
+    if (_tn_der_hdr(der, send, xp, &ap, &al) != 0x30) { return 0; }     # algorithm
+    var bp = 0;
+    var bl = 0;
+    if (_tn_der_hdr(der, send, ap + al, &bp, &bl) != 0x03) { return 0; }   # subjectPublicKey
+    if (bl < 2) { return 0; }
+    _tn_md5(der + bp + 1, bl - 1, out);
+    return 1;
+}
+
+# SHA-1 (FIPS 180-4) of p[0..n) into out[0..20), big-endian. Allocates nothing, as _tn_md5 does —
+# the verifier runs it per connect. Used ONLY to read Windows' disallowed list, whose 20-byte
+# identifiers are a SHA-1-signed certificate's signature hash: a match can only distrust, so SHA-1's
+# collisions cannot make anything trusted. CHANGELOG [6.7.15]
+fn _tn_sha1(p, n, out): i64 {
+    var st[40];
+    var w[640];
+    var tail[128];
+    store64(&st, 0x67452301);
+    store64(&st + 8, 0xEFCDAB89);
+    store64(&st + 16, 0x98BADCFE);
+    store64(&st + 24, 0x10325476);
+    store64(&st + 32, 0xC3D2E1F0);
+    var off = 0;
+    while (off + 64 <= n) {
+        _tn_sha1_block(&st, p + off, &w);
+        off = off + 64;
+    }
+    var rem = n - off;
+    memset(&tail, 0, 128);
+    memcpy(&tail, p + off, rem);
+    store8(&tail + rem, 0x80);
+    var tl = 64;
+    if (rem >= 56) { tl = 128; }
+    var bits = n * 8;
+    var i = 0;
+    while (i < 8) {                                         # the bit length, big-endian
+        store8(&tail + tl - 1 - i, (bits >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    _tn_sha1_block(&st, &tail, &w);
+    if (tl == 128) { _tn_sha1_block(&st, &tail + 64, &w); }
+    i = 0;
+    while (i < 5) {
+        var v = load64(&st + i * 8);
+        store8(out + i * 4, (v >> 24) & 0xFF);
+        store8(out + i * 4 + 1, (v >> 16) & 0xFF);
+        store8(out + i * 4 + 2, (v >> 8) & 0xFF);
+        store8(out + i * 4 + 3, v & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# One SHA-1 compression of the 64-byte block `m` into st[0..5) (32-bit words in i64 slots), with `w`
+# the 80-word schedule (8 B a word).
+fn _tn_sha1_block(st, m, w): i64 {
+    var i = 0;
+    while (i < 16) {
+        store64(w + i * 8, ((load8(m + i * 4) & 0xFF) << 24) | ((load8(m + i * 4 + 1) & 0xFF) << 16)
+          | ((load8(m + i * 4 + 2) & 0xFF) << 8) | (load8(m + i * 4 + 3) & 0xFF));
+        i = i + 1;
+    }
+    while (i < 80) {
+        var x = load64(w + (i - 3) * 8) ^ load64(w + (i - 8) * 8) ^ load64(w + (i - 14) * 8) ^ load64(w + (i - 16) * 8);
+        store64(w + i * 8, ((x << 1) | (x >> 31)) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    var a = load64(st);
+    var b = load64(st + 8);
+    var c = load64(st + 16);
+    var d = load64(st + 24);
+    var e = load64(st + 32);
+    i = 0;
+    while (i < 80) {
+        var f = 0;
+        var k = 0;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999;
+        } elif (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1;
+        } elif (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDC;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6;
+        }
+        var t = ((((a << 5) | (a >> 27)) & 0xFFFFFFFF) + (f & 0xFFFFFFFF) + e + k + load64(w + i * 8)) & 0xFFFFFFFF;
+        e = d;
+        d = c;
+        c = ((b << 30) | (b >> 2)) & 0xFFFFFFFF;
+        b = a;
+        a = t;
+        i = i + 1;
+    }
+    store64(st, (load64(st) + a) & 0xFFFFFFFF);
+    store64(st + 8, (load64(st + 8) + b) & 0xFFFFFFFF);
+    store64(st + 16, (load64(st + 16) + c) & 0xFFFFFFFF);
+    store64(st + 24, (load64(st + 24) + d) & 0xFFFFFFFF);
+    store64(st + 32, (load64(st + 32) + e) & 0xFFFFFFFF);
+    return 0;
+}
+
+# The digest id _tn_tbs_sigalg answers for md2WithRSA: MD2's hash is 16 bytes, as MD5's (id 16) is, so
+# the id cannot be its length. CHANGELOG [6.7.16]
+const _TN_DG_MD2 = 2;
+
+# The hash length of digest id `dg` (_tn_tbs_sigalg): 16 for MD2, the id itself for every other.
+fn _tn_dg_len(dg): i64 {
+    if (dg == _TN_DG_MD2) { return 16; }
+    return dg;
+}
+
+# The digest of the DER certificate der[0..dlen)'s own signature, from its signatureAlgorithm, as a
+# digest id — each its hash's length but MD2's (_tn_dg_len): 20 for sha1WithRSAEncryption
+# (1.2.840.113549.1.1.5) / ecdsa-with-SHA1 (1.2.840.10045.4.1), 32 for sha256WithRSA (.1.1.11) /
+# ecdsa-with-SHA256 (.4.3.2), 48 for SHA-384 (.1.1.12 / .4.3.3), 64 for SHA-512 (.1.1.13 / .4.3.4), 16
+# for md5WithRSA (.1.1.4) and _TN_DG_MD2 for md2WithRSA (.1.1.2), whose hash is 16 bytes too — with the
+# tbsCertificate TLV's offset and length at `ptp` / `ptn`. 0 for any other algorithm (RSASSA-PSS, whose
+# prop 15 is unmeasured, Ed25519, md4WithRSA, ...: not judged), -1 when the DER does not have that
+# shape. CHANGELOG [6.7.14], [6.7.15], [6.7.16]
+fn _tn_tbs_sigalg(der, dlen, ptp, ptn): i64 {
+    var cp = 0;
+    var cl = 0;
+    if (_tn_der_hdr(der, dlen, 0, &cp, &cl) != 0x30) { return 0 - 1; }      # Certificate
+    var end = cp + cl;
+    var tp = 0;
+    var tl = 0;
+    if (_tn_der_hdr(der, end, cp, &tp, &tl) != 0x30) { return 0 - 1; }     # tbsCertificate
+    var ap = 0;
+    var al = 0;
+    if (_tn_der_hdr(der, end, tp + tl, &ap, &al) != 0x30) { return 0 - 1; }   # signatureAlgorithm
+    var op = 0;
+    var ol = 0;
+    if (_tn_der_hdr(der, ap + al, ap, &op, &ol) != 0x06) { return 0 - 1; }
+    store64(ptp, cp);
+    store64(ptn, tp + tl - cp);
+    if (ol == 9) {                                  # 1.2.840.113549.1.1.x: x WithRSAEncryption
+        if (memeq(der + op, "\x2a\x86\x48\x86\xf7\x0d\x01\x01", 8) == 1) {
+            var r = load8(der + op + 8) & 0xFF;
+            if (r == 2) { return _TN_DG_MD2; }
+            if (r == 4) { return 16; }
+            if (r == 5) { return 20; }
+            if (r == 11) { return 32; }
+            if (r == 12) { return 48; }
+            if (r == 13) { return 64; }
+        }
+        return 0;
+    }
+    if (ol == 7) {                                  # ecdsa-with-SHA1 1.2.840.10045.4.1
+        if (memeq(der + op, "\x2a\x86\x48\xce\x3d\x04\x01", 7) == 1) { return 20; }
+        return 0;
+    }
+    if (ol == 8) {                                  # ecdsa-with-SHA2 1.2.840.10045.4.3.x
+        if (memeq(der + op, "\x2a\x86\x48\xce\x3d\x04\x03", 7) == 1) {
+            var e = load8(der + op + 7) & 0xFF;
+            if (e == 2) { return 32; }
+            if (e == 3) { return 48; }
+            if (e == 4) { return 64; }
+        }
+    }
+    return 0;
+}
+
+# p[0..n) hashed with digest `dg` (_tn_tbs_sigalg's ids: 20 SHA-1, 32 SHA-256, 48 SHA-384, 64
+# SHA-512, 16 MD5, _TN_DG_MD2 MD2) into out[0..its length). The length, or 0 for another id.
+# CHANGELOG [6.7.16]
+fn _tn_sighash_of(dg, p, n, out): i64 {
+    if (dg == _TN_DG_MD2) {
+        _tn_md2(p, n, out);
+        return 16;
+    }
+    if (dg == 16) {
+        _tn_md5(p, n, out);
+        return 16;
+    }
+    if (dg == 20) { _tn_sha1(p, n, out); }
+    if (dg == 32) { sha256(p, n, out); }
+    if (dg == 48) { sha384(p, n, out); }
+    if (dg == 64) { sha512(p, n, out); }
+    if (_tn_pol_sig_off(dg) == 0) { return 0; }
+    return dg;
+}
+
+# The signature hash (crypt32's prop 15) of the DER certificate der[0..dlen) into out[0..64): its
+# tbsCertificate TLV hashed with its own signature digest. The hash's length (16 MD2 / MD5, 20 / 32 /
+# 48 / 64), 0 when it is signed with an algorithm this does not judge (see _tn_tbs_sigalg), -1 when
+# the DER does not have that shape. CHANGELOG [6.7.14], [6.7.15], [6.7.16]
+fn _tn_tbs_sighash(der, dlen, out): i64 {
+    var tp = 0;
+    var tn = 0;
+    var dg = _tn_tbs_sigalg(der, dlen, &tp, &tn);
+    if (dg <= 0) { return dg; }
+    return _tn_sighash_of(dg, der + tp, tn, out);
+}
+
+# 1 when the DER certificate der[0..dlen)'s signature hash is one of `pol`'s deny signature hashes of
+# its length, 2 when its shape cannot be read while any are listed, else 0 (a certificate signed with
+# an algorithm not judged, or whose digest's list is empty, is not judged by them). An MD2 / MD5-signed
+# certificate's 16-byte hash is judged by the policy's 16-byte list, the deny keys at [0] — a 16-byte
+# CTL entry is applied under both readings, the public-key MD5 and the signature hash (6.7.16; see
+# _TN_POL_LEN). Hashes only when that length's list is non-empty — the Windows system set's — so no
+# other policy pays for it. CHANGELOG [6.7.14], [6.7.15], [6.7.16]
+fn _tn_pol_tbs_denied(pol, der, dlen): i64 {
+    var any = load64(pol) + load64(pol + 48) + load64(pol + 64) + load64(pol + 80) + load64(pol + 96);
+    if (any <= 0) { return 0; }
+    var tp = 0;
+    var tn = 0;
+    var dg = _tn_tbs_sigalg(der, dlen, &tp, &tn);
+    if (dg < 0) { return 2; }
+    if (dg == 0) { return 0; }
+    var len = _tn_dg_len(dg);
+    var o = _tn_pol_sig_off(len);              # 0 for 16: the deny-key list's {count, ptr} at [0]
+    var nt = load64(pol + o);
+    if (nt <= 0) { return 0; }
+    var t[64];
+    _tn_sighash_of(dg, der + tp, tn, &t);
+    var hs = load64(pol + o + 8);
+    var i = 0;
+    while (i < nt) {
+        if (memeq(hs + i * len, &t, len) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Whether `pol` distrusts the DER certificate der[0..dlen): 1 when its key's MD5 is a deny key, its
+# signature hash a deny signature hash, or it is a deny cert; 2 when its key cannot be read while
+# there are deny keys, or its shape while there are deny signature hashes (it cannot be judged, so it
+# is not trusted either); 0 otherwise.
+fn _tn_pol_der_denied(pol, der, dlen): i64 {
+    var nk = load64(pol);
+    if (nk > 0) {
+        var h[16];
+        if (_tn_spki_md5(der, dlen, &h) == 0) { return 2; }
+        var keys = load64(pol + 8);
+        var i = 0;
+        while (i < nk) {
+            if (memeq(keys + i * 16, &h, 16) == 1) { return 1; }
+            i = i + 1;
+        }
+    }
+    var td = _tn_pol_tbs_denied(pol, der, dlen);
+    if (td != 0) { return td; }
+    var nc = load64(pol + 16);
+    var certs = load64(pol + 24);
+    var j = 0;
+    while (j < nc) {
+        if (load64(certs + j * 16 + 8) == dlen) {
+            if (memeq(load64(certs + j * 16), der, dlen) == 1) { return 1; }
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# 1 when `pol` (0 = none) distrusts the parsed certificate `cert` (see _tn_pol_der_denied), else 0.
+fn _tn_pol_denied(pol, cert): i64 {
+    if (pol == 0) { return 0; }
+    if (_tn_pol_der_denied(pol, load64(cert), load64(cert + 8)) != 0) { return 1; }
+    return 0;
+}
+
+# 1 when the trusted root `r` may anchor `leaf` under `pol` (0 = none): `r` is not distrusted, and a
+# root carrying an issuance bound anchors only a leaf whose notBefore precedes it.
+fn _tn_pol_anchor_ok(pol, r, leaf): i64 {
+    if (pol == 0) { return 1; }
+    if (_tn_pol_denied(pol, r) == 1) { return 0; }
+    var der = load64(r);
+    var dlen = load64(r + 8);
+    var nb = load64(pol + 32);
+    var bounds = load64(pol + 40);
+    var i = 0;
+    while (i < nb) {
+        var e = bounds + i * 24;
+        if (load64(e + 8) == dlen) {
+            if (memeq(load64(e), der, dlen) == 1) {
+                if (x509_cert_not_before(leaf) >= load64(e + 16)) { return 0; }
+            }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The most certificates _tn_verify_chain's path holds: the leaf, then one CA per step up — at most
+# the 16 intermediates the Certificate parsers keep, plus one more step the walk's `ni + 1` bound
+# allows (a step that can only fail). CHANGELOG [6.7.18]
+const _TN_CHAIN_PATH_MAX = 18;
+
+# 1 when the CA `ca`'s nameConstraints (RFC 5280 §4.2.1.10; none = 1) allow every certificate of
+# `path`[0 .. n) — the leaf (`path`[0]) always, an intermediate unless it is self-issued (RFC 5280
+# §6.1.3(b): a self-issued certificate other than the last is not checked) — through sigil's
+# x509_name_constraints_check for the leaf and x509_name_constraints_check_ca for an intermediate
+# (dNSName and iPAddress subtrees permitted and excluded, directoryName permitted, the LEAF's
+# subject CN as a dNSName when it has none — a CA's CN names the CA, as OpenSSL reads it at depth 0
+# only; any other constrained form refuses a cert carrying it). CYRIUS-2026-0042, CHANGELOG [6.7.18]
+fn _tn_nc_below_ok(ca, path, n): i64 {
+    if (x509_cert_has_name_constraints(ca) == 0) { return 1; }
+    var k = 0;
+    while (k < n) {
+        var c = load64(path + k * 8);
+        if (k == 0) {
+            if (x509_name_constraints_check(ca, c) == 0) { return 0; }
+        } else {
+            if (_x509_self_issued(c) == 0) {
+                if (x509_name_constraints_check_ca(ca, c) == 0) { return 0; }
+            }
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
 # The chain verifier both roles share (6.6.14): `leaf` (a parsed x509 cert, or 0), `inters` (the
 # peer's other certificates, [count][cert ptrs] in TLS order, or 0) and the ctx's trust roots
 # (TLS_CTX_OFF_CA_ROOT, whatever tls_native_set_ca_bundle / tls_native_set_ca_system /
@@ -2847,13 +3886,26 @@ fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
 # ⛔ 6.6.14 (CYRIUS-2026-0019) — WHY. This was the client's verifier only, and the server checked a client
 # certificate's POSSESSION (its CertificateVerify) and never its chain: any self-signed leaf was
 # accepted as an identity by a server that asked for verification. CHANGELOG [6.6.14]
+# ⛔ 6.7.18 (CYRIUS-2026-0042) — WHY `path`: a CA's nameConstraints bind EVERY certificate below it
+# (RFC 5280 §6.1.4(g)), and this walker read none, so a subordinate CA constrained to good.test
+# vouched for any host. sigil 3.13.14's _x509_verify_link applies only the DIRECT issuer's, and
+# exempts a self-issued CA child even when that child is the leaf. So the path selected so far is
+# kept, and each candidate CA — every intermediate and the trust anchor — must allow all of it
+# (_tn_nc_below_ok) inside the conjunction that SELECTS it: one that does not is skipped, as a
+# wrongly purposed CA is. CHANGELOG [6.7.18]
 fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
+    var path: i64[_TN_CHAIN_PATH_MAX];      # path[0] the leaf, path[k] the CA selected at depth k - 1
+    path[0] = leaf;
     var rootset = load64(ctx + TLS_CTX_OFF_CA_ROOT);
     if (leaf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     if (rootset == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     if (_x509_in_window(leaf, now_unix) == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     # CYRIUS-2026-0002 (v6.1.36): the leaf must permit the TLS identity it is used as.
     if (_tn_leaf_purpose_ok(leaf, purpose) != 1) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
+    # 6.7.12: the root set's trust policy (Windows' disallowed list and store, the per-root issuance
+    # bound) binds every certificate of the path — the leaf here, each CA where it is selected.
+    var pol = load64(ctx + TLS_CTX_OFF_CA_POLICY);
+    if (_tn_pol_denied(pol, leaf) == 1) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     var ni = 0;
     if (inters != 0) { ni = load64(inters); }
     var rcount = load64(rootset);
@@ -2870,8 +3922,14 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                         if (_x509_verify_link(cur, R) == 1) {
                             # CYRIUS-2026-0002: the anchoring root must assert keyCertSign
                             # (if it has keyUsage) + honor pathLen for `depth`;
-                            # 6.6.16: and its EKU must permit `purpose`.
-                            if (_tn_ca_signer_ok(R, depth, purpose) == 1) { return TLS_OK; }
+                            # 6.6.16: and its EKU must permit `purpose`; 6.7.12: and the policy
+                            # must let it anchor this leaf; 6.7.18: and its nameConstraints must
+                            # allow the whole path below it.
+                            if (_tn_ca_signer_ok(R, depth, purpose) == 1) {
+                                if (_tn_pol_anchor_ok(pol, R, leaf) == 1) {
+                                    if (_tn_nc_below_ok(R, &path, depth + 1) == 1) { return TLS_OK; }
+                                }
+                            }
                         }
                     }
                 }
@@ -2890,8 +3948,14 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                             if (_x509_verify_link(cur, P) == 1) {
                                 # CYRIUS-2026-0002: signing intermediate must assert
                                 # keyCertSign + honor pathLen for `depth`;
-                                # 6.6.16: and its EKU must permit `purpose`.
-                                if (_tn_ca_signer_ok(P, depth, purpose) == 1) { nextp = P; ii = ni; }
+                                # 6.6.16: and its EKU must permit `purpose`; 6.7.12: and the
+                                # policy must not distrust it; 6.7.18: and its nameConstraints
+                                # must allow the whole path below it.
+                                if (_tn_ca_signer_ok(P, depth, purpose) == 1) {
+                                    if (_tn_pol_denied(pol, P) == 0) {
+                                        if (_tn_nc_below_ok(P, &path, depth + 1) == 1) { nextp = P; ii = ni; }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2902,6 +3966,9 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
         if (nextp == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
         cur = nextp;
         depth = depth + 1;
+        # A path no peer can send (the Certificate parsers keep 16 intermediates) is refused.
+        if (depth >= _TN_CHAIN_PATH_MAX) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
+        path[depth] = cur;
     }
     return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID);
 }

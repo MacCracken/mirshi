@@ -5,12 +5,13 @@
 # v6.1.18: dir_list/is_dir/dir_walk bottomed out on syscall(SYS_GETDENTS64,…)
 # (arity 5), which has no Windows route — since v6.1.17 it returned an honest
 # -38, so directory walking was a no-op on Windows. This implements the real
-# port via five kernel32 reroutes (see src/backend/pe/emit.cyr + parse_expr.cyr):
+# port via five kernel32 reroutes (see src/backend/pe/emit.cyr + parse/expr/factor.cyr):
 #   0xF016 FindFirstFileW(pattern, &data) → HANDLE  (INVALID_HANDLE_VALUE = -1)
 #   0xF017 FindNextFileW(h, &data)        → BOOL     (0 = end, or a failure: see 0xF04B)
 #   0xF018 FindClose(h)                   → BOOL
 #   0xF019 GetFileAttributesW(path)       → DWORD    (0xFFFFFFFF = invalid)
 #   0xF04B GetLastError()                 → DWORD    (6.6.12)
+#   0xF04E GetFinalPathNameByHandleW(h, buf, cch, flags) → DWORD (6.7.12; win_handle_under)
 # dir_walk / dir_list_full / find_files need no changes — they sit on dir_list
 # + is_dir and become correct transitively.
 #
@@ -240,5 +241,53 @@ fn is_dir(path: Str): i64 {
     var attrs = syscall(61465, p);              # GetFileAttributesW (narrow; 6.6.12)
     if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
     if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY
+    return 0;
+}
+
+# One UTF-16 unit with ASCII A-Z folded to a-z (the comparison `win_handle_under` makes).
+fn _fs_wfold(u): i64 {
+    if (u >= 65) {
+        if (u <= 90) { return u + 32; }
+    }
+    return u;
+}
+
+# 1 when the object behind the open handle `h` lies strictly INSIDE the directory behind the open
+# handle `root_h`, 0 when it does not, -1 when either handle's final path cannot be had. Each
+# handle is asked where it REALLY is — GetFinalPathNameByHandleW (reroute 0xF04E), normalized,
+# with the DOS volume name — and `root_h`'s path must be a prefix of `h`'s, compared without ASCII
+# case, that ends at a separator (`C:\proj` holds `C:\proj\x`, never `C:\project\x`). What a
+# name check cannot see, the handle can: a directory on the way that was swapped for a junction or
+# a directory link after the name was checked resolves outside, and the handle says so. cbt's
+# [embed] / `${file:}` open refuses such a file (cbt/manifest.cyr `_embed_open`); a compiler
+# without the reroute answers -1, never 1. Each final path gets a 32768-unit stack buffer (the
+# `\\?\` limit) in its own fn. CHANGELOG [6.7.12]
+fn win_handle_under(h, root_h): i64 {
+    if (_win_fd_aliases(h) == 1) { return 0 - 1; }      # never an open handle (6.7.16)
+    if (_win_fd_aliases(root_h) == 1) { return 0 - 1; }
+    var a[65536];
+    var na = syscall(0xF04E, root_h, &a, 32768, 0);    # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    if (na <= 0) { return 0 - 1; }                      # 0 = failed; -38 = not routed
+    if (na >= 32768) { return 0 - 1; }                  # would not fit: the size it needs
+    var r = _fs_handle_under_path(h, &a, na);
+    return r;
+}
+
+# `win_handle_under`'s second half: is handle `h`'s final path inside the root's (`a`, `na` units)?
+# A fn of its own because each 64 KB buffer must fit ONE fn's frame budget — two in one fn put the
+# second in static storage, shared by every call and every thread.
+fn _fs_handle_under_path(h, a, na): i64 {
+    var b[65536];
+    var nb = syscall(0xF04E, h, &b, 32768, 0);
+    if (nb <= 0) { return 0 - 1; }
+    if (nb >= 32768) { return 0 - 1; }
+    if (nb <= na) { return 0; }                         # the root itself, or shorter
+    var i = 0;
+    while (i < na) {
+        if (_fs_wfold(load16(a + i * 2)) != _fs_wfold(load16(&b + i * 2))) { return 0; }
+        i = i + 1;
+    }
+    if (load16(a + (na - 1) * 2) == 92) { return 1; }  # a volume root (`\\?\C:\`) ends in `\`
+    if (load16(&b + na * 2) == 92) { return 1; }
     return 0;
 }

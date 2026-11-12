@@ -4,6 +4,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-11-12
+
+### Added
+
+- **The agnos 1.57.13 band: `sock_send_dl#109`, `console_mode#110`, `fd_kind#111`**
+  (`src/dispatch.cyr`, [ADR 0018](docs/adr/0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md)).
+  The cyrius 6.7.11+ agnos stdlib issues all three. Each probes and falls back on -1, so before this
+  they took the ENOSYS path: programs ran with the pre-1.57.13 behaviour and printed a
+  `mirshi: ENOSYS agnos#N -> -1` line. All three are now supervisor-EMULATE, with no child-seccomp
+  change. ⚠ Linux #109/#110/#111 are `setpgid`/`getppid`/`getpgrp`; the `orig_rax = -1` skip keeps
+  them from running in the child.
+  - **`sock_send_dl#109`** is `sock_send#48` with a caller ceiling, in the net band (`--net`). It keeps
+    the kernel's order: the conn is checked first (-1 even for len <= 0, which the stdlib's
+    `#109(conn, buf, 0, 0)` support probe relies on), then len <= 0 → 0. Timeouts:
+    - `timeout_us` 0 is exactly mirshi's #48.
+    - `timeout_us` < 0 makes one non-blocking attempt.
+    - `timeout_us` > 0 waits at most min(ceiling, 8 s, the kernel's D6 window) for send space.
+    
+    An expired wait answers 0, the committed count. This was on the stdlib's own socket-write path
+    (`sys_write` on a tagged fd, `tls_native`), so every agnos program that wrote to a socket printed
+    one stray line, and its sends ignored the deadline.
+  - **`console_mode#110`** drives the console with the kernel's holder rule. The console is the
+    first of mirshi's fds 0/1/2 that is a tty, the same fds `fd_kind` calls CONSOLE. The mode applies
+    to whoever reads, and dies with the process that set it, on every death path.
+    - `CM_NOECHO` clears `ECHO | ECHONL`, and clearing it puts back what it found.
+    - `CM_FLUSH` is `tcflush(TCIFLUSH)`, or `TCSETSF` when the same call changes the echo.
+    - `CM_NOSERIAL` (agnos 1.57.18) is a per-process cell (the record's new `C_CON_NOSER`), reported
+      back in the previous flags.
+    - Unknown bits answer -1 with nothing changed.
+    - With no tty on any of the three fds, nothing changes, so scripted input survives. With stdin
+      piped and stderr on a terminal, the terminal is the console and the pipe keeps its bytes.
+    - mirshi restores the echo at exit, after kbscan's own restore. If mirshi itself is ended by HUP,
+      INT, QUIT or TERM while it hides the echo (a Ctrl-C at a hidden prompt), handlers armed by the
+      first hide restore the tty and re-raise, so mirshi dies of the same signal.
+      - The handlers are installed only over SIG_DFL, and never when mirshi is a container's PID 1.
+      - A SIGKILL cannot be caught.
+  - **`fd_kind#111`** returns an `FdKind`.
+    - mirshi's emulated signalfd/timerfd/epoll ids are answered by slot (7/9/8 while open, else -1),
+      before the kernel's 32-fd bound.
+    - A real fd is duplicated into the supervisor with `pidfd_getfd`, `fstat`'d and asked `TCGETS`:
+      a terminal is CONSOLE, `/dev/null` is DEVICE, and a closed fd, fd < 0 or fd >= 32 is -1.
+  - Decode tables name them (`sock_send_dl` arity 4, buf arg1; `console_mode` 2; `fd_kind` 1).
+
+### Changed
+
+- **Toolchain `6.7.9` → `6.7.18`.** `lib/` was re-vendored to match (`cyrius lib sync --full`):
+  65 of the 106 top-level files changed, plus `lib/unicode/categories.cyr`. The bundle adds no
+  files and removes none. All 113 `.cyr` files are byte-identical to the 6.7.18 bundle, and
+  `cyrius.lock` was regenerated to their new hashes. The bump itself needed no source change; the
+  band above is what it exposed. The binary is 230,592 B (217,936 B for the bump alone, 213,824 B at
+  1.12.0).
+- **Checked against cyrius's `ecosystem-migration.md` for 6.7.10–6.7.18.** None of its items changes
+  a mirshi result. The ones that come near:
+  - 6.7.14 adds `SYS_POLL = 7` to the Linux stdlib. mirshi defines no `SYS_POLL`, so nothing collides.
+  - 6.7.12's `args_init()` now returns a byte count or a negative errno. `src/main.cyr:51` discards
+    the return value.
+  - 6.7.11/6.7.12 tighten the agnos peer's tagged-socket test, so an fd of -1 is no longer read as
+    socket slot 7. That fixes the guest side and changes nothing in mirshi.
+  - 6.7.16 removes `cyrius tests`, which mirshi never used.
+- `CHILD_REC_SIZE` 176 → 184 (`C_CON_NOSER` at 176, cleared by `_child_alloc`).
+
+### Tests
+
+- `tests/mirshi.tcyr` 329 → 398: the `fd-kind`, `console-mode` and `send-dl` groups (the kernel's
+  enum values, every `st_mode` type, refused bits, mode and NOSERIAL transitions, the 8 s cap, a fresh
+  record's cleared cell), plus #109–#111 in the decode, arity, pointer-mask and frozen-coverage tables.
+- New CI gate `scripts/it/fdkind_console.sh`, six sub-tests:
+  - Every `FdKind` and -1 case on no-tty stdio (`/dev/null` stdin, piped and file stdout, a file, a
+    directory, both pipe ends, the three event fds open and closed).
+  - Piped stdin keeps its input through `NOECHO | FLUSH`.
+  - On a real pty: CONSOLE, typeahead flushed, a hidden line not echoed and the next one echoed,
+    NOSERIAL reported, a spawned holder's death giving the echo back while its parent runs, and the
+    echo restored when the root exits holding NOECHO.
+  - Stdin piped with stderr on the pty: a line read from stderr's tty stays hidden, and the pipe keeps
+    its bytes.
+  - mirshi killed by SIGTERM, then SIGINT, while it hides the echo: it dies of that signal, with the
+    echo restored.
+- New CI gate `scripts/it/send_dl.sh`:
+  - The probe, length and dead-conn order.
+  - Timeout 0 / > 0 / < 0 sends.
+  - Against a peer that stops reading, a 250 ms ceiling answers 0 on time rather than after 8 s.
+  - The stdlib's POSIX socket write delivers its bytes with no ENOSYS line.
+- Each gate fails against a build with its piece removed: no #109 or #111 arm, the ceiling ignored,
+  emulated ids unanswered, no holder-death hook, no exit restore, NOECHO not applied, the console
+  limited to fd 0, no signal handlers.
+- Re-verified: `cyrius build` (warning-free); `cyrius test` 398/0 + 2/0; all 29 `scripts/it/*`
+  gates, with no skips; `docker/smoke.sh`, including the 4-container fan-out.
+- `docs/reference/syscall-coverage.md`: rows #109–#111, footnote ⁸, and the band's known divergences.
+
 ## [1.12.0] - 2026-11-12
 
 ### Changed

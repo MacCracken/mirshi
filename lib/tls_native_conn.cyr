@@ -471,7 +471,7 @@ fn _tn_connect_hs(ctx, sock_fd): i64 {
             _tn_send_hs_alert(ctx, sock_fd);
             return ch2n;
         }
-        var c2cap = ch2n + TLS_RECORD_HEADER_LEN * (1 + ch2n / TLS_RECORD_MAX_PLAINTEXT);
+        var c2cap = ch2n + TLS_RECORD_HEADER_LEN * (1 + ch2n / _TLS_RECORD_MAX_PLAINTEXT);
         var c2rec = _tn_alloc(ctx, c2cap);
         if (c2rec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
         var c2rn = _tn_hs_plain_records(ch2, ch2n, c2rec, c2cap);
@@ -494,7 +494,10 @@ fn _tn_connect_hs(ctx, sock_fd): i64 {
     var frl = _tn_read_rec(ctx, sock_fd, inbuf, cap, _TN_CCS_MAY);
     if (frl < 0) { return _tn_read_fail(ctx, frl); }
     var rf = tls_native_client_recv_flight(ctx, inbuf, frl);
-    if (rf != TLS_OK) { return rf; }
+    if (rf != TLS_OK) {
+        _tn_send_hs_alert(ctx, sock_fd);   # the refusals that name one (6.7.12), sealed under our handshake key
+        return rf;
+    }
     # Verify the server Finished + send the client second flight. v6.2.8: this
     # may include the client Certificate + CertificateVerify (mTLS client-auth)
     # ahead of the Finished, so size for a cert chain (was 256 — Finished-only).
@@ -634,9 +637,10 @@ fn _tn_hs_plain_alert(ctx, rec, rl): i64 {
 #     Windows socket), waits for writability with the time left, and restores the fd on every exit
 #     — its status flags on Linux / macOS; a Windows socket is left BLOCKING, because Windows cannot
 #     read FIONBIO back (the mode lib/net.cyr creates sockets in, as net_connect_sa_nb leaves them);
-#   - agnos, a tagged socket: sock_recv / sock_send take the time left themselves; a send can
-#     overshoot by one sock_send#48 stall (~8 s: the kernel waits for each segment's ACK inside the
-#     call and #48 takes no time bound — agnos needs a bounded send to close it);
+#   - agnos, a tagged socket: sock_recv / sock_send take the time left themselves — on a kernel
+#     with sock_send_dl#109 (agnos 1.57.13) as each send call's own ceiling (6.7.11); on an older
+#     kernel a send can still overshoot by one sock_send#48 stall (~8 s: the kernel waits for each
+#     segment's ACK inside the call and #48 takes no time bound);
 #   - a custom transport (tls_native_set_transport), an agnos fd that is not a socket, and a
 #     Windows HANDLE that is not a socket (a pipe, a file): the clock is checked BETWEEN calls only,
 #     so one call is bounded by the transport itself.
@@ -732,6 +736,7 @@ fn _tn_is_notsock(e): i64 {
 # Read up to `n` bytes from `fd`.
 fn _tn_os_read(fd, buf, n): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }  # never a descriptor (6.7.16)
     var len = n;
     if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }       # recv takes an int length
     var r = syscall(0xF048, fd, buf, len, 0);        # recv
@@ -748,6 +753,7 @@ fn _tn_os_read(fd, buf, n): i64 {
 # Write up to `n` bytes to `fd`, never raising SIGPIPE on a socket (see the block above).
 fn _tn_os_write(fd, buf, n): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }  # never a descriptor (6.7.16)
     var len = n;
     if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }       # send takes an int length; a short write is legal
     var w = syscall(0xF047, fd, buf, len, 0);        # send
@@ -884,6 +890,7 @@ fn _tn_eagain(): i64 {
 # Linux / macOS: O_NONBLOCK (the saved status flags). Windows: ioctlsocket(FIONBIO, 1) — 0.
 fn _tn_nb_on(fd): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }  # never a descriptor (6.7.16)
     var v[8];
     store64(&v, 1);
     if (syscall(0xF049, fd, 0x8004667E, &v) != 0) { return _tn_win_sockerr(); }   # FIONBIO
@@ -897,6 +904,7 @@ fn _tn_nb_on(fd): i64 {
 # Undo _tn_nb_on. Windows cannot read FIONBIO back, so a socket is left BLOCKING there.
 fn _tn_nb_off(fd, saved): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    if (_win_fd_aliases(fd) == 1) { return 0 - 9; }  # never a descriptor (6.7.16)
     var v[8];
     store64(&v, 0);
     syscall(0xF049, fd, 0x8004667E, &v);             # FIONBIO 0
@@ -1368,9 +1376,9 @@ fn _tn_ctx_buf(ctx, off, n): i64 {
 fn tls_native_write(ctx, buf, len): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     if (load64(ctx + TLS_CTX_OFF_STATE) != TLS_STATE_CONNECTED) { return TLS_ERR_PROTOCOL; }
-    if (len > TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_INVALID_PARAM; }   # caller fragments
+    if (len > _TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_INVALID_PARAM; }   # caller fragments
     var fd = load64(ctx + TLS_CTX_OFF_SOCK_FD);
-    var rec = _tn_ctx_buf(ctx, TLS_CTX_OFF_WRITE_BUF, TLS_RECORD_MAX_PLAINTEXT + 64);
+    var rec = _tn_ctx_buf(ctx, TLS_CTX_OFF_WRITE_BUF, _TLS_RECORD_MAX_PLAINTEXT + 64);
     if (rec == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     var rn = tls_native_seal_app(ctx, buf, len, rec, len + 64);
     if (rn < 0) { return rn; }
@@ -1456,6 +1464,7 @@ fn tls_native_read(ctx, buf, maxlen): i64 {
             # NOT end-of-stream — drain it and keep reading, so only a real
             # close_notify returns 0. Non-empty data is delivered to the caller.
             if (n > 0) {
+                store64(ctx + TLS_CTX_OFF_KEY_UPDATES, 0);   # data ends a KeyUpdate run. CHANGELOG [6.7.18]
                 if (n <= maxlen) {
                     memcpy(buf, plain, n);
                     return n;
@@ -1467,7 +1476,7 @@ fn tls_native_read(ctx, buf, maxlen): i64 {
                 # 16384-byte hold), then deliver the first `maxlen` bytes.
                 var hb = load64(ctx + TLS_CTX_OFF_READ_HOLD);
                 if (hb == 0) {
-                    hb = _tn_alloc(ctx, TLS_RECORD_MAX_PLAINTEXT);
+                    hb = _tn_alloc(ctx, _TLS_RECORD_MAX_PLAINTEXT);
                     if (hb == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
                     store64(ctx + TLS_CTX_OFF_READ_HOLD, hb);
                 }
@@ -1512,6 +1521,9 @@ fn tls_native_read(ctx, buf, maxlen): i64 {
 # allocator. Sealing the close_notify allocates nothing: the record (at most 31
 # bytes, TLS 1.2's) is built on the stack. The caller owns the socket fd
 # (TLS_CTX_OFF_SOCK_FD) and closes it after this returns. CHANGELOG [6.6.13]
+# Every secret the ctx holds — traffic secrets, keys and IVs, the key schedule, the
+# private key — is zeroised after the close_notify (_tn_wipe_secrets), whatever the
+# state, a failed ctx's too. CHANGELOG [6.7.18]
 fn tls_native_close(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     var state = load64(ctx + TLS_CTX_OFF_STATE);
@@ -1527,6 +1539,7 @@ fn tls_native_close(ctx): i64 {
             _tn_io_write_all(ctx, load64(ctx + TLS_CTX_OFF_SOCK_FD), &rec, rn);
         }
     }
+    _tn_wipe_secrets(ctx);
     store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_CLOSED);
     return TLS_OK;
 }

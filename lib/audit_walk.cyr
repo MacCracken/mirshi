@@ -1,12 +1,12 @@
 # audit_walk.cyr — shared fmt/lint/doc walkers for `cyrius audit` + the check driver.
 #
-# Consumers: programs/checks/ (the check driver's fmt + lint suites) and cbt/commands.cyr
+# Consumers: programs/checks/ (the check driver's fmt + lint suites) and cbt/commands/audit.cyr
 # (`cyrius audit`). This is the only implementation — the bash twin it was ported from,
 # scripts/lib/audit-walk.sh, had no caller left and was deleted at 6.6.7.
 #
 # Public functions:
 #   audit_fmt_walk(cyrfmt_path, dirs_vec)
-#       Run cyrfmt on every non-symlink, non-distlib-bundle *.cyr
+#       Run `cyrfmt --check` on every non-symlink, non-distlib-bundle *.cyr
 #       file in the given dirs. Sets globals AW_FMT_FAIL (0/1),
 #       AW_FMT_SKIPPED, AW_FMT_FAIL_FILES (vec<str>), and — 6.6.8 —
 #       AW_FMT_ERRORS / AW_FMT_ERROR_FILES (files cyrfmt did not finish on).
@@ -236,7 +236,13 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     #ifndef CYRIUS_TARGET_WIN
     #ifndef CYRIUS_TARGET_MACOS
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = sys_open(str_data(path), O_RDONLY, 0);
+    # Exactly the Str's bytes, NUL-terminated (lib/fs.cyr's listers' _fs_cpath), and
+    # O_DIRECTORY: the kernel refuses a non-directory at path resolution (-ENOTDIR, which the
+    # walkers report as an unlistable directory). With O_RDONLY alone a FIFO at `path` blocked
+    # in open(2) until a writer came, so the walk never returned. CHANGELOG [6.7.12]
+    var cpath[4096];
+    if (_fs_cpath(path, &cpath, 4096) < 0) { return 0 - 36; }   # ENAMETOOLONG / an embedded NUL
+    var fd = sys_open(&cpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0) { return fd; }
     var sbuf[4096];                 # STACK (6.6.10): was an unchecked alloc per directory
     var buf = &sbuf;
@@ -334,9 +340,14 @@ fn _aw_skip_dir(name): i64 {
     return 0;
 }
 
-# Run cyrfmt on every non-symlink, non-distlib-bundle *.cyr file in
-# each directory of `dirs_vec`. Captures cyrfmt's stdout into a tmp
-# buffer and compares against the file content; mismatch ⇒ FAIL.
+# Run `cyrfmt --check` on every non-symlink, non-distlib-bundle *.cyr file in each directory
+# of `dirs_vec`: exit 0 is formatted, exit 1 with its "not canonically formatted" line is
+# FAIL, any other outcome an ERROR (`_aw_fmt_verdict`).
+# ⛔ 6.7.12 (D26) — THE AUDIT ASKS THE CHECK. This byte-compared `cyrfmt <file>`'s output with
+# the file, and that output is the CANONICAL form (a 2-space continuation step), while
+# `cyrfmt --check` also ACCEPTS a 4-space step (the 2026-08-18 contract, programs/cyrfmt.cyr).
+# So `cyrius audit` flagged a file `cyrfmt --check` passed (cyim 1.11.0). The verdict is now
+# --check's own, so the two cannot disagree. CHANGELOG [6.7.12]
 fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     AW_FMT_FAIL = 0;
     AW_FMT_SKIPPED = 0;
@@ -344,10 +355,10 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     AW_FMT_ERRORS = 0;
     AW_FMT_ERROR_FILES = vec_new();
     var st[16];
-    var cap = 2000000;
-    var orig_buf = alloc(cap);
-    var fmt_buf  = alloc(cap);
-    if (orig_buf == 0 || fmt_buf == 0) {   # 6.6.10: were stored through unchecked
+    var probe[64];                         # the readability probe: 64 bytes are enough
+    var cap = 65536;                       # --check prints at most a few lines per file
+    var fmt_buf = alloc(cap);
+    if (fmt_buf == 0) {                    # 6.6.10: were stored through unchecked
         AW_FMT_ERRORS = 1;
         vec_push(AW_FMT_ERROR_FILES, str_from("audit_fmt_walk: out of memory — nothing was checked"));
         return 1;
@@ -388,7 +399,7 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
                     if (_aw_is_distlib_bundle(full) == 1 || _aw_is_generated(full) == 1) {
                         AW_FMT_SKIPPED = AW_FMT_SKIPPED + 1;
                     } else {
-                        var orig_n = file_read_all(str_data(full), orig_buf, cap);
+                        var orig_n = file_read_all(str_data(full), &probe, 64);
                         # 6.6.10: an unreadable file is an ERROR by name, whatever cyrfmt says.
                         if (orig_n < 0) {
                             AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
@@ -398,29 +409,16 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
                         }
                         var args = vec_new();
                         vec_push(args, cyrfmt_path);
+                        vec_push(args, "--check");
                         vec_push(args, str_data(full));
                         var fmt_n = exec_capture_status(args, fmt_buf, cap, &st);
-                        var bad = _aw_exit_verdict(full, &st);
-                        if (bad != 0) {
-                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
-                            vec_push(AW_FMT_ERROR_FILES, bad);
-                        } elif (fmt_n != orig_n) {
+                        var bad = _aw_fmt_verdict(full, &st, fmt_buf, fmt_n);
+                        if (bad == 1) {
                             AW_FMT_FAIL = 1;
                             vec_push(AW_FMT_FAIL_FILES, name);
-                        } else {
-                            var i = 0;
-                            var diff = 0;
-                            while (i < orig_n) {
-                                if (load8(orig_buf + i) != load8(fmt_buf + i)) {
-                                    diff = 1;
-                                    i = orig_n;
-                                }
-                                i = i + 1;
-                            }
-                            if (diff == 1) {
-                                AW_FMT_FAIL = 1;
-                                vec_push(AW_FMT_FAIL_FILES, name);
-                            }
+                        } elif (bad != 0) {
+                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+                            vec_push(AW_FMT_ERROR_FILES, bad);
                         }
                     }
                 }
@@ -520,6 +518,25 @@ fn _aw_exit_verdict(full, st): i64 {
     if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
     if (code != 0) { return _aw_note(full, "the tool refused or failed, exit ", code); }
     return 0;
+}
+
+# The verdict on one `cyrfmt --check <file>` run: 0 formatted, 1 not formatted (exit 1 AND the
+# check's own "not canonically formatted" line), else the `_aw_exit_verdict` note naming why it
+# cannot be trusted. ⛔ Exit 1 alone is NOT "needs reformatting": cyrfmt also exits 1 when it
+# refuses the file (cannot read, too large), and 6.6.8 made that an ERROR. CHANGELOG [6.7.12]
+fn _aw_fmt_verdict(full, st, buf, n): i64 {
+    var bad = _aw_exit_verdict(full, st);
+    if (bad == 0) { return 0; }
+    if (load64(st) != 1) { return bad; }
+    if (load64(st + 8) != 0) { return bad; }
+    var mk = "not canonically formatted";
+    var ml = strlen(mk);
+    var i = 0;
+    while (i + ml <= n) {
+        if (memeq(buf + i, mk, ml) == 1) { return 1; }
+        i = i + 1;
+    }
+    return bad;
 }
 
 # Print an AW_LINT_ERROR_FILES / AW_DOC_ERROR_FILES list, one note per line, capped at 20

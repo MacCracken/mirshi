@@ -6,7 +6,7 @@
 # str.cyr, result.cyr, net.cyr (v5.10.11 — `regression_network_probe` composes on
 # `net_connect_nb`).
 #
-# What this module provides — ~22 reusable primitives that
+# What this module provides — reusable primitives (the full list: docs/api-surface.snapshot) that
 # accumulated through cyrius's v5.9.6 → v5.9.41 dispatcher
 # work, generalized so downstream test runners (yantra,
 # agnosys/mabda smoke suites, future runners) can reach for
@@ -407,6 +407,36 @@ fn _regression_fork(): i64 {
     return sys_fork();
 }
 
+# In the CHILD: point `target` (0 / 1 / 2) at `fd` and drop `fd` — unless `fd` already IS
+# `target`. A parent that started with a std fd closed hands that number to the next open or
+# pipe (fd 1 closed: the capture file opens at 1; fd 0 closed: the stdin /dev/null opens at 0),
+# and `dup2(fd, fd)` is a no-op: closing `fd` then closed the redirect it had just made, so the
+# exec'd program started with that std fd closed and a capture read 0 bytes. lib/process.cyr's
+# `_proc_redirect` twin. CHANGELOG [6.7.15]
+fn _regression_redirect(fd, target): i64 {
+    sys_dup2(fd, target);
+    if (fd != target) { sys_close(fd); }
+    return 0;
+}
+
+# In the CHILD, before any redirect onto 0 / 1 / 2: move `fd` — one the PARENT opened for this
+# child — above 2 when it is one of them, and answer its number now. A parent started with fd 0
+# closed opens the output file AT 0, and the child's stdin redirect (/dev/null, or the pipe's
+# read end) overwrote fd 0 before the output redirect read it: stdout pointed at /dev/null or
+# the pipe and the capture came back empty. Lifted, no later redirect can target it, whatever
+# order they run in. F_DUPFD answers the lowest free fd >= 3; if even that is refused (no fd
+# left), the child carries on with `fd` as it is — the redirects that follow need fds too.
+# CHANGELOG [6.7.15]
+# `_regression_capture_open` lifts its fd the same way in the PARENT, which keeps it open through
+# the wait: a std fd the parent writes to must never be the capture. CHANGELOG [6.7.16]
+fn _regression_lift_fd(fd): i64 {
+    if (fd > 2) { return fd; }
+    var nfd = sys_fcntl(fd, F_DUPFD, 3);
+    if (nfd < 0) { return fd; }
+    sys_close(fd);
+    return nfd;
+}
+
 # Decimal `v` (>= 0) at `p`; returns the byte after it.
 fn _regression_put_dec(p, v): i64 {
     var tmp[24];
@@ -790,7 +820,58 @@ fn _regression_poll_fd(fd, events, timeout_ms): i64 {
 # the same ready poll blocks on byte 65537. Axis 2d of
 # tests/gates/toolchain/check_driver_bounded.sh caught exactly that and is the reason the
 # axis exists. The unbounded path (`timeout_ms <= 0`) keeps writing in one go, as before.
+#
+# A child that exits WITHOUT reading its stdin closes the pipe's read end, and the next
+# write(2) raises SIGPIPE, whose default action kills the CALLER — the check driver died with
+# 141 mid-run, every driver row after it left without a verdict. So the write runs with
+# SIGPIPE ignored, where the same write answers EPIPE (a short count, as above). CHANGELOG [6.7.15]
 fn regression_pipe_write_all(fd, buf, n, timeout_ms): i64 {
+    var held = _regression_sigpipe_hold();
+    var written = _regression_pipe_write_loop(fd, buf, n, timeout_ms);
+    _regression_sigpipe_release(held);
+    return written;
+}
+
+# Ignore SIGPIPE for the length of a write, but only when its disposition is SIG_DFL — a
+# caller that installed its own ignore or handler keeps it. A child forked before the write
+# has already inherited the caller's disposition, so the ignore never reaches an exec'd child.
+# Returns 1 when it switched SIG_DFL to SIG_IGN (`_regression_sigpipe_release` puts it back).
+# The query is sigaction with act = 0: Linux rt_sigaction (x86 #13 / aarch64 #134, the
+# 32-byte kernel struct), macOS the 3-arg BSD sigaction (ESYSXLAT renumbers 13 / 134 to 46;
+# the handler is the struct's first 8 bytes there too). Other targets have no SIGPIPE.
+fn _regression_sigpipe_hold(): i64 {
+    var old[32];
+    var i = 0;
+    while (i < 32) { store8(&old + i, 0); i += 1; }
+    var rc = 0 - 1;
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    rc = syscall(13, SIGPIPE, 0, &old, 8);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    rc = syscall(134, SIGPIPE, 0, &old, 8);
+    #endif
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    #ifdef CYRIUS_ARCH_X86
+    rc = syscall(13, SIGPIPE, 0, &old);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    rc = syscall(134, SIGPIPE, 0, &old);
+    #endif
+    #endif
+    if (rc != 0) { return 0; }
+    if (load64(&old) != 0) { return 0; }   # not SIG_DFL: the caller's own choice stands
+    if (signal_ignore(SIGPIPE) != 0) { return 0; }
+    return 1;
+}
+
+fn _regression_sigpipe_release(held): i64 {
+    if (held == 1) { signal_default(SIGPIPE); }
+    return 0;
+}
+
+fn _regression_pipe_write_loop(fd, buf, n, timeout_ms): i64 {
     var written = 0;
     var chunk_cap = n;
     if (timeout_ms > 0) { chunk_cap = 4096; }   # PIPE_BUF — what POLLOUT actually promises
@@ -844,7 +925,8 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     if (out_path == 0) {
         out_fd = sys_open("/dev/null", 1, 0);
     } else {
-        out_fd = sys_open(out_path, 577, 420);
+        # The per-target bits: Linux's 577 is O_WRONLY|O_ASYNC|O_CREAT on Darwin. CHANGELOG [6.7.16]
+        out_fd = sys_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 420);
     }
     if (out_fd < 0) { return 0 - 1; }
 
@@ -863,12 +945,11 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         sys_close(wfd);
-        sys_dup2(rfd, 0);
-        sys_close(rfd);
-        sys_dup2(out_fd, 1);
-        sys_close(out_fd);
+        var ofd = _regression_lift_fd(out_fd);   # a closed fd 0 put it AT 0. CHANGELOG [6.7.15]
+        _regression_redirect(rfd, 0);
+        _regression_redirect(ofd, 1);
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[24];   # N BYTES (CLAUDE.md buffer contract): cmd + NUL = 16 B
         store64(&argv,     bin_path);
         store64(&argv + 8, 0);
@@ -925,11 +1006,11 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
         var dn1 = sys_open("/dev/null", 1, 0);
-        if (dn1 >= 0) { sys_dup2(dn1, 1); sys_close(dn1); }
+        if (dn1 >= 0) { _regression_redirect(dn1, 1); }
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[24];   # N BYTES (CLAUDE.md buffer contract): cmd + NUL = 16 B
         store64(&argv,     bin_path);
         store64(&argv + 8, 0);
@@ -950,6 +1031,119 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 
 # ── Process: exec + capture ───────────────
 
+# The directory a capture file is created in: $TMPDIR when it is an absolute path (trailing
+# slashes dropped: macOS sets `/var/folders/…/T/`), else /tmp. A relative value is ignored — it
+# would resolve against whatever directory the caller runs in (cbt's `_cbt_tmpbase` rule).
+fn _regression_tmp_base(): i64 {
+    var t = getenv("TMPDIR");
+    if (t == 0) { return "/tmp"; }
+    if (load8(t) != 47) { return "/tmp"; }
+    var n = strlen(t);
+    while (n > 1 && load8(t + n - 1) == 47) { n = n - 1; }
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < n) { str_builder_add_byte(sb, load8(t + i)); i = i + 1; }
+    return str_data(str_builder_build(sb));
+}
+
+# Candidate `try` of a capture file's name: "<base>/<prefix><pid>", then "<base>/<prefix><pid>.<try>".
+fn _regression_capture_name(base, prefix, try): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, base);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, sys_getpid());
+    if (try > 0) {
+        str_builder_add_byte(sb, 46);   # '.'
+        str_builder_add_int(sb, try);
+    }
+    return str_data(str_builder_build(sb));
+}
+
+# The one stderr line a capture verb prints when it cannot create its file (nothing is run then):
+# the name that refused, and either the open's errno or, past the bound, that every name was taken.
+fn _regression_capture_refused(name, err, taken): i64 {
+    var e1 = "regression: cannot create the capture file ";
+    sys_write(2, e1, strlen(e1));
+    sys_write(2, name, strlen(name));
+    if (taken > 0) {
+        var e2 = " — it and every name before it were taken";
+        sys_write(2, e2, strlen(e2));
+    } else {
+        var eb[32];
+        var e3 = " (errno ";
+        sys_write(2, e3, strlen(e3));
+        var q = _regression_put_dec(&eb, 0 - err);
+        sys_write(2, &eb, q - &eb);
+        sys_write(2, ")", 1);
+    }
+    var e4 = "; nothing was run\n";
+    sys_write(2, e4, strlen(e4));
+    return 0;
+}
+
+# Create the file a capture verb's child writes to, EXCLUSIVELY and PRIVATELY, and UNLINK it at
+# once: each candidate (`_regression_capture_name`, under `_regression_tmp_base`) is opened O_RDWR |
+# O_CREAT | O_EXCL | O_NOFOLLOW, mode 0600 — each target's own bits — so a name that already exists
+# (a file, or a symlink dangling or not) is never opened, followed or truncated, and no other user
+# can read the output; a taken name is skipped and the next tried, up to 64 (lib/io.cyr's
+# `_io_tmp_taken` says which failures mean "taken"). The name is unlinked as soon as it is created:
+# the verb keeps the fd — its child writes through a dup of it, the parent reads it back with
+# `_regression_capture_read` — so a process killed mid-capture leaves nothing behind and nothing
+# reaches the capture by name. The fd is lifted above 2 (`_regression_lift_fd`): the parent keeps it
+# open through the wait, and a std fd it writes to (a deadline-knob warning on stderr) must never be
+# the capture. Returns the fd, or the negative errno (-17: all 64 names were taken) with the
+# refusal named on stderr.
+# ⛔ CYRIUS-2026-0036: until 6.7.15 the file was "/tmp/<prefix><pid>" opened with Linux's
+# O_WRONLY|O_CREAT|O_TRUNC bits (577): a symlink another local user planted at an upcoming pid's
+# name made the capture overwrite the file it named, and a planted file was read back as the
+# capture (on Darwin 577 has no O_TRUNC, so the file was not even emptied). CHANGELOG [6.7.15]
+# ⛔ Until 6.7.16 the name was unlinked only after the child was reaped and the file read back BY
+# NAME: a process SIGKILLed mid-capture left `<base>/audit_x[ca]_<pid>[.N]` for ever, since O_EXCL
+# makes a later process with that pid skip the name instead of reusing it. CHANGELOG [6.7.16]
+# Windows: nothing is created — PE has no fork (sys_fork is the documented -1), so no capture can
+# run there, and "/tmp" would be a drive-relative rooted path (C:\tmp) another user can create.
+fn _regression_capture_open(prefix): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 38;   # -ENOSYS: the verb answers as its failed fork did
+    #endif
+    var base = _regression_tmp_base();
+    var name = 0;
+    var tries = 0;
+    while (tries < 64) {
+        name = _regression_capture_name(base, prefix, tries);
+        var fd = sys_open(name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0x180);
+        if (fd >= 0) {
+            sys_unlink(name);
+            return _regression_lift_fd(fd);
+        }
+        if (_io_tmp_taken(name, fd) == 0) {
+            _regression_capture_refused(name, fd, 0);
+            return fd;
+        }
+        tries = tries + 1;
+    }
+    _regression_capture_refused(name, 0 - 17, 1);
+    return 0 - 17;
+}
+
+# Read a capture back from the parent's own fd (`_regression_capture_open`) into `buf[0..buflen)`
+# and close it. The child wrote through a dup of it, so the shared offset sits at the end: seek to
+# 0 first. Returns the bytes read; 0 when the seek or a read fails (the verbs' "0 on failure").
+fn _regression_capture_read(fd, buf, buflen): i64 {
+    var total = 0;
+    var go = 1;
+    if (xlseek(fd, 0, 0) != 0) { go = 0; }
+    while (go == 1 && total < buflen) {
+        var n = sys_read(fd, buf + total, buflen - total);
+        if (n < 0) { total = 0; go = 0; }
+        if (n == 0) { go = 0; }
+        if (n > 0) { total = total + n; }
+    }
+    sys_close(fd);
+    return total;
+}
+
 # Run `bin_path` (no args), capture stdout into `buf[0..buflen)`,
 # discard stderr. Returns bytes captured (>= 0) or 0 on
 # fork/open failure. envp threaded through.
@@ -965,38 +1159,32 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 # [0] is also -2 when the deadline killed the child and -1 when its end was never observed
 # (`_regression_store_status`; 6.6.7).
 fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 {
-    var out_path = _regression_tmp_path("audit_xc_");
-    var out_fd = sys_open(out_path, 577, 420);
+    var out_fd = _regression_capture_open("audit_xc_");   # CYRIUS-2026-0036; unlinked (6.7.16)
     if (out_fd < 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); return 0; }
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
     if (pid < 0) {
-        sys_close(out_fd); sys_unlink(out_path);
+        sys_close(out_fd);
         store64(status_out, 0 - 1); store64(status_out + 8, 0);
         return 0;
     }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
-        sys_dup2(out_fd, 1);
-        sys_close(out_fd);
+        _regression_redirect(out_fd, 1);
         var dn_r = sys_open("/dev/null", 0, 0);
-        if (dn_r >= 0) { sys_dup2(dn_r, 0); sys_close(dn_r); }
+        if (dn_r >= 0) { _regression_redirect(dn_r, 0); }
         var dn_e = sys_open("/dev/null", 1, 0);
-        if (dn_e >= 0) { sys_dup2(dn_e, 2); sys_close(dn_e); }
+        if (dn_e >= 0) { _regression_redirect(dn_e, 2); }
         var argv[24];   # N BYTES (CLAUDE.md buffer contract): cmd + NUL = 16 B
         store64(&argv,     bin_path);
         store64(&argv + 8, 0);
         sys_execve(bin_path, &argv, envp);
         sys_exit(127);
     }
-    sys_close(out_fd);
     var stbuf[4];
     var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
     _regression_store_status(status_out, reaped, load32(&stbuf));
-    var total = file_read_all(out_path, buf, buflen);
-    sys_unlink(out_path);
-    if (total < 0) { return 0; }
-    return total;
+    return _regression_capture_read(out_fd, buf, buflen);
 }
 
 # Run `bin_path` (no args), capture stdout into `buf[0..buflen)`, discard
@@ -1016,11 +1204,11 @@ fn regression_exec_run(bin_path, envp): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
         var dn1 = sys_open("/dev/null", 1, 0);
-        if (dn1 >= 0) { sys_dup2(dn1, 1); sys_close(dn1); }
+        if (dn1 >= 0) { _regression_redirect(dn1, 1); }
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[24];   # N BYTES (CLAUDE.md buffer contract): cmd + NUL = 16 B
         store64(&argv,     bin_path);
         store64(&argv + 8, 0);
@@ -1058,20 +1246,18 @@ fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
 fn regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
     store64(status_out, 0 - 1);
     store64(status_out + 8, 0);
-    var out_path = _regression_tmp_path("audit_xa_");
-    var out_fd = sys_open(out_path, 577, 420);
+    var out_fd = _regression_capture_open("audit_xa_");   # CYRIUS-2026-0036; unlinked (6.7.16)
     if (out_fd < 0) { return 0; }
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
-    if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
+    if (pid < 0) { sys_close(out_fd); return 0; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
-        sys_dup2(out_fd, 1);
-        sys_close(out_fd);
+        _regression_redirect(out_fd, 1);
         var dn_r = sys_open("/dev/null", 0, 0);
-        if (dn_r >= 0) { sys_dup2(dn_r, 0); sys_close(dn_r); }
+        if (dn_r >= 0) { _regression_redirect(dn_r, 0); }
         var dn_e = sys_open("/dev/null", 1, 0);
-        if (dn_e >= 0) { sys_dup2(dn_e, 2); sys_close(dn_e); }
+        if (dn_e >= 0) { _regression_redirect(dn_e, 2); }
         var argv[40];   # N BYTES (CLAUDE.md buffer contract): cmd + arg + NUL = 24 B
         store64(&argv,     bin_path);
         store64(&argv + 8, arg);
@@ -1079,14 +1265,10 @@ fn regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, sta
         sys_execve(bin_path, &argv, envp);
         sys_exit(127);
     }
-    sys_close(out_fd);
     var stbuf[4];
     var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
     _regression_store_status(status_out, reaped, load32(&stbuf));
-    var total = file_read_all(out_path, buf, buflen);
-    sys_unlink(out_path);
-    if (total < 0) { return 0; }
-    return total;
+    return _regression_capture_read(out_fd, buf, buflen);
 }
 
 # Variant of `regression_exec_with_arg_capture` that captures
@@ -1108,19 +1290,18 @@ fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 
 fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
     store64(status_out, 0 - 1);
     store64(status_out + 8, 0);
-    var out_path = _regression_tmp_path("audit_xa_");
-    var out_fd = sys_open(out_path, 577, 420);
+    var out_fd = _regression_capture_open("audit_xa_");   # CYRIUS-2026-0036; unlinked (6.7.16)
     if (out_fd < 0) { return 0; }
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
-    if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
+    if (pid < 0) { sys_close(out_fd); return 0; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         sys_dup2(out_fd, 1);
         sys_dup2(out_fd, 2);
-        sys_close(out_fd);
+        if (out_fd != 1 && out_fd != 2) { sys_close(out_fd); }   # it may BE one of them (`_regression_redirect`)
         var dn_r = sys_open("/dev/null", 0, 0);
-        if (dn_r >= 0) { sys_dup2(dn_r, 0); sys_close(dn_r); }
+        if (dn_r >= 0) { _regression_redirect(dn_r, 0); }
         var argv[40];   # N BYTES (CLAUDE.md buffer contract): cmd + arg + NUL = 24 B
         store64(&argv,     bin_path);
         store64(&argv + 8, arg);
@@ -1128,14 +1309,10 @@ fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp
         sys_execve(bin_path, &argv, envp);
         sys_exit(127);
     }
-    sys_close(out_fd);
     var stbuf[4];
     var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
     _regression_store_status(status_out, reaped, load32(&stbuf));
-    var total = file_read_all(out_path, buf, buflen);
-    sys_unlink(out_path);
-    if (total < 0) { return 0; }
-    return total;
+    return _regression_capture_read(out_fd, buf, buflen);
 }
 #endif
 
@@ -1208,11 +1385,11 @@ fn regression_ssh_skip_check(target): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
         var dn1 = sys_open("/dev/null", 1, 0);
-        if (dn1 >= 0) { sys_dup2(dn1, 1); sys_close(dn1); }
+        if (dn1 >= 0) { _regression_redirect(dn1, 1); }
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[72];   # N BYTES (CLAUDE.md buffer contract): 8 ptrs + NUL = 72 B.
         store64(&argv,      "ssh");      # was argv[8]/envp[1] = 8 B each: the 8
         store64(&argv + 8,  "-o");       # arg writes overran by 56 B and envp[0]
@@ -1251,7 +1428,7 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         var dn = sys_open("/dev/null", 1, 0);
-        if (dn >= 0) { sys_dup2(dn, 1); sys_close(dn); }
+        if (dn >= 0) { _regression_redirect(dn, 1); }
         var argv[48];   # N BYTES (CLAUDE.md buffer contract): 5 ptrs = 40 B
         store64(&argv,      "scp");
         store64(&argv + 8,  "-q");
@@ -1283,11 +1460,11 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
         var dn1 = sys_open("/dev/null", 1, 0);
-        if (dn1 >= 0) { sys_dup2(dn1, 1); sys_close(dn1); }
+        if (dn1 >= 0) { _regression_redirect(dn1, 1); }
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[40];   # N BYTES (CLAUDE.md buffer contract): 4 ptrs = 32 B
         store64(&argv,      "ssh");
         store64(&argv + 8,  target);
@@ -1312,19 +1489,20 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
 # exit status (-2 the deadline, -1 on any other failure, including
 # a child that was never observed — waitpid failed).
 fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
-    var out_fd = sys_open(out_path, 577, 420);
+    # The per-target bits: Linux's 577 is O_WRONLY|O_ASYNC|O_CREAT on Darwin. CHANGELOG [6.7.16]
+    var out_fd = sys_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 420);
     if (out_fd < 0) { return 0 - 1; }
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
+        var ofd = _regression_lift_fd(out_fd);   # a closed fd 0 put it AT 0. CHANGELOG [6.7.15]
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
-        sys_dup2(out_fd, 1);
-        sys_close(out_fd);
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
+        _regression_redirect(ofd, 1);
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         var argv[40];   # N BYTES (CLAUDE.md buffer contract): 4 ptrs = 32 B
         store64(&argv,      "ssh");
         store64(&argv + 8,  target);
@@ -1380,7 +1558,8 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
     if (out_path == 0) {
         out_fd = sys_open("/dev/null", 1, 0);
     } else {
-        out_fd = sys_open(out_path, 577, 420);
+        # The per-target bits: Linux's 577 is O_WRONLY|O_ASYNC|O_CREAT on Darwin. CHANGELOG [6.7.16]
+        out_fd = sys_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 420);
     }
     if (out_fd < 0) { return 0 - 1; }
     var _rg_ppid = sys_getpid();
@@ -1388,12 +1567,12 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
+        var ofd = _regression_lift_fd(out_fd);   # a closed fd 0 put it AT 0. CHANGELOG [6.7.15]
         var dn0 = sys_open("/dev/null", 0, 0);
-        if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
-        sys_dup2(out_fd, 1);
-        sys_close(out_fd);
+        if (dn0 >= 0) { _regression_redirect(dn0, 0); }
+        _regression_redirect(ofd, 1);
         var dn2 = sys_open("/dev/null", 1, 0);
-        if (dn2 >= 0) { sys_dup2(dn2, 2); sys_close(dn2); }
+        if (dn2 >= 0) { _regression_redirect(dn2, 2); }
         sys_chdir(work_dir);
         var argv[48];   # N BYTES (CLAUDE.md buffer contract): cmd + 3 args + NUL = 40 B
         var ai = 0;
@@ -1450,19 +1629,6 @@ fn regression_exec_in_dir3_env(work_dir, bin_path, arg1, arg2, arg3, env_extras_
 
 # ── Internal helpers (underscore prefix; not part of the
 # public surface but consistent within this module) ────────
-
-# Build "/tmp/<prefix><pid>" — used by the *_capture variants
-# for their scratch files. Same shape as `programs/checks/`'s
-# `_tmp_path` so cleanup behavior + collision properties are
-# identical.
-fn _regression_tmp_path(prefix): i64 {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "/tmp/");
-    str_builder_add_cstr(sb, prefix);
-    str_builder_add_int(sb, sys_getpid());
-    var s = str_builder_build(sb);
-    return str_data(s);
-}
 
 # Build "<a><b><c>" as a single cstring. Used by the SSH
 # helpers to produce the "target:remote_path" form scp wants.
