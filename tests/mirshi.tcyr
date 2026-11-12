@@ -542,6 +542,11 @@ fn main() {
     # slot shapes: an epoll slot is {in_use; 8 x watched} = 9 x i64; a timerfd slot is 4 x i64.
     assert_eq(EPOLL_SLOT_SIZE, 72, "epoll slot = in_use + 8 watches = 9 x i64");
     assert_eq(TIMERFD_SLOT_SIZE, 32, "timerfd slot = flags/deadline/interval/armed = 4 x i64");
+    # a signalfd slot is {watched; state}: the state is its own cell, never the caller's flags (1.12.2)
+    assert_eq(SIGFD_SLOT_SIZE, 16, "signalfd slot = watched + state = 2 x i64");
+    assert_eq(SIGFD_FREE, 0 - 1, "SIGFD_FREE = -1");
+    assert_eq(SIGFD_OPEN, 0, "SIGFD_OPEN = 0");
+    assert_eq(SIGFD_OPEN != SIGFD_FREE, 1, "open and free differ");
     # _emu_classify — one sample per band, the bit-30 socket check taking priority over the >= ladder.
     assert_eq(_emu_classify(5), KIND_REAL, "a small real child fd -> REAL");
     assert_eq(_emu_classify(0 - 1), KIND_REAL, "negative -> REAL (guard)");

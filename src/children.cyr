@@ -28,7 +28,9 @@ enum MirshiChild {
     # syscall, so a signalfd MUST clear bit 30 to reach mirshi's read#5.
     # Still way above any real child fd (rlimit caps them < 1024).
     SIGNALFD_SLOTS = 8;         # per-child signalfd table size (a process rarely needs > 1-2)
-    SIGFD_SLOT_SIZE = 16;       # per slot {i64 watched_mask; i64 flags} — flags == -1 marks FREE
+    SIGFD_SLOT_SIZE = 16;       # per slot {i64 watched_mask; i64 state} — SIGFD_FREE / SIGFD_OPEN
+    SIGFD_FREE = 0 - 1;         # 1.12.2: the slot state is its own cell, never the caller's flags word
+    SIGFD_OPEN = 0;
     SFD_NONBLOCK = 2048;        # signalfd flag (agnos SFD_NONBLOCK); the MVP read is always non-blocking
     # --- record field offsets (all i64) ---
     C_AGNOS_PID = 0;            # the opaque guest-facing pid mirshi coined (root = 1)

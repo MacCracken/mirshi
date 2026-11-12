@@ -50,6 +50,16 @@ fn main(): i64 {
     var j = 0;
     while (j < n2) { if (load64(evbuf + j * 12 + 4) == sfd) { gotS = 1; } j = j + 1; }
     if (gotS == 0) { return 12; }
+    # (D) 1.12.2: readiness ignores the blocked mask, as the kernel's does — consume, block, post again
+    var sb[8]; if (sys_read(sfd, &sb, 8) != 4) { return 13; }
+    var blk = sigset_new(); sigset_add(blk, 10);
+    if (sys_sigprocmask(0, blk, 0) != 0) { return 14; }
+    if (sys_kill(1, 10) != 0) { return 15; }
+    var n3 = sys_epoll_wait(ep, evbuf, 16);
+    var gotB = 0;
+    var q = 0;
+    while (q < n3) { if (load64(evbuf + q * 12 + 4) == sfd) { gotB = 1; } q = q + 1; }
+    if (gotB == 0) { return 16; }
     var ok = "EPOLLWAIT-OK\n";
     sys_write(1, ok, strlen(ok));
     return 0;

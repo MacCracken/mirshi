@@ -5,6 +5,17 @@
 
 ## Version
 
+**1.12.2** — 2026-11-12. **Quick kernel-fidelity repairs**, each checked against the kernel at agnos
+`aef48206` (1.57.19):
+- The signalfd follows `vfs_read_signalfd`: `pending & watched` with the blocked mask not consulted, a
+  4-byte record answering 4, 0 when nothing is pending, a new signalfd per call, `close#6` freeing its
+  slot. Under 1.12.1 an agnos signalfd never received a signal. ADR 0014 is amended.
+- `sigprocmask#17` refuses a NULL set and stores the set verbatim for `how` >= 2.
+- `flock#59` refuses an fd that is not a file or a directory.
+- `sock_send#48` answers 0 when its 8 s window expires.
+
+The roadmap is reorganized (1.12.3 sweep → 1.13.x ABI re-sync → … → the 2.0.0 backlog). `cyrius test`
+402/0; all 29 `scripts/it/*` gates and `docker/smoke.sh` green.
 **1.12.1** — 2026-11-12. **Toolchain `6.7.9` → `6.7.18`, with `lib/` re-vendored to the 6.7.18 bundle**
 (`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle; `cyrius.lock` regenerated).
 **Plus the agnos 1.57.13 band the 6.7.11+ stdlib issues**, all supervisor-EMULATE
@@ -258,7 +269,7 @@ paths in the child red zone + repack output structs at the exit stop
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
-  **398 assertions**, hermetic)
+  **402 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`

@@ -4,7 +4,8 @@
 #   (1) the kernel's argument order: a LIVE conn answers the cyrius stdlib's support probe #109(c, buf, 0, 0)
 #       with 0, a dead or foreign conn with -1 even for len 0; timeout 0 (= #48), > 0 and < 0 all send;
 #   (2) the ceiling: against a peer that stops reading, timeout < 0 answers 0 at once and a 250 ms ceiling
-#       answers 0 after ~250 ms — not -1, and not after #48's ~8 s window;
+#       answers 0 after ~250 ms — not -1, and not after #48's ~8 s window; plain #48 there waits that window
+#       and then answers 0, the committed count (1.12.2);
 #   (3) the stdlib's OWN write path (POSIX socket adapter: sys_socket/sys_connect/sys_write, whose first
 #       write probes #109) delivers its bytes with no `ENOSYS agnos#109` line on stderr.
 # Needs python3 + the same-uid ptrace requirement.
@@ -101,6 +102,13 @@ fn main(): i64 {
     if (w != 0) { return 23; }                                 # the ceiling fired with nothing sent -> 0
     if (dt < 200) { return 24; }                               # it really waited...
     if (dt > 3000) { return 25; }                              # ...but not for #48's ~8 s window
+    # 1.12.2: plain #48 on the same stalled conn waits its ~8 s window, then answers 0 — not -1
+    var t1 = syscall(40);
+    var w48 = syscall(48, s, big, 4096);
+    var dt48 = syscall(40) - t1;
+    if (w48 < 0) { return 27; }                                # -1 is a dead conn only
+    if (w48 != 0) { return 28; }
+    if (dt48 < 7000) { return 29; }                            # it did wait the window
     return 0;
 }
 var r = main();

@@ -97,8 +97,8 @@ program can read its password from any of them (darshana's `tty_echo_off(fd)` ac
     installed, so a fatal signal there leaves it hidden too.
   - After a job-control stop (Ctrl-Z), the shell may restore its own tty modes. mirshi does not hide
     the echo again on SIGCONT. A Linux password prompt that needs that handles SIGTSTP/SIGCONT itself.
-  - A signalfd slot is never freed by `close#6` (the signal-band gap), so `fd_kind` still answers
-    `FDK_SIGNALFD` for a closed signalfd.
+  - ~~A signalfd slot is never freed by `close#6`, so `fd_kind` still answers `FDK_SIGNALFD` for a
+    closed signalfd.~~ Fixed in 1.12.2: `close#6` frees the slot, and `fd_kind` then answers -1.
   - `sock_send_dl` sends one chunk of at most 4096 bytes per call, like #48.
   - `fd_kind` applies the kernel's 32-fd bound, so an fd mirshi's rlimit allows above 31 reads as -1. An
     agnos program could never have been given one.

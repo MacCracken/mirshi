@@ -4,6 +4,83 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-11-12
+
+Quick kernel-fidelity repairs: places where mirshi gave a different answer than the agnos kernel, each
+checked against the kernel at agnos `aef48206` (1.57.19).
+
+### Fixed
+
+- **An agnos signalfd never received a signal under mirshi** (`src/dispatch.cyr`, filed 2026-10-12 from
+  darshana's 1.1.4 audit). The read now follows the kernel's `vfs_read_signalfd`, and the epoll
+  readiness test agrees with it:
+  - **The blocked mask is not consulted:** the read takes the lowest signal that is pending *and
+    watched*. A signalfd consumer blocks its signals first, so the old `pending & watched & ~blocked`
+    made the signal it waited for the one it could never read.
+  - **The record is the kernel's:** a 4-byte signal number, answering 4.
+  - **Nothing pending answers 0,** not -1, so darshana's `tty_read_signal` read an empty signalfd as
+    an error.
+  - **A count below 4 is -1.**
+  - ADR 0014 is amended.
+- **`signalfd#18` makes a new signalfd on every call**, as the kernel's arm does: the fd and flags
+  arguments are not consulted. mirshi updated an existing signalfd when given its id. It also stored the
+  flags word in the slot's in-use cell, so a flags value of -1 freed the slot. The slot now holds
+  `{watched, state}` (`SIGFD_FREE` / `SIGFD_OPEN`).
+- **`close#6` on a signalfd frees its slot.** It fell through to a real Linux close of the emulated id,
+  which failed and left the slot taken. So the 9th `signalfd#18` in a process was -1, and `fd_kind#111`
+  kept answering SIGNALFD for a closed one.
+- **`sigprocmask#17` edges:**
+  - A NULL `set` is -1 with nothing changed (the kernel's `is_user_range(arg2, 8)`); mirshi took it
+    as a query.
+  - A `how` other than 0 or 1 stores the set verbatim, where mirshi left the mask unchanged for
+    `how >= 3`.
+  - mirshi still reads `set` before writing `oldset`, so a `set == oldset` alias (which POSIX allows)
+    applies the caller's set. The kernel writes `oldset` first. That is kept, and is on the roadmap to
+    report upstream.
+- **`flock#59` refuses what the kernel refuses:** an fd that is not a file or a directory (a pipe, a
+  terminal, a device), and fd < 0 or >= 32. Linux `flock(2)` locks any of those, so the check runs
+  before the EXECUTE. The fd is duplicated with `pidfd_getfd` and `fstat`'d, through
+  `_child_fd_dup`, now shared with `fd_kind#111`. hapi's 2026-10-28 finding was about directories;
+  the kernel has since started locking those, as mirshi always did.
+- **`sock_send#48` answers 0, not -1, when its ~8 s window expires with nothing sent**, the committed
+  count as the kernel's D6 rule says (`TCP_PROGRESS_US`). A -1 told the program its connection was dead.
+  `sock_send_dl#109` with timeout 0 inherits this. Found in the 1.12.1 review.
+
+### Changed
+
+- **`docs/development/roadmap.md` reorganized.** Shipped work is gone (it is in this file).
+  - The filed defects were re-checked against the current kernel. Three of them it has since made right
+    on its own side: `readlink#70` truncates, `rename#31` replaces, `flock#59` locks directories.
+  - What remains is sequenced:
+    - 1.12.3: a P(-1) audit / hardening / security sweep.
+    - 1.13.x: the ABI re-sync for agnos #36–#115.
+    - 1.14.x: kernel fidelity II.
+    - 1.15.x: the signal model.
+    - 1.16.x: supervisor concurrency.
+    - 1.x: the open decisions.
+    - 2.0.0: the direction-2 backlog.
+- **`docs/reference/syscall-coverage.md` corrections:**
+  - `kbscan#42` was still listed as an undefined gap, though it has been handled since 1.11.0.
+  - #36 / #38–39 / #44 are real agnos calls (`klug`, `fbinfo`/`blit`, `sched_yield`), still ENOSYS.
+  - `link#32`'s note said agnos has no symlink call, but #63 has existed since 1.10.2.
+  - The rows for #17, #18, #48 and #59 and the signal footnote now describe 1.12.2.
+- ADR 0018: the closed-signalfd consequence is struck, since it is fixed.
+
+### Tests
+
+- `tests/mirshi.tcyr` 398 → 402: the signalfd slot shape and its `SIGFD_FREE` / `SIGFD_OPEN` values.
+- `scripts/it/signals.sh`:
+  - The signalfd fixture asserts the kernel's contract: 0 when empty; a 4-byte record with the high
+    half of an 8-byte buffer untouched; -1 for a count of 3; a blocked signal still readable; a new
+    signalfd per call; flags -1 not freeing the slot; a full table; `close#6` freeing a slot once.
+  - The `sigprocmask` fixture adds the NULL-set refusal and `how 3`.
+- `scripts/it/epoll_wait.sh`: a blocked signal still makes the signalfd ready.
+- `scripts/it/flock.sh`: a directory locks; a pipe, fd -1, fd 40 and a closed fd are -1.
+- `scripts/it/send_dl.sh`: plain #48 on the stalled conn waits its window, then answers 0.
+- Every updated gate fails against a clean 1.12.1 build. The deeper signalfd checks were also each
+  proved against a build with that piece reverted: the blocked mask honoured, the close gate removed,
+  readiness honouring the blocked mask, flags stored as the in-use cell.
+
 ## [1.12.1] - 2026-11-12
 
 ### Added

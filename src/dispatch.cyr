@@ -501,11 +501,13 @@ fn _net_fd_pollable(cid): i64 {
     return load64(b + 0);
 }
 
-# sock_send#48(conn_id, buf, len) -> bytes (<=len) / -1. BLOCKS (agnos). The child buffer is
+# sock_send#48(conn_id, buf, len) -> bytes (<=len) / 0 / -1. BLOCKS (agnos). The child buffer is
 # pvm_read into a supervisor page (bounded to NET_IO_CAP), then send()'d with MSG_NOSIGNAL so a
 # peer-closed socket cannot SIGPIPE the SUPERVISOR. The socket is non-blocking (for recv/connect),
 # so a full send buffer (-EAGAIN) is handled by one bounded ppoll(POLLOUT) + retry — emulating the
-# blocking send. A partial send is a valid agnos return (the caller loops).
+# blocking send. A partial send is a valid agnos return (the caller loops). When the ~8 s window
+# expires with nothing sent the answer is 0, the committed count, as the kernel's D6 rule says
+# (TCP_PROGRESS_US); -1 is a dead conn or a real error only (1.12.2 — it was -1).
 fn _net_send(pid, regs): i64 {
     var fd = _net_fd_conn(decode_arg(regs, 0));
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
@@ -528,6 +530,7 @@ fn _net_send(pid, regs): i64 {
     syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
     sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
     if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent == (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0); }    # the window expired, nothing sent
     return _net_emu(pid, regs, 0 - 1);
 }
 
@@ -537,7 +540,7 @@ fn _net_send(pid, regs): i64 {
 # — that is what the cyrius stdlib's support probe `#109(conn, buf, 0, 0)` relies on), then len <= 0
 # -> 0, then the buffer. A chunk that goes out without a wait still goes; when the wait expires with
 # nothing sent the answer is 0 ("no progress yet"), not -1.
-#   timeout_us == 0 -> byte-for-byte #48 (_net_send: the D6 window only).
+#   timeout_us == 0 -> byte-for-byte #48 (_net_send: the D6 window only, then 0).
 #   timeout_us <  0 -> a spent ceiling: one non-blocking attempt, never a wait.
 #   timeout_us >  0 -> wait at most min(timeout_us, the ~8 s D6 window) for send space.
 fn _net_send_dl(pid, regs): i64 {
@@ -899,9 +902,10 @@ fn _sig_buf_get(): i64 {
     return _sig_buf;
 }
 
-# sigprocmask#17(how, set_ptr, oldset_ptr) -> 0 / -1. EMULATE (per-caller, no loop cooperation): if
-# oldset_ptr != 0, write the caller's CURRENT blocked mask there (POSIX: the mask BEFORE the change);
-# then if set_ptr != 0, apply `how` to C_SIG_BLOCKED with the 8-byte mask at set_ptr. Masks are agnos
+# sigprocmask#17(how, set_ptr, oldset_ptr) -> 0 / -1. EMULATE (per-caller, no loop cooperation), the
+# kernel's arm: `set` is REQUIRED (8 bytes at set_ptr); if oldset_ptr != 0 the caller's CURRENT blocked mask
+# is written there (the mask BEFORE the change); then `how` 0 = BLOCK (|=), 1 = UNBLOCK (&= ~), and any other
+# value stores the set verbatim (2 is SETMASK; the kernel does the same for 3 and up). Masks are agnos
 # `1<<sig`. _cur_rec is the caller's record (set by the loop at this enter stop).
 fn _do_sigprocmask(pid, regs): i64 {
     var how = decode_arg(regs, 0);
@@ -909,26 +913,20 @@ fn _do_sigprocmask(pid, regs): i64 {
     var oldset_ptr = decode_arg(regs, 2);
     var sb = _sig_buf_get();
     var cur = load64(_cur_rec + C_SIG_BLOCKED);
-    # Read the new set FIRST (into a local), BEFORE writing oldset — so oldset_ptr == set_ptr aliasing
-    # (POSIX permits it) can't clobber the child's intended set with the just-written old mask.
-    var have_set = 0;
-    var newset = 0;
-    if (set_ptr != 0) {
-        if (pvm_read(pid, set_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
-        newset = load64(sb);
-        have_set = 1;
-    }
+    # The kernel requires `set` (is_user_range(arg2, 8) first): a NULL or unreadable set is -1 with nothing
+    # changed (1.12.2; mirshi took NULL as a query). It is read BEFORE oldset is written, so a set_ptr ==
+    # oldset_ptr alias (POSIX permits it) still applies the caller's set — the kernel writes oldset first.
+    if (set_ptr == 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (pvm_read(pid, set_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    var newset = load64(sb);
     if (oldset_ptr != 0) {                                 # oldset gets the mask BEFORE the change
         store64(sb, cur);
         if (pvm_write(pid, oldset_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
     }
-    if (have_set == 1) {
-        var result = cur;
-        if (how == 0) { result = cur | newset; }              # SIG_BLOCK   — add bits
-        if (how == 1) { result = cur & (0 - newset - 1); }    # SIG_UNBLOCK — clear bits (cur & ~newset)
-        if (how == 2) { result = newset; }                    # SIG_SETMASK — replace wholesale
-        store64(_cur_rec + C_SIG_BLOCKED, result);
-    }
+    var result = newset;                                   # any other `how` stores the set verbatim (kernel)
+    if (how == 0) { result = cur | newset; }               # SIG_BLOCK   — add bits
+    if (how == 1) { result = cur & (0 - newset - 1); }     # SIG_UNBLOCK — clear bits (cur & ~newset)
+    store64(_cur_rec + C_SIG_BLOCKED, result);
     return _net_emu(pid, regs, 0);
 }
 
@@ -941,7 +939,7 @@ fn _sigfd_tbl(): i64 {
         var i = 0;
         while (i < SIGNALFD_SLOTS) {
             store64(t + i * SIGFD_SLOT_SIZE + 0, 0);        # watched_mask = 0
-            store64(t + i * SIGFD_SLOT_SIZE + 8, 0 - 1);    # flags = -1 -> FREE
+            store64(t + i * SIGFD_SLOT_SIZE + 8, SIGFD_FREE);
             i = i + 1;
         }
         store64(_cur_rec + C_SIGFD_TBL, t);
@@ -949,40 +947,53 @@ fn _sigfd_tbl(): i64 {
     return t;
 }
 
-# signalfd#18(fd, mask_ptr, flags) -> fd / -1. EMULATE (per-caller). fd==-1 allocates a new slot ->
-# returns SIGFD_BASE+slot; an existing SIGFD_BASE+slot updates its watched mask. The mask (8-byte
-# 1<<sig) is read from mask_ptr. An OPAQUE emulated fd — a real Linux fd is meaningless in the child
-# (separate fd tables across the ptrace boundary). read#5 on the returned fd delivers pending signals.
+# signalfd#18(fd, mask_ptr, flags) -> fd / -1. EMULATE (per-caller). Like the kernel's arm, every call makes a
+# NEW signalfd: the fd and flags arguments are not consulted (1.12.2 — mirshi used to update an existing
+# SIGFD_BASE+slot in place, and stored the flags word in the slot's in-use cell, where a flags of -1 read as
+# FREE). The watched mask (8-byte 1<<sig) is read from mask_ptr; an unreadable one is -1. Returns an OPAQUE
+# emulated id, SIGFD_BASE + slot — a real Linux fd is meaningless in the child (separate fd tables across
+# the ptrace boundary). read#5 on it delivers pending signals; close#6 frees the slot.
 fn _do_signalfd(pid, regs): i64 {
-    var fd = decode_arg(regs, 0);
     var mask_ptr = decode_arg(regs, 1);
-    var flags = decode_arg(regs, 2);
     var sb = _sig_buf_get();
     if (pvm_read(pid, mask_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
     var watched = load64(sb);
     var tbl = _sigfd_tbl();
     var slot = 0 - 1;
-    if (fd == (0 - 1)) {                                   # new signalfd -> first FREE slot
-        var i = 0;
-        while (i < SIGNALFD_SLOTS) {
-            if (load64(tbl + i * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { slot = i; i = SIGNALFD_SLOTS; }
-            else { i = i + 1; }
-        }
-        if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }         # table full
-    } else {                                              # update an existing signalfd
-        if (fd < SIGFD_BASE) { return _net_emu(pid, regs, 0 - 1); }
-        slot = fd - SIGFD_BASE;
-        if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
-        if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }   # not open
+    var i = 0;
+    while (i < SIGNALFD_SLOTS) {
+        if (load64(tbl + i * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { slot = i; i = SIGNALFD_SLOTS; }
+        else { i = i + 1; }
     }
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }         # table full
     store64(tbl + slot * SIGFD_SLOT_SIZE + 0, watched);
-    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, flags);
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, SIGFD_OPEN);
     return _net_emu(pid, regs, SIGFD_BASE + slot);
 }
 
-# read#5 on an emulated signalfd (fd >= SIGFD_BASE): deliver the lowest pending & watched & unblocked
-# signal as an 8-byte number into the child's buffer (return 8), consuming that pending bit. Nothing
-# deliverable -> agnos -1 (the MVP signalfd is NON-BLOCKING; the caller polls, yielding via pause#14).
+# close#6 on an emulated signalfd: free its slot -> 0, or -1 when the id names no open slot (1.12.2; until
+# then the close fell through to a real Linux close of the id, which failed EBADF and left the slot taken,
+# so the 9th signalfd#18 in a process was -1).
+fn _sigfd_close(pid, regs): i64 {
+    var slot = decode_arg(regs, 0) - SIGFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _sigfd_tbl();
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return _net_emu(pid, regs, 0 - 1); }
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 0, 0);
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, SIGFD_FREE);
+    return _net_emu(pid, regs, 0);
+}
+
+# read#5 on an emulated signalfd (fd >= SIGFD_BASE) -> 4 / 0 / -1, the kernel's vfs_read_signalfd (1.12.2):
+#   count < 4                 -> -1 (the kernel stores exactly 4 bytes, so it refuses a shorter buffer);
+#   nothing pending & watched -> 0 ("nothing yet": the signalfd is non-blocking; the caller polls);
+#   else the lowest such signal (1..63) as a 4-byte number at buf -> 4, and that pending bit is consumed.
+# The BLOCKED mask is not consulted: a signalfd consumer blocks its signals first (so they take no default
+# action), and it is exactly those it reads — as on the kernel and on Linux. Until 1.12.2 mirshi delivered
+# `pending & watched & ~blocked`, wrote 8 bytes, required 8 and answered -1 for "nothing pending", so the
+# signal a program waited for was the one it could never read. Deliver first, then consume: a failed write
+# leaves the signal pending.
 fn _sigfd_read(pid, regs): i64 {
     var fd = decode_arg(regs, 0);
     var buf = decode_arg(regs, 1);
@@ -991,28 +1002,20 @@ fn _sigfd_read(pid, regs): i64 {
     if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }            # belt-and-suspenders (net-band idiom)
     if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
     var tbl = _sigfd_tbl();
-    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return _net_emu(pid, regs, 0 - 1); }   # not open
-    if (len < 8) { return _net_emu(pid, regs, 0 - 1); }             # need room for the 8-byte number
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return _net_emu(pid, regs, 0 - 1); }   # not open
+    if (len < 4) { return _net_emu(pid, regs, 0 - 1); }             # the record is 4 bytes
     var watched = load64(tbl + slot * SIGFD_SLOT_SIZE + 0);
-    var deliverable = _sig_deliverable(load64(_cur_rec + C_PENDING_SIG), load64(_cur_rec + C_SIG_BLOCKED)) & watched;
-    if (deliverable == 0) { return _net_emu(pid, regs, 0 - 1); }    # nothing pending (non-blocking)
-    var sig = _sig_lowest(deliverable);
-    # DELIVER FIRST, then consume: if the child buffer write fails, the pending bit MUST stay set
-    # (never lose a signal on a bad-buffer read — the "deliver-then-consume" discipline of _net_recv).
+    var ready = load64(_cur_rec + C_PENDING_SIG) & watched;
+    if (ready == 0) { return _net_emu(pid, regs, 0); }              # nothing pending (non-blocking)
+    var sig = _sig_lowest(ready);
     var sb = _sig_buf_get();
-    store64(sb, sig);                                              # the signal number, 8-byte i64
-    if (pvm_write(pid, buf, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }   # nothing consumed on failure
+    store64(sb, 0);
+    store32(sb, sig);                                              # the signal number, 4 bytes
+    if (pvm_write(pid, buf, sb, 4) != 4) { return _net_emu(pid, regs, 0 - 1); }   # nothing consumed on failure
     store64(_cur_rec + C_PENDING_SIG, _sig_clear(load64(_cur_rec + C_PENDING_SIG), sig));   # THEN consume
-    return _net_emu(pid, regs, 8);                                 # bytes delivered
+    return _net_emu(pid, regs, 4);
 }
 
-# --- v1.7.0 timerfd band (#22/#23 + read#5). SUPERVISOR-EMULATED as a stored DEADLINE (no real Linux
-#     timerfd fd): a real child timerfd would be invisible to the supervisor-emulated epoll (BITE 5),
-#     the same stranding as sockets, so a timerfd is a supervisor-side clock entry epoll_wait folds in
-#     with a pure _mono_ms compare. Per-child C_TIMERFD_TBL, lazy-alloc-once (mirrors _sigfd_tbl). ---
-
-# 24-byte supervisor scratch for the timerfd val pvm I/O (settime reads a 24 B itimerspec; read writes
-# an 8 B count), lazy-alloc-once — one call in flight, never a per-call alloc (same as _sig_buf).
 var _timer_buf = 0;
 fn _timer_buf_get(): i64 {
     if (_timer_buf == 0) { _timer_buf = alloc(24); }
@@ -1226,15 +1229,16 @@ fn _epoll_scratch(): i64 {
 }
 
 # READ-ONLY readiness probes for epoll_wait (they must NOT consume — the program read#5's after the wake).
-# A signalfd is ready iff it has a deliverable & watched signal; a timerfd iff armed and its deadline passed.
+# A signalfd is ready iff a watched signal is pending; a timerfd iff armed and its deadline passed.
 fn _sigfd_ready(id): i64 {
     var slot = id - SIGFD_BASE;
     if (slot < 0) { return 0; }
     if (slot >= SIGNALFD_SLOTS) { return 0; }
     var tbl = _sigfd_tbl();
-    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return 0; }    # not open
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return 0; }  # not open
     var watched = load64(tbl + slot * SIGFD_SLOT_SIZE + 0);
-    if ((_sig_deliverable(load64(_cur_rec + C_PENDING_SIG), load64(_cur_rec + C_SIG_BLOCKED)) & watched) != 0) { return 1; }
+    # pending & watched, the blocked mask not consulted — the kernel's epoll test and _sigfd_read agree (1.12.2)
+    if ((load64(_cur_rec + C_PENDING_SIG) & watched) != 0) { return 1; }
     return 0;
 }
 fn _timerfd_ready(id, now): i64 {
@@ -1733,7 +1737,7 @@ fn _fdk_emu_open(fd, kind): i64 {
         var ss = fd - SIGFD_BASE;
         if (st == 0) { return 0; }
         if (ss >= SIGNALFD_SLOTS) { return 0; }
-        if (load64(st + ss * SIGFD_SLOT_SIZE + 8) == (0 - 1)) { return 0; }
+        if (load64(st + ss * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return 0; }
         return 1;
     }
     if (kind == KIND_TIMERFD) {
@@ -1755,6 +1759,17 @@ fn _fdk_emu_open(fd, kind): i64 {
     return 0;
 }
 
+# A supervisor-side duplicate of the child's real fd `fd` (pidfd_getfd: the same open file, no effect on
+# the child's table, O_CLOEXEC), or -1 when the child has no such fd. The caller closes it.
+fn _child_fd_dup(pid, fd): i64 {
+    var pfd = syscall(SYS_PIDFD_OPEN, pid, 0);
+    if (pfd < 0) { return 0 - 1; }
+    var dfd = syscall(SYS_PIDFD_GETFD, pfd, fd, 0);
+    syscall(HOST_CLOSE, pfd);
+    if (dfd < 0) { return 0 - 1; }
+    return dfd;
+}
+
 fn _do_fd_kind(pid, regs): i64 {
     var fd = decode_arg(regs, 0);
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
@@ -1764,10 +1779,7 @@ fn _do_fd_kind(pid, regs): i64 {
         return _net_emu(pid, regs, 0 - 1);
     }
     if (fd >= FDK_FD_MAX) { return _net_emu(pid, regs, 0 - 1); }
-    var pfd = syscall(SYS_PIDFD_OPEN, pid, 0);
-    if (pfd < 0) { return _net_emu(pid, regs, 0 - 1); }
-    var dfd = syscall(SYS_PIDFD_GETFD, pfd, fd, 0);         # the dup is O_CLOEXEC; the child's fd is untouched
-    syscall(HOST_CLOSE, pfd);
+    var dfd = _child_fd_dup(pid, fd);
     if (dfd < 0) { return _net_emu(pid, regs, 0 - 1); }     # a closed fd
     var sb = _fdk_scratch();
     var k = 0 - 1;
@@ -1778,6 +1790,26 @@ fn _do_fd_kind(pid, regs): i64 {
     }
     syscall(HOST_CLOSE, dfd);
     return _net_emu(pid, regs, k);
+}
+
+# flock#59's fd gate (1.12.2): 1 when `fd` may be locked, as the kernel's arm decides — fd in [0, 32) and
+# a file or a directory (ext2 FILE / DIR on the kernel) — else 0. A pipe, a terminal, a device, an event
+# fd or one of mirshi's emulated ids is refused there; Linux flock(2) locks any of them, so the check has to
+# happen here, before the EXECUTE. (The kernel also answers -2 for a full lock table; mirshi has none.)
+fn _flock_fd_ok(pid, fd): i64 {
+    if (fd < 0) { return 0; }
+    if (fd >= FDK_FD_MAX) { return 0; }
+    var dfd = _child_fd_dup(pid, fd);
+    if (dfd < 0) { return 0; }
+    var sb = _fdk_scratch();
+    var ok = 0;
+    if (syscall(SYS_FSTAT, dfd, sb) == 0) {
+        var k = fdk_from_mode(load32(sb + 24), 0);
+        if (k == FDK_FILE) { ok = 1; }
+        if (k == FDK_DIR) { ok = 1; }
+    }
+    syscall(HOST_CLOSE, dfd);
+    return ok;
 }
 
 # ============================================================================
@@ -2285,13 +2317,20 @@ fn translate_dispatch(pid, regs): i64 {
         }
     }
 
-    # close#6 on an emulated timerfd / epoll -> free the slot (a real close would EBADF). signalfd close
-    # stays a real close (the v1.6.0 slot-leak limit). Real child fds (incl. pipe ends, < MIN_EMU_BASE)
+    # close#6 on an emulated signalfd / timerfd / epoll -> free the slot (a real close would EBADF; the
+    # signalfd joined in 1.12.2 — before that its slot leaked). Real child fds (incl. pipe ends, < MIN_EMU_BASE)
     # fall through to the EXECUTE tail (renumber to Linux close#3).
     if (nr == 6) {
         var ck = _emu_classify(decode_arg(regs, 0));
+        if (ck == KIND_SIGFD) { return _sigfd_close(pid, regs); }
         if (ck == KIND_TIMERFD) { return _timerfd_close(pid, regs); }
         if (ck == KIND_EPOLL) { return _epoll_close(pid, regs); }
+    }
+
+    # flock#59 -> refuse what the kernel refuses (not a file or a directory, or fd outside [0, 32)), then
+    # EXECUTE the real Linux flock below (op codes identical).
+    if (nr == 59) {
+        if (_flock_fd_ok(pid, decode_arg(regs, 0)) == 0) { return _net_emu(pid, regs, 0 - 1); }
     }
 
     # The execute-in-child family: renumber orig_rax to the Linux peer (+ arg

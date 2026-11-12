@@ -1,139 +1,190 @@
 # mirshi — Roadmap
 
-> **Forward-looking sequencing** — what ships next, in what order, against what gates. The completed
-> v0.1.0 → v1.4.0 detail has been retired to [`../../CHANGELOG.md`](../../CHANGELOG.md) (per-release)
-> and [`state.md`](state.md) (live snapshot); this file keeps only a compact shipped-ledger + the
-> planned minors.
+> **Forward-looking only.** What ships next, in what order. Shipped work lives in
+> [`../../CHANGELOG.md`](../../CHANGELOG.md) (per release) and [`state.md`](state.md) (live snapshot);
+> the per-number contract is [`../reference/syscall-coverage.md`](../reference/syscall-coverage.md).
 >
 > **Discipline** ([ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md)): mirshi runs agnos
-> userland on the *host* Linux kernel — it validates **userland concurrency + Linux-app compat at
-> scale**, NOT the agnos kernel's own SMP scheduler / net stack. It **complements, never replaces**
-> QEMU+KVM (real kernel) + iron (hardware truth). Each surface owns a distinct bug class.
+> userland on the *host* Linux kernel. It validates **userland concurrency + Linux-app compat at
+> scale**, NOT the agnos kernel's own SMP scheduler / net stack, and **complements, never replaces**
+> QEMU+KVM (real kernel) + iron (hardware truth). **The kernel's code is the reference** for every
+> answer mirshi gives: `../agnos/kernel/core/syscall.cyr` and its callees.
 
-## The core technical problem
+## Where things stand
 
-agnos redefines the `Sys` enum to its own numbers (`exit`=0 vs Linux 60; the net band #47–57/#61 is a
-sovereign `sock_*`/`udp_*`/`icmp` ABI; `mmap#27` is 2 MB-granular; `sock_recv#49` has inverted EOF;
-`spawn#3` runs an **in-memory** ELF). So translation is a **per-number handler table**, not a remap:
-each agnos syscall either (a) **executes** in the child (renumber + arg-translate to a Linux peer),
-(b) is **emulated** supervisor-side over Linux primitives, or (c) returns **ENOSYS**. agnos binaries
-are **static, no libc** → no `LD_PRELOAD`; interception is supervisor-side (ptrace today; seccomp-notify
-studied and **deferred-by-data**, [ADR 0005](../adr/0005-seccomp-notify-feasibility.md)).
+mirshi handles agnos# 0–63 (except the kernel-only ops), `readlink#70`, `uptime_us#95` and the 1.57.13
+band `#109–#111`. The agnos ABI has kept growing: the kernel at agnos 1.57.19 answers numbers up to
+**#115**, and the cyrius 6.7.18 stdlib issues most of them. Everything mirshi does not handle falls to
+`ENOSYS -> -1` with a stderr line. Closing that gap is the 1.13 line.
 
-## Shipped (v0.1.0 → v1.10.2)
+Each item below was checked against the kernel at agnos `aef48206` (1.57.19) on 2026-11-12. Items the
+kernel has since made right on its side were dropped:
+- `readlink#70` truncates since 1.57.18, as Linux does.
+- `rename#31` replaces since 1.57.17.
+- `flock#59` accepts directories.
 
-The functional v1 surface, the pre-1.0 quality arc, the v1.0 clean cut, the post-v1 net band,
-multi-process, signals, I/O multiplexing, the info-getter long-tail, and tty sizing are **done** —
-**direction 1 is feature-complete** (every defined, non-kernel-only agnos syscall is handled). Full per-release detail:
-[`../../CHANGELOG.md`](../../CHANGELOG.md). Frozen per-number contract:
-[`../reference/syscall-coverage.md`](../reference/syscall-coverage.md). Ledger:
+---
 
-| Band | Versions | What |
-|---|---|---|
-| **Functional v1 surface** | v0.1–v0.5 | M0 trap loop → M1 process/console → M2 filesystem → M3 Docker vehicle + fan-out → M4 seccomp-notify feasibility (deferred-by-data) |
-| **Pre-1.0 quality arc** | v0.6–v0.9 | hardening → security sweep (default-deny seccomp proven) → rootfs confinement (`--root`) → optimizations (exit-stop single-register I/O) → freeze + docs |
-| **v1.0 — the clean cut** | v1.0.0 | a representative AGNOS userland in a `FROM scratch` Docker container, **no QEMU**, seccomp-bounded, fan-out-ready |
-| **Net band (post-v1)** | v1.1–v1.4 | TCP client → TCP server → UDP + `net_config` → ICMP: the sovereign net band (#47–57, #61), supervisor-EMULATE, egress default-deny ([ADR 0012](../adr/0012-net-band-supervisor-emulated-conn-table.md)) — **complete** |
-| **Multi-process (post-v1)** | v1.5.0 | `spawn#3`/`waitpid#4`/`getpid#2` — the **agnsh crown jewel**: a parent spawns in-memory-ELF children + waits their exit codes, to arbitrary depth, under one `wait4(-1)` supervisor; opaque-monotonic pids, `MAX_CHILDREN` storm bound, deadlock guard ([ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md)) |
-| **Signals (post-v1)** | v1.6.0 | `pause#14`/`kill#16`/`sigprocmask#17`/`signalfd#18` — the shell's notification half: supervisor-emulated pending/blocked masks over the record table, `kill` self/child-scoped, a **bounded-yield** `pause`, and an opaque `signalfd` whose `read#5` delivers the raw signal number ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) |
-| **I/O multiplexing (post-v1)** | v1.7.0 | `epoll#19–21`/`timerfd#22–23`/`pipe#25` — the **event loop**: epoll + timerfd **supervisor-emulated** (a heterogeneous **bounded-yield** `epoll_wait` — `ppoll` sockets + mask-test signalfds + clock-test timerfds), `pipe` **execute-in-child**; the tag ladder + `_emu_classify` read#5/close#6 front gate; socket-watching best-effort ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)) |
-| **Info getters + locks (post-v1)** | v1.8.0 | `getuid#15`/`uname#34`/`sysinfo#35`/`flock#59` — the **ENOSYS long-tail**: the info getters **supervisor-emulated** (synthesized agnos-native structs — `getuid`→0, `uname`/`sysinfo` from live host values, never leaking host identity), `flock` **execute-in-child** (real inode-keyed advisory lock) ([ADR 0016](../adr/0016-info-getters-emulated-flock-executed.md)) |
-| **tty sizing (post-v1)** | v1.9.0 | `winsize#60` — the **whole direction-1 graphics surface** (no `fbinfo`/`blit` exists): **supervisor-emulated** `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default, always a usable size), consumer-verified against darshana ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)). **Direction 1 feature-complete.** |
+## 1.12.2 — quick kernel-fidelity repairs
 
-## Open defects — the signal band (filed 2026-10-12 from darshana's 1.1.4 audit)
+Small, self-contained fixes where mirshi gives a different answer than the kernel. Each one is a
+contained change with a kernel line to check it against.
 
-Found while auditing darshana's AGNOS `tty_open_signalfd` / `tty_close_signalfd` peers, which are
-consumer-verified against mirshi the way `winsize#60` is ([ADR 0017](../adr/0017-winsize-emulated-tiocgwinsz.md)).
-Each was checked against mirshi HEAD `2314569` and, where it says so, the agnos kernel's own code.
-Together they mean an agnos program's signalfd **never receives a signal under mirshi**, although the
-same program works on the agnos kernel.
+**The signal band** (filed 2026-10-12 from darshana's 1.1.4 audit; together they meant an agnos
+signalfd never received a signal under mirshi):
+1. **A signalfd reads `pending & watched`, ignoring the blocked mask**, as the kernel's
+   `vfs_read_signalfd` and its epoll readiness test do. A signalfd consumer must block the signals
+   first, so under mirshi the signal a program waits for was exactly the one it could never read.
+   ADR 0014's `~blocked` term is corrected.
+2. **The signalfd `read#5` record is the kernel's.** A count below 4 is -1. With nothing pending the
+   answer is 0. Otherwise a 4-byte signal number is stored and the answer is 4. mirshi wrote 8 bytes,
+   required 8, and answered -1 for "nothing pending". The kernel's 1..63 range, which mirshi already
+   used, is unchanged.
+3. **`close#6` on a signalfd frees its slot.** It stayed taken, so the 9th `signalfd#18` in a process
+   was -1, and `fd_kind#111` kept answering SIGNALFD for a closed one.
+4. **`signalfd#18` always makes a new signalfd**, as the kernel does: it ignores the fd argument and
+   the flags. mirshi updated an existing one when given its id, and stored the flags word in the
+   slot's in-use marker, so a flags value of -1 freed the slot.
+5. **`sigprocmask#17` edges.** A NULL or unreadable `set` is -1, as on the kernel. `how` other than
+   0 (BLOCK) or 1 (UNBLOCK) stores the set verbatim, where mirshi left the mask unchanged for
+   `how >= 3`.
 
-1. **A blocked signal is never readable through a signalfd.** `_sigfd_read` and the epoll readiness
-   test deliver `pending & watched & ~blocked` (`_sig_deliverable`, `src/children.cyr:163`;
-   `src/dispatch.cyr:959`, `:1199`). The agnos kernel's `vfs_read_signalfd`
-   (`agnos/kernel/core/vfs.cyr:838`) delivers `pending & sigmask` and ignores the blocked mask, as Linux
-   does — and a signalfd consumer *must* block the signals first, or they take their default action
-   instead. So under mirshi the signal a program is waiting for is exactly the one that can never be
-   read. **Confirmed by run**: an agnos program that opens a `TTY_SIGMASK_EXIT` signalfd (block, then
-   `signalfd#18`) and then `kill#16`s itself with SIGTERM gets `kill = 0` (the pending bit is set) and
-   then 6 s of `read#5 = -1`. ADR 0014 §Decision specifies the `~blocked` term, so the ADR needs the
-   correction too.
-2. **The `read#5` record differs from the kernel's.** mirshi writes an 8-byte i64, requires `len >= 8`
-   and returns -1 when nothing is pending; the kernel stores a 4-byte value (`store32`), requires
-   `count >= 4`, returns 4, and returns **0** when nothing is pending. It also scans signals 1..31 where
-   mirshi accepts 1..63. A program written against one fails on the other (a 4-byte buffer is -1 under
-   mirshi; a `n == 8` check never matches on the kernel). Confirmed by reading both.
-3. **Host-originated signals bypass the agnos signal model.** `C_PENDING_SIG` has exactly one writer,
-   `_do_kill` (agnos `kill#16`, `src/intercept.cyr:523`). A signal that arrives from the host — a
-   terminal Ctrl-C, a host `kill`, a SIGHUP, a SIGWINCH on resize — takes the ptrace signal-delivery
-   path (`src/intercept.cyr:636-643`) and is re-injected as a REAL Linux signal, with the real default
-   action, because the child's agnos blocked mask exists only in the supervisor. **Confirmed by run**:
-   the same program, with SIGTERM blocked and watched, killed by a host `kill -TERM <child>` — mirshi
-   exits 143 and the signalfd never sees it. For a screen-owning program that is the worst case: Ctrl-C
-   kills it instead of waking its teardown, so the terminal is left raw. (SIGWINCH is not raised by the
-   agnos kernel either — a kernel item, not mirshi's — but under mirshi a host resize cannot reach the
-   child's signal model at all.)
-4. **Closing a signalfd never frees its slot.** `close#6` frees emulated timerfd and epoll slots, but a
-   signalfd close "stays a real close" (`src/dispatch.cyr:1951-1952`, the documented v1.6.0 limit): the
-   Linux `close` of the emulated id fails with EBADF and the slot stays taken. With `SIGNALFD_SLOTS = 8`
-   (`src/children.cyr:29`), the 9th `signalfd#18(-1, …)` in a process returns -1. Confirmed by reading.
-5. *(Low.)* **`sigprocmask#17` edge cases diverge from the kernel.** For `how >= 3` mirshi leaves the
-   mask unchanged and returns 0, where the kernel stores the new set verbatim; mirshi accepts a NULL
-   `set` (query only), which the kernel rejects (`is_user_range(arg2, 8)`). Confirmed by reading both.
+**Other fidelity:**
 
-## Open defects — kernel fidelity (filed 2026-10-28 from hapi's 1.1.1 P(-1) audit)
+6. **`flock#59` refuses an fd that is neither a file nor a directory** (a pipe, a terminal, a device),
+   and refuses fd < 0 or >= 32, as the kernel does. This is what is left of hapi's 2026-10-28 finding:
+   the kernel now locks directories too.
+7. **`sock_send#48` answers 0, not -1, when its ~8 s window expires with nothing sent.** The kernel
+   returns the committed count (`TCP_PROGRESS_US`: "#48 returns the committed count after this long
+   with no ACK progress"); a -1 told the program its connection was dead. Found in the 1.12.1 review.
+8. **Coverage-doc corrections.** `kbscan#42` is listed as an undefined gap although it has been handled
+   since 1.11.0. #36 (`klug`), #38/#39 (`fbinfo`/`blit`) and #44 (`sched_yield`) are real agnos calls
+   now (still ENOSYS, see 1.13.0). `link#32`'s gap note says agnos has no symlink call, but #63 has
+   existed since 1.10.2.
 
-Found while running hapi's agnos build both under mirshi and on an agnos 1.57.14 kernel booted in QEMU
-(hapi `docs/audit/2026-10-28-audit.md`, § *Harness gap*). On each of these calls mirshi gives the
-host-Linux answer where the kernel refuses, so a program that passes under mirshi fails on agnos — and
-the failure paths of the program can never be exercised under mirshi. hapi hit two real bugs this way:
-one is a symlink-following hole that only the kernel shows, and the other is `hapi adopt` being
-unusable on agnos. Items 1–4 were **confirmed by run** on mirshi HEAD `b2b6274` (the 1.11.3 tree,
-built with cyrius 6.7.18) and on the kernel, and by reading the kernel at agnos `839e8d54`.
+## 1.12.3 — P(-1) sweep: audit, refactor, hardening, optimization, security, and repairs
 
-1. **readlink#70 truncates where the kernel refuses.** For a link body longer than the caller's buffer,
-   the kernel returns **-1** (`ext2_readlink`: `if (tlen > cap) return -1`,
-   `agnos/kernel/core/ext2.cyr:3226`; ZFS does the same). mirshi forwards to Linux `readlink`
-   (`src/translate.cyr:50`, `src/dispatch.cyr:66`), which truncates and returns the buffer length.
-   Run: an 84-byte link read into 64 bytes is **64** under mirshi and **-1** on the kernel. hapi
-   probed "is this a symlink?" with a 64-byte buffer, so on the kernel any link body of 65 bytes or more
-   read as "not a symlink" and was followed. mirshi said it was refused.
-2. **open#7 opens a directory without `AO_DIRECTORY`.** The kernel's `ext2_open` refuses any
-   non-regular file (`(mode & 0xF000) != 0x8000` → -1, `ext2.cyr:3417`); a directory opens only through
-   the `AO_DIRECTORY` arm (`syscall.cyr`, `sys_open_ext2_inner`). mirshi forwards `AO_RDONLY` to Linux
-   `open` (`src/translate.cyr:38`), which opens a directory read-only. Run: fd **3** under mirshi,
-   **-1** on the kernel.
-3. **flock#59 locks a directory fd.** The kernel accepts only an ext2 regular-file fd
-   (`ktag(fl_base) != VFS_EXT2_FILE` → -1, `syscall.cyr:12376`), and returns **-2** when its lock
-   table is full. mirshi forwards to Linux `flock` (`src/translate.cyr:49`), which locks anything.
-   Run: **0** under mirshi, **-1** on the kernel. This is hapi's manifest lock, so `hapi adopt` passes
-   under mirshi and fails on agnos.
-4. **rename#31 replaces an existing destination.** The kernel refuses it (`ext2_rename`:
-   "rename-replace is a follow-on bite", `ext2.cyr:3058-3061`). mirshi forwards to Linux `rename`
-   (`src/translate.cyr:43`), which replaces atomically. Run: **0** under mirshi, **-1** on the kernel.
-   ⚠ This one tracks a kernel change that is planned. When the kernel's rename-replace lands, mirshi's
-   current answer becomes the right one. Until then, refusing is what lets a program's no-replace
-   fallback be tested at all.
-5. *(Low.)* **No environment.** The kernel stages `HOME=/` and `PWD=/` into every init envp at exec
-   (`elf.cyr:714-727`); mirshi passes `[NULL]` (`src/intercept.cyr:211-213`, and `:229-231` for the
-   memfd spawn). So `getenv("HOME")` is a valid path on agnos and null under mirshi. hapi's
-   `$HOME`-scoped verbs cannot run under mirshi at all. Its default scope on agnos, `/`, was refusing
-   every row (hapi F-047), and that defect was found only on the real kernel. Confirmed by reading both.
+A whole-tree pass with no new syscalls, ending in the repairs it finds. Scope:
+- **Correctness audit** of every arm against the kernel's current code (the drift found above suggests
+  more).
+- **Security sweep:**
+  - every `pvm_read`/`pvm_write` length and pointer;
+  - every child-controlled integer;
+  - the child seccomp allowlist kept least-privilege;
+  - the supervisor's own fds, signals and heap bounds.
+- **Hardening:** fault injection over the new arms (#109–#111) and the 1.12.2 changes.
+- **Refactor:** `src/dispatch.cyr` is ~2,200 lines, one file for every band.
+- **Optimization:** the per-syscall hot path (ADR 0010 is the last pass).
 
-## Planned — the direction-2 major
+Seeds already noticed:
+- `src/` still declares local `SYS_*` / `O_*` / `SO_*` numbers that the stdlib has since grown with the
+  same values (`SYS_PPOLL`, `SYS_MEMFD_CREATE`, `SYS_SENDTO` …). They compile silently today, but would
+  break the build if a stdlib value ever changed.
+- The `xlat-coverage` freeze test's labels name #36/#38/#39/#42/#44 as gaps.
+- `state.md`'s version history has gaps (1.10.1–1.11.3 are one line).
+- README's version paragraph stops at 1.11.1.
+- `docs/reference/syscall-coverage.md` is headed "agnos# 0–61" but now has rows up to #111.
+- The kernel's `sigprocmask#17` stores `oldset` before it reads `set`, so with `set == oldset`
+  (which POSIX allows) it reads back the old mask. mirshi keeps the POSIX-correct order. Report this
+  upstream rather than copy it.
 
-**Direction 1 (AGNOS→Linux) is feature-complete** — every defined, non-kernel-only agnos syscall is
-handled (the matrix's only ENOSYS rows are the agnos-kernel-only ops + the undefined ABI gaps). What
-remains is the mirror half:
+---
 
-### v2.0.0 — Direction 2: the Linux→AGNOS "swallow"
-Run **Linux** binaries **on the agnos kernel** — the permanent compat layer, the mirror half of the
+## 1.13.x — ABI re-sync II
+
+The agnos numbers past mirshi's surface. For each one, read its kernel arm first, then classify it:
+EXECUTE (a Linux peer), EMULATE (answer it in the supervisor), or permanent ENOSYS (hardware-only,
+see 1.x).
+
+- **1.13.0 — the cheap ones:** a getter, an fs call with a Linux peer, or a pure supervisor answer.
+  - Scheduling: `sched_yield#44` and `sched_yield_to#108`.
+  - Filesystem: `lstat#102` (the `stat#33` repack, no-follow), `statfs#103` (a frozen 32-byte
+    record), `mountlist#104`, `readdir#81` / `readdir_at#101`, and `fsync#115`.
+  - The log: `klug#36`, mirshi's own log, or an empty ring.
+  - Processes and limits: `proclist#99` (mirshi's record table) and `spawn_limits#107`.
+  - Net: `sock_peer#106` and `icmp_echo_ex#100`.
+- **1.13.1 — the process environment.** It goes with `chdir#112` / `getcwd#113` (agnos 1.57.18).
+  - The kernel stages `HOME=/` and `PWD=<the cwd the child is born with>` into every init envp, and a
+    `spawn_path#43` env blob replaces that default.
+  - mirshi passes `[NULL]` for the root child, `spawn#3`, `#37` and `#43`. So `getenv("HOME")` is null
+    under mirshi, and hapi's `$HOME`-scoped verbs cannot run.
+  - Under `--root`, `PWD` and `chdir` must stay inside the rootfs.
+- **1.13.2 — `fork#96`:** a second process image, traced like a `spawn#3` grandchild but sharing the
+  parent's memory image at the fork point.
+- **1.13.3 — channels `chan_op#97`:** the PTY band a terminal emulator hands its child. It is
+  `fd_kind`'s FDK_CHAN, which mirshi never answers today.
+- **Then:** `shm_*#71–74` and `ptrscan#98`. Read their arms before scheduling them.
+
+## 1.14.x — kernel fidelity II
+
+Bigger divergences that need a design choice, not a one-line fix:
+- **`open#7` opens what the kernel refuses.** The kernel's `ext2_open` opens only regular files; a
+  directory opens only through `AO_DIRECTORY`. mirshi passes `AO_RDONLY` to Linux `open`, which opens a
+  directory, a FIFO or a device (filed 2026-10-28 from hapi's audit: fd 3 under mirshi, -1 on the
+  kernel).
+  - The check has to happen before the open: closing an fd from the supervisor after the fact means
+    injecting a syscall, which ADR 0002 rejected.
+  - It has to work under `--root` too.
+- **timerfd semantics.**
+  - A `read#5` before expiry is 0 on the kernel and -1 under mirshi.
+  - The kernel stores 1, where mirshi stores an expiration count.
+  - The kernel re-arms a periodic timer from now, where mirshi re-arms from the old deadline.
+  - Decide which of the ADR 0015 defaults to change, with a consumer.
+- **`read#5`'s non-blocking form (a4 = 1) is ignored for real fds.** The kernel answers -2
+  (WOULD_BLOCK) or -3 (fd 0: a partial keyboard line pending). mirshi renumbers to a blocking Linux
+  `read`, so `sys_read_nb` blocks. darshana's terminal reads use it.
+- **`console_mode#110`:** a FLUSH while another process is mid-line waits for that reader on the
+  kernel, and discards at once under mirshi.
+
+## 1.15.x — the signal model
+
+- **Host-originated signals bypass the agnos model.**
+  - What happens today: a terminal Ctrl-C, a host `kill`, a SIGHUP or a SIGWINCH takes the ptrace
+    signal-delivery path and is re-injected as a real Linux signal with its real default action,
+    because the child's agnos blocked mask exists only in the supervisor (filed 2026-10-12).
+  - The consequence: a screen-owning program is killed instead of waking its teardown, and the
+    terminal is left raw.
+  - The fix maps them into `C_PENDING_SIG` and suppresses the real delivery while the agnos mask
+    blocks them.
+- **Job control and the console:** after Ctrl-Z / `fg`, mirshi does not hide a `console_mode` echo
+  again. This needs a SIGCONT handler that returns, so a real `sa_restorer` trampoline.
+
+## 1.16.x — supervisor concurrency
+
+- **Head-of-line blocking.** One single-threaded supervisor serves every child. So `sleep_ms#41`,
+  `pause#14`'s quantum, `epoll_wait#21`'s ppoll and the net band's bounded waits (up to 8 s for
+  `#48`/`#109`) stall every other child for that long. The fix is an event-driven supervisor: stop
+  scheduling instead of in-line waits.
+- **epoll.** Real child fds (stdin, a pipe end) are not watchable, which is the reserved `PIPE_BASE`
+  watchable-pipe promotion. Socket watching resolves `id & 7` to a slot, which is exact for sequential
+  servers but diverges under connect-failure churn; that needs a coordinated agnos + mirshi fix.
+- **Revisit seccomp-notify** (ADR 0005, deferred-by-data) as the per-syscall cost path once the
+  supervisor is event-driven.
+
+## 1.x — open decisions
+
+- **The hardware bands:** sound `#64–69`, block devices `#75–80`, the GPU `#82–94` (`#86` and
+  `#87` share the shm band), `fbinfo#38` / `blit#39`, and the power query `#114`. Either they stay
+  permanent ENOSYS, or a headless emulation is useful (a null sound sink, a blit to the terminal, an
+  image file as a block device). Decide per band, with a consumer.
+- **`symlink#63` under `--root`:** refused today, because a raw target is not a confinable path. It
+  needs a custom `symlinkat` that keeps the target text literal while anchoring the link path.
+- **Value assumptions** (ADR 0016/0017), each revisited when a consumer needs it:
+  - `uname.release` is `mirshi`, where the kernel writes its version.
+  - `sysinfo.procs` is a live count, where the kernel reports a high-water mark.
+  - `winsize#60` never answers -1.
+
+---
+
+## 2.0.0 — backlog: direction 2, the Linux→AGNOS "swallow"
+
+Run **Linux** binaries **on the agnos kernel**: the permanent compat layer, the mirror half of the
 mirror-shim, and a **major** bump. An entirely separate validation surface: the same translation core
 run from the other side. Per [ADR 0011](../adr/0011-mirshi-qemu-iron-boundary-discipline.md) this still
-never replaces QEMU+iron.
+never replaces QEMU+iron. It is scheduled once the 1.x line has closed the direction-1 re-sync.
 
-## Not planned (agnos-kernel-only / permanent ENOSYS)
+## Not planned (agnos-kernel-only)
 
-`mount#11` / `umount#24` / `reboot#13` / `write_boot_checkpoint#26` are agnos-**kernel** operations with
-no meaningful host-Linux translation (on agnos itself they stub or halt); mirshi returns ENOSYS by
-design. The undefined agnos# gaps (36–39, 42–44) are ABI holes, not syscalls. Neither is a milestone.
+`mount#11` / `umount#24` / `reboot#13` / `write_boot_checkpoint#26` are agnos-**kernel** operations
+with no meaningful host-Linux translation (on agnos itself they stub or halt). mirshi returns ENOSYS by
+design.

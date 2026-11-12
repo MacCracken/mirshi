@@ -1,7 +1,8 @@
 # 0014 — Signal band: supervisor-emulated pending/blocked masks + an opaque-tagged signalfd
 
-**Status**: Accepted (v1.6.0 — pause#14 / kill#16 / sigprocmask#17 / signalfd#18)
-**Date**: 2026-07-01
+**Status**: Accepted (v1.6.0 — pause#14 / kill#16 / sigprocmask#17 / signalfd#18); **amended v1.12.2** (the
+signalfd read contract and the `sigprocmask` edges — see *Amendment* below)
+**Date**: 2026-07-01 (amended 2026-11-12)
 
 ## Context
 
@@ -62,7 +63,8 @@ one-compare branch: `fd >= SIGFD_BASE` → `_sigfd_read`, which delivers the low
 `pending & watched & ~blocked` signal as an **8-byte number** into the child buffer (returning 8) and
 **then** clears the pending bit — deliver-then-consume, so a failed child-buffer write never loses a
 signal. Nothing deliverable → agnos -1 (the MVP signalfd is **non-blocking**; the caller polls, yielding
-via `pause`).
+via `pause`). ⚠ **Superseded in v1.12.2** — see *Amendment*: the `~blocked` term, the 8-byte record and
+the -1 were all wrong against the kernel.
 
 ### The `SIGFD_BASE` choice — avoiding the agnos socket-fd tag (the load-bearing lesson)
 `SIGFD_BASE = 0x20000000` (bit 29). It **must not** set bit 30, because the agnos userland tags its own
@@ -111,3 +113,25 @@ agnos userland's own fd tags is a general constraint for any future emulated fd 
   the libc off-by-one would silently desync the mask from `kill`/`signalfd`.
 - **`SIGFD_BASE = 0x40000000`** (the initial design) — rejected after it collided exactly with
   `AGNOS_SOCK_TAG`; moved to bit 29.
+
+## Amendment (v1.12.2) — the signalfd read, checked against the kernel
+
+The v1.6.0 decision above got the signalfd's read contract wrong, and darshana's 1.1.4 audit (2026-10-12)
+showed the consequence: an agnos program's signalfd **never received a signal under mirshi**. The kernel's
+`vfs_read_signalfd` (`agnos/kernel/core/vfs.cyr`) is the reference, and since v1.12.2 mirshi follows it:
+
+- **`pending & watched`, the blocked mask not consulted.** A signalfd consumer must block its signals
+  first, or they take their default action; it then reads exactly those signals, on the kernel as on
+  Linux. The `~blocked` term made the signal a program waited for the one it could never read. The
+  epoll readiness test changes the same way. `pause#14` still uses `pending & ~blocked`.
+- **The record is 4 bytes, and "nothing" is 0.** The read stores the signal number as 4 bytes and answers
+  4; it answers 0 when nothing is pending and -1 when the count is below 4. The 1..63 range is the
+  kernel's since agnos 1.57.13.
+- **Every `signalfd#18` call makes a new signalfd.** The kernel's arm ignores the fd and flags arguments,
+  so mirshi no longer updates an existing slot in place. Its slots now hold `{watched_mask, state}`; the
+  flags word was stored where the in-use marker lived, so a flags value of -1 freed the slot.
+- **`close#6` frees a signalfd's slot**, as it already did for timerfd and epoll (the v1.6.0 limit).
+- **`sigprocmask#17`** requires `set` (NULL → -1, the kernel's `is_user_range(arg2, 8)`), and a `how`
+  other than 0 or 1 stores the set verbatim. mirshi still reads `set` before writing `oldset`, so a
+  `set == oldset` alias applies the caller's set. The kernel writes `oldset` first; that difference is
+  kept deliberately, and reporting it upstream is a 1.12.3 item on the roadmap.

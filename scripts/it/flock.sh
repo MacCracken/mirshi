@@ -29,6 +29,19 @@ fn main(): i64 {
     if (sys_flock(fd1, 8) != 0) { return 8; }               # fd1 LOCK_UN -> 0
     if (sys_flock(fd2, 2 | 4) != 0) { return 9; }           # fd2 LOCK_EX|NB -> now free -> 0
     if (sys_flock(fd2, 8) != 0) { return 10; }              # fd2 LOCK_UN -> 0
+    # (3) 1.12.2: what the kernel's arm accepts — a file or a directory, fd in [0, 32) — and nothing else
+    var d = "$sbox";
+    var dfd = sys_open(d, strlen(d), 0x800);                # AO_DIRECTORY
+    if (dfd < 0) { return 11; }
+    if (sys_flock(dfd, 2) != 0) { return 12; }              # a directory locks (kernel: EXT2 DIR)
+    if (sys_flock(dfd, 8) != 0) { return 13; }
+    var pf[16];
+    if (syscall(25, &pf) != 0) { return 14; }               # pipe#25
+    if (sys_flock(load64(&pf), 2) != (0 - 1)) { return 15; }   # a pipe -> -1 (Linux would lock it)
+    if (sys_flock(0 - 1, 2) != (0 - 1)) { return 16; }      # fd < 0
+    if (sys_flock(40, 2) != (0 - 1)) { return 17; }         # fd >= 32
+    if (sys_flock(31, 2) != (0 - 1)) { return 18; }         # a closed fd
+    sys_close(dfd);
     sys_close(fd1);
     sys_close(fd2);
     var ok = "FLOCK-OK\n";
@@ -42,9 +55,9 @@ cyrius build --agnos "$sbox/fl.cyr" "$sbox/fl" >/dev/null 2>&1
 
 set +e; out="$(timeout 25 "$mirshi" "$sbox/fl" 2>/dev/null)"; rc=$?; set -e
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "FLOCK-OK"; then
-    echo "OK: getuid#15 -> 0 (always root) + flock#59 execute-in-child (two-OFD LOCK_EX contention + release)"
+    echo "OK: getuid#15 -> 0 (always root) + flock#59 execute-in-child (two-OFD LOCK_EX contention + release; dir locks, pipe/bad fd -1)"
 else
-    echo "FAIL: flock rc=$rc out='$(printf '%s' "$out" | tr '\n' '|')' (2/3=getuid!=0, 7=no-contention, 9=not-released)" >&2
+    echo "FAIL: flock rc=$rc out='$(printf '%s' "$out" | tr '\n' '|')' (2/3=getuid!=0, 7=no-contention, 9=not-released, 12=dir refused, 15=pipe locked, 16-18=bad fd accepted)" >&2
     fail=1
 fi
 

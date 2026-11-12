@@ -47,8 +47,8 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 14 | pause | EMULATE ⁴ | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
 | 15 | getuid | EMULATE ⁶ | — | info getters (v1.8.0): `getuid`/`geteuid` → **0** (always root; never the host uid) |
 | 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
-| 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip |
-| 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table); `read#5` delivers the lowest pending&watched&unblocked signal as an 8-byte number, non-blocking |
+| 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip. **v1.12.2:** `set` is required (NULL → −1, as on the kernel); `how` ≥ 2 stores the set verbatim |
+| 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table). **v1.12.2, the kernel's contract:** every call is a new signalfd (fd and flags not consulted); `read#5` stores the lowest pending & watched signal — the blocked mask not consulted — as a **4-byte** number and answers 4, 0 when nothing is pending, −1 for a count < 4; `close#6` frees the slot |
 | 19 | epoll_create | EMULATE ⁵ | — | I/O-mux (v1.7.0): a per-child epoll instance (`EPOLL_BASE+slot`), an 8-watch list of raw agnos ids |
 | 20 | epoll_ctl | EMULATE ⁵ | — | I/O-mux (v1.7.0): op 1=ADD (dedup, 8-cap), op 2=CLEAR (whole list; fd ignored) |
 | 21 | epoll_wait | EMULATE ⁵ | — | I/O-mux (v1.7.0): heterogeneous **bounded-yield** readiness — `ppoll` sockets + mask-test signalfds + clock-test timerfds; packed 12 B events; never parks |
@@ -62,22 +62,22 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 29 | getdents | EXECUTE | `getdents64` (217) | one-page scratch staged; Linux→agnos dirent repack at exit (cap 4096) |
 | 30 | unlink | EXECUTE | `unlink` (87) ¹ | path staged |
 | 31 | rename | EXECUTE | `rename` (82) ¹ | two paths staged; a4=r10 |
-| 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; **HARDLINK** (agnos has no symlink syscall) |
+| 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; a **HARDLINK** (symlinks are `symlink#63`) |
 | 33 | stat | EXECUTE | `stat` (4) ¹ | path staged; Linux 144 B → agnos 48 B repack at exit |
 | 34 | uname | EMULATE ⁶ | — | info getters (v1.8.0): synthesized agnos-native 64 B struct (4×16 = sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `len<64`→−1 |
 | 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1. **v1.11.3:** the kernel's length tiers — writes exactly 40 / 104 (+per-core user/kernel ticks at +40, host `/proc/stat`) / 200 (+BLK-tag sectors at +104, zero) / 208 (+`sched_kicks` at +200, zero) bytes |
-| 36 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
+| 36 | klug | ENOSYS | — | the kernel log ring (dmesg). Not handled yet — the 1.13.0 re-sync |
 | 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path |
-| 38–39 | *(undefined)* | ENOSYS | — | gaps in the agnos ABI mirror |
+| 38–39 | fbinfo / blit | ENOSYS | — | the framebuffer pair. A hardware band: permanent ENOSYS or a headless emulation is an open decision ([roadmap](../development/roadmap.md) 1.x) |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
-| 42 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
+| 42 | kbscan | EMULATE | — | **v1.11.0:** the raw Set-1 scancode drain, synthesized from mirshi's stdin (the tty armed raw + non-blocking on the first call; a pipe works too) — cyim's per-key channel |
 | 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) |
-| 44 | *(undefined)* | ENOSYS | — | gap in the agnos ABI mirror |
+| 44 | sched_yield | ENOSYS | — | not handled yet — the 1.13.0 re-sync |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
 | 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress |
-| 48 | sock_send | EMULATE ² | — | net band client (v1.1.0): pvm-staged `send` (`MSG_NOSIGNAL`) |
+| 48 | sock_send | EMULATE ² | — | net band client (v1.1.0): pvm-staged `send` (`MSG_NOSIGNAL`). **v1.12.2:** the ~8 s window expiring with nothing sent answers 0 (the committed count, the kernel's D6 rule), not −1 |
 | 49 | sock_recv | EMULATE ² | — | net band client (v1.1.0): **inverted EOF** (0=WOULD_BLOCK, −1=EOF) |
 | 50 | sock_close | EMULATE ² | — | net band (v1.1.0): free the slot; a LISTEN slot reaps children (v1.2.0) |
 | 51 | udp_bind | EMULATE ² | — | net band UDP (v1.3.0): bound DGRAM socket; loopback-default |
@@ -88,7 +88,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
 | 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
-| 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta |
+| 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta. **v1.12.2:** an fd that is not a file or a directory, or outside [0, 32), is −1 before the EXECUTE, as on the kernel |
 | 60 | winsize | EMULATE ⁷ | — | tty sizing (v1.9.0): `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default if no tty); the whole direction-1 graphics surface |
 | 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
 | 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
@@ -137,17 +137,18 @@ shipped in v1.6.0 (footnote ⁴).
 **supervisor-EMULATE** ([ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md)) over the
 v1.5.0 record table — no real host signals, no real host fds. Each child record carries a **pending** mask
 (`kill#16` ORs `1<<sig`, self/direct-child scope, pid 0 protected, sig 1..63) and a **blocked** mask
-(`sigprocmask#17`); a signal is deliverable iff `pending & ~blocked`. `signalfd#18` returns an opaque
-`SIGFD_BASE + slot` fd (per-child 8-slot table); a `read#5` on it delivers the lowest watched-and-deliverable
-signal as an **8-byte number** (returns 8), clearing the pending bit **after** the write (deliver-then-consume,
-so a failed write never loses the signal), else agnos −1 (non-blocking). Masks are agnos `1<<sig` (bit N =
+(`sigprocmask#17`). `signalfd#18` returns an opaque `SIGFD_BASE + slot` fd (per-child 8-slot table), a new one
+on every call. Since **v1.12.2** a `read#5` on it follows the kernel's `vfs_read_signalfd`: it takes the lowest
+signal that is pending **and watched — the blocked mask is not consulted**, because a signalfd consumer blocks
+its signals first and reads exactly those. It stores that number as **4 bytes** and answers 4, clearing the
+pending bit **after** the write (deliver-then-consume, so a failed write never loses the signal). It answers
+0 when nothing is pending (non-blocking) and −1 for a count below 4. `close#6` frees the slot. Masks are agnos `1<<sig` (bit N =
 signal N, **not** libc's `1<<(sig-1)`). `pause#14` is a **bounded yield** (returns 0; idles a 1 ms supervisor
 quantum if nothing pending) — it never blocks forever, protecting `_agnos_sock_recv_block`'s TLS/HTTP poll
 loop. `SIGFD_BASE = 0x20000000` keeps **bit 30 clear** so it never collides with the agnos userland's own
 socket-fd tag `AGNOS_SOCK_TAG = 0x40000000`. **Known limits**: `pause` head-of-line-blocks other children for
-the 1 ms quantum (the `sleep_ms#41` class); the MVP signalfd is **non-blocking-only** (a read with nothing
-pending returns −1, not a park); `sys_close` on a signalfd does **not** free its mirshi slot (bounded 8/proc,
-freed on exit). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
+the 1 ms quantum (the `sleep_ms#41` class); the signalfd is **non-blocking**, like the kernel's (a read with
+nothing pending returns 0, not a park). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
 
 ⁵ **I/O-multiplexing band (v1.7.0).** `epoll#19–21` + `timerfd#22–23` are **supervisor-EMULATE**; `pipe#25`
 is **EXECUTE-in-child** ([ADR 0015](../adr/0015-io-mux-emulated-epoll-timerfd-executed-pipe.md)). A server's
@@ -240,7 +241,8 @@ extensions, as were the **info-getters + advisory-locks band** (`getuid#15`/`una
 v1.8.0 — footnote ⁶) and **tty sizing** (`winsize#60`, v1.9.0 — footnote ⁷). **Direction 1 is now
 feature-complete**: every *defined, non-kernel-only* agnos syscall is handled. The only remaining ENOSYS rows
 are the agnos-**kernel**-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26` — permanent by
-design) and the undefined ABI gaps (#36, #38–39, #42, #44). The exec-band re-sync landed **#37 execwait + #43 spawn_path + #62 exec_redirect + #63 symlink**. What remains on the [roadmap](../development/roadmap.md) is
+design). #36 / #38–39 / #44 and the agnos numbers past #63 that mirshi does not handle yet are the
+[roadmap](../development/roadmap.md)'s 1.13 re-sync. The exec-band re-sync landed **#37 execwait + #43 spawn_path + #62 exec_redirect + #63 symlink**. What remains on the [roadmap](../development/roadmap.md) is
 the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 
 ## Known gaps (carried forward, documented not fixed)
@@ -248,8 +250,6 @@ the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 - **`getdents#29`**: records overflowing the agnos buffer are **dropped** (the agnos call
   re-reads from the saved fd offset on the next call); `d_ino` u64 is **truncated to u32**
   in the agnos dirent. Bounded to a 4096-byte scratch page per call.
-- **`link#32`**: hardlink only — agnos has **no symlink syscall**, so mirshi follows that
-  surface (mirrors the ark-v2 finding).
 - **`stat#33`**: the agnos 48 B struct carries mode/nlink/size/ino/blocks/mtime; sub-second
   mtime nsec is dropped (agnos has no nsec field).
 - **Multi-process (`spawn#3`/`waitpid#4`, ³)**: `sleep_ms#41` + blocking net I/O run in the
@@ -258,12 +258,11 @@ the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
   the host status word; a wait deadlock (self-wait / cycle) is broken to agnos −1, not diagnosed; the
   process tree is capped at `MAX_CHILDREN=16`. See [ADR 0013](../adr/0013-multiprocess-supervisor-fork-record-table.md).
 - **Signal band (`pause#14`/`signalfd#18`, ⁴)**: `pause#14`'s 1 ms yield **head-of-line-blocks** other
-  children for the quantum (the `sleep_ms#41` class); the signalfd is **non-blocking only** — a `read`
-  with nothing pending returns agnos −1 rather than parking (the poll-with-`pause` idiom is the MVP
-  contract; a blocking/level-triggered signalfd is deferred); `sys_close` on a signalfd does a real
-  (harmless) close but does **not** free the mirshi slot (bounded 8/proc, freed on exit; a `close#6`
-  intercept is a future enhancement). `SIGKILL`/`SIGSTOP` unmaskability is not special-cased (agnos
-  delivers via signalfd, not default actions). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
+  children for the quantum (the `sleep_ms#41` class); the signalfd is **non-blocking**, as on the kernel —
+  a `read` with nothing pending returns 0 (the poll-with-`pause` idiom). Host-originated signals (a
+  terminal Ctrl-C, a host `kill`) still bypass the agnos model ([roadmap](../development/roadmap.md)
+  1.15.x). `SIGKILL`/`SIGSTOP` unmaskability is not special-cased (agnos delivers via signalfd, not
+  default actions). See [ADR 0014](../adr/0014-signal-band-supervisor-emulated-masks-signalfd.md).
 - **I/O-mux band (`epoll#19–21`/`timerfd#22–23`/`pipe#25`, ⁵)**: **socket-watching is best-effort** — epoll
   resolves a watched socket by `id & 7` → conn slot, exact for sequential server flows but divergent under
   connect-failure churn (a coordinated agnos+shim fix lands later; wait-time `SLOT_FREE`-revalidated). A
@@ -281,7 +280,5 @@ the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 - **The agnos 1.57.13 band (⁸)**: `console_mode#110`'s `CM_FLUSH` discards the tty's input at once, even a line
   another process is half-way through; the kernel waits for that reader to finish its line first. A SIGKILL of
   mirshi (or any fatal signal when it is a container's PID 1) leaves a hidden echo hidden. After a job-control
-  stop the shell may restore its own tty modes, and mirshi does not hide the echo again on SIGCONT. A signalfd
-  slot is never freed by `close#6` (the signal-band gap above), so `fd_kind#111` still answers `FDK_SIGNALFD`
-  for a closed signalfd. `sock_send_dl#109` sends one chunk of at most 4096 bytes per call, like #48 (the
+  stop the shell may restore its own tty modes, and mirshi does not hide the echo again on SIGCONT. `sock_send_dl#109` sends one chunk of at most 4096 bytes per call, like #48 (the
   caller loops).
