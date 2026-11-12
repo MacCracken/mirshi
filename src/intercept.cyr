@@ -39,9 +39,10 @@ include "src/decode.cyr"
 # ----------------------------------------------------------------------------
 enum MirshiPtrace {
     SYS_PTRACE = 101;
-    SYS_PROCESS_VM_READV = 310;       # M2: read child paths / Linux structs out of child memory
-    SYS_PROCESS_VM_WRITEV = 311;      # M2: stage NUL-terminated paths / agnos structs into child memory
-    SYS_MEMFD_CREATE = 319;           # v1.5.0 spawn#3: anonymous in-memory fd for the staged child ELF
+    SYS_CLOSE_RANGE = 436;
+    SPAWN_E_NOPROC = 2;               # 1.12.3: spawn_path#43 error codes, the kernel's
+    SPAWN_E_ARGS = 6;
+    MFD_CLOEXEC = 1;                  # 1.12.3: memfd_create flag — the spawn#3 image fd closes at execveat
     PTRACE_TRACEME = 0;
     PTRACE_CONT = 7;
     PTRACE_SYSCALL = 24;              # resume + EXECUTE one (rewritten) call, stop at exit
@@ -55,7 +56,6 @@ enum MirshiPtrace {
     PTRACE_O_TRACESYSGOOD = 0x1;      # syscall-stops report SIGTRAP|0x80
     PTRACE_O_EXITKILL = 0x100000;     # SIGKILL the child if the tracer dies
     SIG_KILL = 9;
-    SIGSTOP = 19;                     # the four stopping signals that yield a ptrace group-stop;
     SIGTSTP = 20;                     # at a group-stop the supervisor suppresses them (resume with
     SIGTTIN = 21;                     # no signal) instead of re-injecting a stop it never originated
     SIGTTOU = 22;
@@ -143,6 +143,15 @@ fn _wait_any(status): i64 {
 include "src/translate.cyr"
 include "src/scratch.cyr"
 include "src/children.cyr"
+include "src/emu_core.cyr"
+include "src/band_fs.cyr"
+include "src/band_net.cyr"
+include "src/band_signals.cyr"
+include "src/band_iomux.cyr"
+include "src/band_info.cyr"
+include "src/band_kbscan.cyr"
+include "src/band_fdkind.cyr"
+include "src/band_console.cyr"
 include "src/dispatch.cyr"
 include "src/seccomp.cyr"
 include "src/limits.cyr"
@@ -158,12 +167,18 @@ var _spawn_rootpath = 0;
 # the 0.6.0 rlimits, the 0.7.1 rootfd anchor, and the M3 seccomp bound. No alloc/print: a stray
 # syscall here is a spurious pre-image trap. Each step FAIL-CLOSED (SYS_EXIT — never run with
 # confinement/bound silently off). Returns 0 on full success; never returns on a setup failure.
-fn _child_setup(bound, rootpath): i64 {
+fn _child_setup(bound, rootpath, keep): i64 {
     pt(PTRACE_TRACEME, 0, 0, 0);
     # 0.6.0 host-resource bounds: kernel-enforced rlimits (address space + fds) so a runaway/hostile
     # child can't exhaust the host. ALWAYS on and FIRST — before any seccomp filter, so prlimit64
     # needs no allowlist entry and the child can't raise them.
     apply_child_rlimits();
+    # 1.12.3 fd hygiene: the child starts with stdin/stdout/stderr and nothing else — every fd >= 3 it
+    # would inherit (whatever mirshi's own parent left open, and, for a grandchild, the supervisor's host
+    # sockets and pidfds) is closed, except `keep` (the spawn#3 memfd, or a redirect's target fd; -1 =
+    # none). BEFORE the rootfd is pinned below, so ROOTFD is the only descriptor the confined child holds
+    # that it did not open itself (ADR 0009's premise).
+    _child_close_inherited(keep);
     # 0.7.1 rootfs confinement: open the configured root as the child's anchor fd, pinned at the fixed
     # ROOTFD the dispatcher anchors every confined open#7 at. BEFORE the seccomp filter (dup3 is not
     # allowlisted), WITHOUT O_CLOEXEC (must survive exec). O_PATH keeps it inert as a data handle yet
@@ -199,15 +214,51 @@ fn _child_setup(bound, rootpath): i64 {
     return 0;
 }
 
+# Close every fd >= 3 except `keep` (-1 = keep none): close_range(2) (Linux 5.9+), else a loop. Runs in
+# the child between fork and exec, before the seccomp filter (close_range is not on the allowlist).
+fn _child_close_inherited(keep): i64 {
+    if (keep < 3) {
+        if (syscall(SYS_CLOSE_RANGE, 3, 0xFFFFFFFF, 0) == 0) { return 0; }
+    } else {
+        var r1 = 0;
+        if (keep > 3) { r1 = syscall(SYS_CLOSE_RANGE, 3, keep - 1, 0); }
+        if (r1 == 0) {
+            if (syscall(SYS_CLOSE_RANGE, keep + 1, 0xFFFFFFFF, 0) == 0) { return 0; }
+        }
+    }
+    var fd = 3;                                         # no close_range: close the fd table's span
+    while (fd < 4096) {
+        if (fd != keep) { syscall(HOST_CLOSE, fd); }
+        fd = fd + 1;
+    }
+    return 0;
+}
+
 # The root child: run the gauntlet, then load the agnos ELF from `path` via execve (returns only on
 # failure).
-fn _child_exec(path, bound, rootpath, child_argv): i64 {
-    _child_setup(bound, rootpath);          # never returns on a setup failure
+fn _child_exec(path, bound, rootpath, child_argv, keep, in_root): i64 {
+    _child_setup(bound, rootpath, keep);    # never returns on a setup failure
     # child_argv (v1.10.0): the NULL-terminated [path, args…] vector built by main() on the
     # supervisor heap pre-fork (inherited across the fork). Before this the child ran with a
     # hard-coded [path, NULL] and lost every argument past the ELF.
     var envp[8];
     store64(&envp, 0);
+    if (in_root == 1) {
+        # 1.12.3: a path an agnos program asked to run (execwait#37 / spawn_path#43) under --root is
+        # resolved INSIDE the root — openat2(ROOTFD, path, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS), the
+        # resolution open#7 uses — and executed from that fd. Until 1.12.3 it was execve'd as a host path.
+        var how[24];
+        store64(&how + 0, O_PATH | O_CLOEXEC);
+        store64(&how + 8, 0);
+        store64(&how + 16, OPEN_RESOLVE);
+        var xfd = syscall(SYS_OPENAT2, ROOTFD, path, &how, OPEN_HOW_SIZE);
+        if (xfd < 0) { syscall(SYS_EXIT, EXECVE_FAILED); return EXECVE_FAILED; }
+        var empty[8];
+        store8(&empty, 0);
+        sys_execveat(xfd, &empty, child_argv, &envp, AT_EMPTY_PATH);
+        syscall(SYS_EXIT, EXECVE_FAILED);
+        return EXECVE_FAILED;
+    }
     sys_execve(path, child_argv, &envp);
     syscall(SYS_EXIT, EXECVE_FAILED);
     return EXECVE_FAILED;
@@ -219,7 +270,7 @@ fn _child_exec(path, bound, rootpath, child_argv): i64 {
 # the mirshi binary (NOT cloned from the agnos parent), so _child_setup re-establishes ROOTFD + the
 # bound (fed _spawn_rootpath / _spawn_bound by the caller). execveat returns only on failure.
 fn _child_exec_memfd(memfd, bound, rootpath): i64 {
-    _child_setup(bound, rootpath);          # never returns on a setup failure
+    _child_setup(bound, rootpath, memfd);   # never returns on a setup failure; keeps the memfd
     var empty[8];
     store8(&empty, 0);                      # "" — AT_EMPTY_PATH operates on the fd itself
     var argv[8];
@@ -270,7 +321,7 @@ fn _do_spawn(pid, regs, rec): i64 {
     var elf_size = decode_arg(regs, 1);
     var buf = _spawn_elf_buffer();
     if (_spawn_read_elf(pid, elf_addr, elf_size, buf) < 0) { return _net_emu(pid, regs, 0 - 1); }
-    var memfd = sys_memfd_create("mirshi-spawn", 0);
+    var memfd = sys_memfd_create("mirshi-spawn", MFD_CLOEXEC);   # 1.12.3: the image never sees its own fd
     if (memfd < 0) { return _net_emu(pid, regs, 0 - 1); }
     # Stage the ELF image into the memfd (loop on short writes).
     var written = 0;
@@ -338,8 +389,8 @@ fn _do_waitpid(pid, regs, rec): i64 {
 # 127 + NUL + slack; 65*8 = 64 tokens + the NULL terminator. Both inherited across the spawn fork.
 var _ew_cl = 0;
 var _ew_argv = 0;
-fn _ew_cl_buf(): i64 { if (_ew_cl == 0) { _ew_cl = alloc(129); } return _ew_cl; }
-fn _ew_argv_buf(): i64 { if (_ew_argv == 0) { _ew_argv = alloc(65 * 8); } return _ew_argv; }
+fn _ew_cl_buf(): i64 { if (_ew_cl == 0) { _ew_cl = alloc(1032); } return _ew_cl; }   # 1.12.3: room for a 1024 B argv blob
+fn _ew_argv_buf(): i64 { if (_ew_argv == 0) { _ew_argv = alloc(17 * 8); } return _ew_argv; }   # 16 entries + NULL
 
 # exec_redirect#62 one-shot arm state: the next _spawn_from_path steals the caller's dst_fd (pidfd_getfd)
 # and dup3's it onto src_fd in the grandchild, then clears armed. Global — mirshi is single-threaded + the
@@ -358,29 +409,50 @@ var _redir_dst = 0;
 # error: table full, empty / oversized cmdline (agnos caps at 127), bad read, empty path, fork failure.
 # Consumed by execwait#37 (which then parks) + spawn_path#43 (which returns the pid).
 fn _spawn_from_path(pid, regs, rec): i64 {
-    if (_child_count() >= MAX_CHILDREN) { return 0; }
+    # Returns the new child's record, or a negative SPAWN_E_* code (1.12.3: the kernel's a2 = len | flags
+    # decoding — bit 16 ARGV blob, bit 17 CLEANFD — and its checks; mirshi used to take a2 as the length).
+    if (_child_count() >= MAX_CHILDREN) { return 0 - SPAWN_E_NOPROC; }
     var cl_addr = decode_arg(regs, 0);
-    var cl_len = decode_arg(regs, 1);
-    if (cl_len < 1) { return 0; }
-    if (cl_len > 127) { return 0; }                                # agnos caps the cmdline at 127
+    var a2 = decode_arg(regs, 1);
+    if (a2 < 0) { return 0 - SPAWN_E_ARGS; }
+    var fl = a2 >> 16;
+    if (fl > 3) { return 0 - SPAWN_E_ARGS; }
+    var argv_form = fl & 1;
+    var cl_len = a2 & 0xFFFF;
+    if (argv_form == 0) {
+        if (cl_len < 1) { return 0 - SPAWN_E_ARGS; }
+        if (cl_len > 127) { return 0 - SPAWN_E_ARGS; }                     # SPAWN_LINE_MAX
+    } else {
+        if (cl_len < 2) { return 0 - SPAWN_E_ARGS; }
+        if (cl_len > 1024) { return 0 - SPAWN_E_ARGS; }                    # SPAWN_ARGV_MAX
+    }
     var cl = _ew_cl_buf();
-    if (_spawn_read_elf(pid, cl_addr, cl_len, cl) < 0) { return 0; }
+    if (_spawn_read_elf(pid, cl_addr, cl_len, cl) < 0) { return 0 - SPAWN_E_ARGS; }
     store8(cl + cl_len, 0);
-    # Tokenize on spaces IN PLACE (space -> NUL), building the NULL-terminated argv vector: [path, args…].
     var av = _ew_argv_buf();
     var nfwd = 0;
     var i = 0;
-    while (i < cl_len) {
-        while (i < cl_len) { if (load8(cl + i) != 32) { break; } i = i + 1; }   # skip leading spaces
-        if (i >= cl_len) { break; }
-        if (nfwd >= 64) { break; }                                             # token cap
-        store64(av + nfwd * 8, cl + i);                                        # token start
-        nfwd = nfwd + 1;
-        while (i < cl_len) { if (load8(cl + i) == 32) { break; } i = i + 1; }   # to the next space
-        if (i < cl_len) { store8(cl + i, 0); i = i + 1; }                       # terminate the token
+    if (argv_form == 1) {
+        if (spawn_blob_ok(cl, cl_len) < 1) { return 0 - SPAWN_E_ARGS; }
+        while (i < cl_len) {                                                # one entry per NUL
+            store64(av + nfwd * 8, cl + i);
+            nfwd = nfwd + 1;
+            while (i < cl_len) { if (load8(cl + i) == 0) { break; } i = i + 1; }
+            i = i + 1;
+        }
+    } else {
+        if (spawn_line_tokens(cl, cl_len) > 16) { return 0 - SPAWN_E_ARGS; }   # SPAWN_ARGC_MAX: refused, never cut
+        while (i < cl_len) {                                                # tokenize on spaces in place
+            while (i < cl_len) { if (load8(cl + i) != 32) { break; } i = i + 1; }
+            if (i >= cl_len) { break; }
+            store64(av + nfwd * 8, cl + i);
+            nfwd = nfwd + 1;
+            while (i < cl_len) { if (load8(cl + i) == 32) { break; } i = i + 1; }
+            if (i < cl_len) { store8(cl + i, 0); i = i + 1; }
+        }
     }
-    store64(av + nfwd * 8, 0);                                                  # NULL-terminate argv
-    if (nfwd < 1) { return 0; }                                                 # empty / all-spaces
+    store64(av + nfwd * 8, 0);
+    if (nfwd < 1) { return 0 - SPAWN_E_ARGS; }
     var path = load64(av + 0);                                                  # argv[0] = the ELF path token
     # exec_redirect#62 (one-shot): if armed, STEAL the caller's dst_fd via pidfd_getfd (works for files AND
     # pipes, unlike /proc) BEFORE the fork, so the grandchild inherits it + dup3's it onto src_fd. mirshi's
@@ -401,8 +473,15 @@ fn _spawn_from_path(pid, regs, rec): i64 {
     }
     if (cpid == 0) {
         # grandchild: apply the redirect (dup the stolen fd onto src_fd) BEFORE seccomp/execve.
-        if (stolen >= 0) { syscall(HOST_DUP3, stolen, _redir_src, 0); syscall(HOST_CLOSE, stolen); }
-        _child_exec(path, _spawn_bound, _spawn_rootpath, av);
+        var keepfd = 0 - 1;
+        if (stolen >= 0) {
+            syscall(HOST_DUP3, stolen, _redir_src, 0);
+            syscall(HOST_CLOSE, stolen);
+            keepfd = _redir_src;                         # the redirect's target survives the fd cleanup
+        }
+        var inroot = 0;
+        if (_spawn_rootpath != 0) { inroot = 1; }
+        _child_exec(path, _spawn_bound, _spawn_rootpath, av, keepfd, inroot);
         syscall(SYS_EXIT, EXECVE_FAILED);
         return EXECVE_FAILED;
     }
@@ -420,7 +499,7 @@ fn _spawn_from_path(pid, regs, rec): i64 {
 # `_wake_waiters` injects the child's exit code into rax at the caller's resume. Loop-level op (enr==37).
 fn _do_execwait(pid, regs, rec): i64 {
     var crec = _spawn_from_path(pid, regs, rec);
-    if (crec == 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (crec <= 0) { return _net_emu(pid, regs, 0 - 1); }
     # PARK the caller on the coined pid until the child exits — exactly _do_waitpid's park.
     store64(regs + REG_ORIG_RAX, 0 - 1);
     pt(PTRACE_SETREGS, pid, 0, regs);
@@ -435,6 +514,7 @@ fn _do_execwait(pid, regs, rec): i64 {
 # (enr==43), the async sibling of execwait#37.
 fn _do_spawn_path(pid, regs, rec): i64 {
     var crec = _spawn_from_path(pid, regs, rec);
+    if (crec < 0) { return _net_emu(pid, regs, crec); }               # -SPAWN_E_*, as the kernel answers
     if (crec == 0) { return _net_emu(pid, regs, 0 - 1); }
     return _net_emu(pid, regs, load64(crec + C_AGNOS_PID));
 }
@@ -455,6 +535,29 @@ fn _do_exec_redirect(pid, regs): i64 {
 # carry, mark it RUNNING, and PTRACE_SYSCALL it — the waiter resumes to its waitpid exit stop where
 # the loop injects the code into rax. Fan-out (many waiters on one pid all wake). Once claimed, the
 # target's slot is freed (its host zombie was already reaped by the wait4(-1) that drove us here).
+# 1.12.3: once `dead` has died, no one can wait for its children: free every EXITED record whose parent
+# is `dead`, and `dead`'s own record when its parent is gone too (and no parked waiter claimed it).
+# Without this, orphaned EXITED records held their slots for the rest of the run.
+fn _reap_orphans(dead): i64 {
+    var tbl = _child_tbl();
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        var b = tbl + i * CHILD_REC_SIZE;
+        if (load64(b + C_STATE) == CS_EXITED) {
+            if (load64(b + C_PARENT) == dead) { _child_free(b); }
+        }
+        i = i + 1;
+    }
+    var d = _child_find_by_agnos(dead);
+    if (d == 0) { return 0; }
+    if (load64(d + C_STATE) != CS_EXITED) { return 0; }
+    var par = _child_find_by_agnos(load64(d + C_PARENT));
+    var gone = 0;
+    if (par == 0) { gone = 1; } else { if (load64(par + C_STATE) == CS_EXITED) { gone = 1; } }
+    if (gone == 1) { _child_free(d); }
+    return 0;
+}
+
 fn _wake_waiters(target): i64 {
     var t = _child_find_by_agnos(target);
     if (t == 0) { return 0; }
@@ -509,7 +612,9 @@ fn _do_kill(pid, regs, rec): i64 {
     var tgt_pid = decode_arg(regs, 0);
     var sig = decode_arg(regs, 1);
     if (tgt_pid == 0) { return _net_emu(pid, regs, 0 - 1); }          # pid 0 protected (no broadcast)
-    if (_sig_valid(sig) != 1) { return _net_emu(pid, regs, 0 - 1); }  # bad signal number
+    var probe = 0;
+    if (sig == 0) { probe = 1; }                                     # 1.12.3: sig 0 only checks the target
+    if (probe == 0) { if (_sig_valid(sig) != 1) { return _net_emu(pid, regs, 0 - 1); } }   # bad signal number
     var t = _child_find_by_agnos(tgt_pid);
     if (t == 0) { return _net_emu(pid, regs, 0 - 1); }               # unknown pid
     # Scope = self OR a DIRECT child of the caller (agnos "self/child only").
@@ -518,6 +623,7 @@ fn _do_kill(pid, regs, rec): i64 {
     if (t == rec) { ok = 1; }                                        # self
     if (load64(t + C_PARENT) == caller) { ok = 1; }                  # direct child
     if (ok == 0) { return _net_emu(pid, regs, 0 - 1); }             # not self/child -> denied
+    if (probe == 1) { return _net_emu(pid, regs, 0); }               # authorized: 0, nothing posted
     store64(t + C_PENDING_SIG, load64(t + C_PENDING_SIG) | _sig_bit(sig));   # set the pending bit
     return _net_emu(pid, regs, 0);
 }
@@ -692,15 +798,19 @@ fn _trace_run(root_pid): i64 {
                 store64(rec + C_EXIT_CODE, WEXITSTATUS(st));   # incl. exit#0 -> exit_group
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return WEXITSTATUS(st); }   # ROOT -> supervisor exit
+                _child_release(rec);                           # 1.12.3: close its sockets, free its slots
                 _cm_on_death(load64(rec + C_AGNOS_PID));       # 1.12.1: a console_mode#110 holder's mode dies with it
                 _wake_waiters(load64(rec + C_AGNOS_PID));      # release any waitpid#4 parkers on it
+                _reap_orphans(load64(rec + C_AGNOS_PID));      # 1.12.3: records no one can wait for
             }
             if (WIFSIGNALED(st) == 1) {
                 store64(rec + C_EXIT_CODE, 0 - 1);   # killed by signal -> agnos -1 (waitpid#4 sees -1)
                 store64(rec + C_STATE, CS_EXITED);
                 if (load64(rec + C_AGNOS_PID) == 1) { return 128 + WTERMSIG(st); }
+                _child_release(rec);
                 _cm_on_death(load64(rec + C_AGNOS_PID));
                 _wake_waiters(load64(rec + C_AGNOS_PID));
+                _reap_orphans(load64(rec + C_AGNOS_PID));
             }
             if (WIFSTOPPED(st) == 1) {
                 if (load64(rec + C_NEEDS_ATTACH) == 1) {
@@ -718,7 +828,9 @@ fn _trace_run(root_pid): i64 {
                     if (load64(rec + C_AT_ENTRY) == 1) {
                         # Syscall-ENTER: read regs, classify, rewrite for the kernel.
                         _cur_rec = rec;   # BITE 3: the net-table accessor _net_tbl() reads this
-                        pt(PTRACE_GETREGS, wpid, 0, regs);
+                        # 1.12.3: a child killed between wait4 and here has no registers to read; skip the
+                        # stop (the next wait4 reports its death) rather than dispatch stale ones.
+                        if (pt(PTRACE_GETREGS, wpid, 0, regs) < 0) { continue; }
                         var enr = decode_nr(regs);
                         store64(rec + C_AGNOS_NR, enr);
                         # spawn#3 + waitpid#4 + execwait#37 are SUPERVISOR-CONTROL ops (fork a new tracee
@@ -770,17 +882,19 @@ fn _trace_run(root_pid): i64 {
                         _m2_out_ptr = load64(rec + C_M2_OUT_PTR);
                         _m2_out_cap = load64(rec + C_M2_OUT_CAP);
                         _m2_scratch = load64(rec + C_M2_SCRATCH);
-                        pt(PTRACE_PEEKUSER, wpid, REG_RAX, raxbuf);
-                        var raw = load64(raxbuf);
-                        var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
-                        if (load64(rec + C_STRAT) == STRAT_EXECUTE) {
-                            # fs_exit_return maps the return AND, for stat/getdents, repacks the
-                            # Linux output struct into the child's saved buffer — a child-MEMORY
-                            # write, independent of the rax write-back conditionally done below.
-                            agret = fs_exit_return(wpid, load64(rec + C_AGNOS_NR), raw);
-                        }
-                        if (agret != raw) {
-                            pt(PTRACE_POKEUSER, wpid, REG_RAX, agret);
+                        if (load64(rec + C_STRAT) != STRAT_EMULATE_DONE) {   # 1.12.3: rax already set at enter
+                            pt(PTRACE_PEEKUSER, wpid, REG_RAX, raxbuf);
+                            var raw = load64(raxbuf);
+                            var agret = _xlat_emu_ret;           # EMULATE / ENOSYS: supervisor-computed
+                            if (load64(rec + C_STRAT) == STRAT_EXECUTE) {
+                                # fs_exit_return maps the return AND, for stat/getdents, repacks the
+                                # Linux output struct into the child's saved buffer — a child-MEMORY
+                                # write, independent of the rax write-back conditionally done below.
+                                agret = fs_exit_return(wpid, load64(rec + C_AGNOS_NR), raw);
+                            }
+                            if (agret != raw) {
+                                pt(PTRACE_POKEUSER, wpid, REG_RAX, agret);
+                            }
                         }
                         store64(rec + C_AT_ENTRY, 1);
                     }
@@ -809,7 +923,16 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
     # (SYSEMU) executes nothing, so the child's paths never reach the kernel.
     var rp = rootpath;
     if (selftest == 1) { rp = 0; }
-    if (rp != 0) { _confine_active = 1; }
+    if (rp != 0) {
+        _confine_active = 1;
+        # 1.12.3: the supervisor's own root anchor, for the confined path ops it now performs itself
+        # (dispatch.cyr _cf_*). O_CLOEXEC: no child ever inherits it.
+        _sup_rootfd = syscall(HOST_OPEN, rp, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+        if (_sup_rootfd < 0) {
+            _emit(2, "mirshi: --root open failed — refusing to run unconfined\n");
+            return BOUND_FAILED;
+        }
+    }
     # Net band (v1.1.0): the egress policy is enforced in the SUPERVISOR (run mode only —
     # selftest translates nothing). The parsed allow-list buffer lives in the supervisor
     # heap (alloc'd by main before fork); stash the pointer + count for the net handlers.
@@ -836,7 +959,7 @@ fn intercept_run(path, selftest, bound, rootpath, net_active, net_entries, net_c
         return 1;
     }
     if (pid == 0) {
-        _child_exec(path, b, rp, child_argv);   # never returns on success
+        _child_exec(path, b, rp, child_argv, 0 - 1, 0);   # the operator's own target: a host path
         return EXECVE_FAILED;
     }
     if (selftest == 1) { return _trace_log(pid); }

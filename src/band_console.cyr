@@ -1,0 +1,217 @@
+# band_console.cyr — split out of src/dispatch.cyr in 1.12.3 (a pure move; included in order by src/intercept.cyr).
+
+# ============================================================================
+# console_mode#110(set, clear) -> the console's PREVIOUS flags / -1 (1.12.1, agnos 1.57.13).
+#
+# The agnos console's mode is one global cell plus its HOLDER — the process that last set a mode bit.
+# The mode applies to WHOEVER reads the console, from ANY console fd, and it DIES WITH ITS HOLDER on
+# every death path, so a program killed with echo off never leaves the console dark. Under mirshi the
+# console is the host terminal on mirshi's stdio — the first of fds 0 / 1 / 2 that is a tty, as for
+# winsize#60 — which every child inherits (fd_kind#111 answers CONSOLE for each of them), so:
+#   CM_NOECHO   clears ECHO | ECHONL in the tty's c_lflag (darshana's tty_echo_off; Linux n_tty with
+#               both clear echoes nothing, a newline included). Clearing it puts back the bits it found.
+#   CM_FLUSH    is tcflush(TCIFLUSH): TCFLSH alone, or TCSETSF when the same call changes the echo
+#               (NOECHO | FLUSH in one call is TCSETSF, as on Linux).
+#   CM_NOSERIAL is the caller's own cell in its record (C_CON_NOSER). mirshi has no COM1 mirror, so it
+#               changes no output; it is reported back in the previous flags, as the kernel does.
+# With no tty on any of the three there is no echo to hide and no typeahead to discard, so the mode is
+# tracked and reported but nothing changes — a scripted `printf 'secret\n' | mirshi prog >log 2>&1`
+# keeps its input. (With stdin piped and stderr on a terminal, the terminal IS the console: its echo is
+# hidden and its typeahead flushed, while the piped stdin is a different file and keeps its bytes.)
+# While kbscan#42 has the tty raw, raw mode already echoes nothing, so the echo bits are left to it.
+# mirshi's own death: the first hide installs HUP / INT / QUIT / TERM handlers that put the tty back
+# and re-raise, so a Ctrl-C at a hidden prompt (ISIG stays on: NOECHO clears only the echo bits) or a
+# kill of mirshi still leaves the terminal echoing. See _cm_arm_signals.
+# Divergences: a FLUSH while another process is mid-line discards that line's keys at once (the kernel
+# waits for that reader to finish its line first); after a job-control stop the shell may restore its
+# own tty modes, and mirshi does not hide the echo again on SIGCONT.
+# ============================================================================
+enum MirshiConsole {
+    TCSETSF_CM = 0x5404;        # ioctl: drain output, FLUSH pending input, then set termios
+    TCFLSH_CM = 0x540B;         # ioctl: tcflush
+    TCIFLUSH_CM = 0;            # tcflush queue selector: input
+    CM_ECHO_BITS = 0x48;        # c_lflag ECHO (0x8) | ECHONL (0x40)
+    SYS_RT_SIGACTION_CM = 13;   # rt_sigaction(sig, act, oldact, sigsetsize = 8)
+    SA_RESTORER_CM = 0x04000000;    # x86_64 refuses to deliver to a handler without one (never used here)
+    SA_RESETHAND_CM = 0x80000000;   # the disposition is SIG_DFL again on entry: the re-raise ends mirshi
+    SA_NODEFER_CM = 0x40000000;     # ...and the signal is not blocked in the handler, so it lands at once
+}
+var _cm_mode = 0;               # the console's stored mode (CM_NOECHO or 0); in force only while its holder lives
+var _cm_holder = 0;             # agnos pid of the process that last SET a mode bit; 0 = none
+var _cm_applied = 0;            # 1 = mirshi cleared CM_ECHO_BITS on the host tty and owes them back
+var _cm_saved_echo = 0;         # the CM_ECHO_BITS the tty had when mirshi cleared them
+var _cm_tio = 0;                # heap[64]: termios scratch
+var _cm_fd = 0 - 2;             # the console tty among mirshi's fds 0/1/2: -2 = not looked for yet, -1 = none
+var _cm_sig_armed = 0;          # 1 once _cm_arm_signals has run
+var _cm_sig_tio = 0;            # heap[64]: the signal handlers' own termios scratch (never the main path's)
+
+# The console's EFFECTIVE mode (the kernel's kbd_mode_now): the stored mode while its holder is LIVE —
+# running or parked in waitpid#4 — else 0. A holder that exited, or whose record is gone, holds nothing.
+fn _cm_effective(): i64 {
+    if (_cm_mode == 0) { return 0; }
+    if (_cm_holder <= 0) { return 0; }
+    var h = _child_find_by_agnos(_cm_holder);
+    if (h == 0) { return 0; }
+    var s = load64(h + C_STATE);
+    if (s == CS_RUNNING) { return _cm_mode; }
+    if (s == CS_BLOCKED) { return _cm_mode; }
+    return 0;
+}
+
+# The console tty fd: the first of mirshi's fds 0 / 1 / 2 on which TCGETS works, or -1. Looked for once —
+# mirshi's own stdio never changes under it. When fd 0 is a tty it is the one, so kbscan#42's raw mode
+# (always on fd 0) and this agree on which terminal they share.
+fn _cm_tty_fd(): i64 {
+    if (_cm_fd != (0 - 2)) { return _cm_fd; }
+    if (_cm_tio == 0) { _cm_tio = alloc(64); }
+    _cm_fd = 0 - 1;
+    var fd = 0;
+    while (fd < 3) {
+        if (syscall(SYS_IOCTL, fd, TCGETS_KB, _cm_tio) == 0) { _cm_fd = fd; fd = 3; }
+        else { fd = fd + 1; }
+    }
+    return _cm_fd;
+}
+
+# Put back what mirshi changed on the terminal — kbscan#42's raw mode and a hidden echo — from inside a
+# signal handler: syscalls only, on the handlers' own buffer. kbscan's first: its saved termios is a
+# hidden one when NOECHO came first, and the echo bits then go back on top of it.
+fn _cm_sig_restore(): i64 {
+    if (_kb_raw_state == 1) {
+        if (_kb_saved_tio != 0) { syscall(SYS_IOCTL, 0, TCSETS_KB, _kb_saved_tio); }
+    }
+    if (_cm_applied == 1) {
+        if (_cm_fd >= 0) {
+            if (syscall(SYS_IOCTL, _cm_fd, TCGETS_KB, _cm_sig_tio) == 0) {
+                store32(_cm_sig_tio + 12, (load32(_cm_sig_tio + 12) & (0 - 1 - CM_ECHO_BITS)) | _cm_saved_echo);
+                syscall(SYS_IOCTL, _cm_fd, TCSETS_KB, _cm_sig_tio);
+            }
+        }
+    }
+    return 0;
+}
+
+# A fatal signal reached mirshi while it owed the terminal its echo: give it back, then die of the same
+# signal (SA_RESETHAND made it SIG_DFL), so the parent sees exactly the status it saw before 1.12.1. The
+# exit_group is only a floor in case the signal is ignored after all; the handler never returns, which
+# is why sa_restorer can be any address.
+fn _cm_die(sig): i64 {
+    _cm_sig_restore();
+    syscall(SYS_KILL, syscall(SYS_GETPID), sig);
+    syscall(SYS_EXIT_GROUP, 128 + sig);
+    return 0;
+}
+fn _cm_on_sighup(): i64 { return _cm_die(1); }
+fn _cm_on_sigint(): i64 { return _cm_die(2); }
+fn _cm_on_sigquit(): i64 { return _cm_die(3); }
+fn _cm_on_sigterm(): i64 { return _cm_die(15); }
+
+# Install handler `h` for `sig`, but only over SIG_DFL: a signal mirshi's parent set to SIG_IGN (nohup, a
+# background job) stays ignored, and one with a handler cannot be (handlers reset at exec).
+fn _cm_arm_one(sig, h): i64 {
+    var a[32];                                     # struct sigaction {handler; flags; restorer; mask}
+    var i = 0;
+    while (i < 32) { store8(&a + i, 0); i = i + 1; }
+    if (syscall(SYS_RT_SIGACTION_CM, sig, 0, &a, 8) != 0) { return 0; }
+    if (load64(&a) != 0) { return 0; }             # not SIG_DFL: leave the parent's choice alone
+    store64(&a + 0, h);
+    store64(&a + 8, SA_RESTORER_CM | SA_RESETHAND_CM | SA_NODEFER_CM);
+    store64(&a + 16, h);
+    store64(&a + 24, 0);
+    syscall(SYS_RT_SIGACTION_CM, sig, &a, 0, 8);
+    return 0;
+}
+
+# Arm the handlers once, the first time mirshi hides the echo: until then mirshi owes the terminal
+# nothing and its signal behaviour is exactly what it was. As a container's PID 1 the kernel ignores
+# default-action signals sent to mirshi; a handler would change that (Ctrl-C under `docker run -it`
+# would start ending the run), so there they are left alone.
+fn _cm_arm_signals(): i64 {
+    if (_cm_sig_armed == 1) { return 0; }
+    _cm_sig_armed = 1;
+    if (syscall(SYS_GETPID) == 1) { return 0; }
+    _cm_sig_tio = alloc(64);
+    _cm_arm_one(1, &_cm_on_sighup);
+    _cm_arm_one(2, &_cm_on_sigint);
+    _cm_arm_one(3, &_cm_on_sigquit);
+    _cm_arm_one(15, &_cm_on_sigterm);
+    return 0;
+}
+
+# Make the console tty match the console mode `mode` (echo hidden iff CM_NOECHO), flushing its input
+# when `flush` is 1. Idempotent, so it also heals a tty left hidden by a holder whose death was missed.
+fn _cm_sync_tty(mode, flush): i64 {
+    var cfd = _cm_tty_fd();
+    if (cfd < 0) { return 0; }                                        # no tty: nothing to hide or flush
+    if (syscall(SYS_IOCTL, cfd, TCGETS_KB, _cm_tio) != 0) { return 0; }
+    var change = 0;
+    if (_kb_raw_state != 1) {                                         # raw mode owns the echo bits
+        var lf = load32(_cm_tio + 12);                                # c_lflag @12
+        if ((mode & CM_NOECHO) != 0) {
+            if (_cm_applied == 0) {
+                _cm_arm_signals();                                    # before the tty owes anything
+                _cm_saved_echo = lf & CM_ECHO_BITS;
+                _cm_applied = 1;
+                store32(_cm_tio + 12, lf & (0 - 1 - CM_ECHO_BITS));
+                change = 1;
+            }
+        } else {
+            if (_cm_applied == 1) {
+                _cm_applied = 0;
+                store32(_cm_tio + 12, (lf & (0 - 1 - CM_ECHO_BITS)) | _cm_saved_echo);
+                change = 1;
+            }
+        }
+    }
+    if (change == 1) {
+        if (flush == 1) { return syscall(SYS_IOCTL, cfd, TCSETSF_CM, _cm_tio); }
+        return syscall(SYS_IOCTL, cfd, TCSETS_KB, _cm_tio);
+    }
+    if (flush == 1) { return syscall(SYS_IOCTL, cfd, TCFLSH_CM, TCIFLUSH_CM); }
+    return 0;
+}
+
+fn _do_console_mode(pid, regs): i64 {
+    var set = decode_arg(regs, 0);
+    var clear = decode_arg(regs, 1);
+    if (cm_args_ok(set, clear) == 0) { return _net_emu(pid, regs, 0 - 1); }   # nothing changed
+    var prev = _cm_effective();
+    var next = cm_mode_next(prev, set, clear);
+    _cm_mode = next;
+    if (next == 0) {
+        _cm_holder = 0;
+    } else {
+        if ((set & CM_NOECHO) != 0) { _cm_holder = load64(_cur_rec + C_AGNOS_PID); }
+    }
+    var fl = 0;
+    if ((set & CM_FLUSH) != 0) { fl = 1; }
+    _cm_sync_tty(next, fl);
+    var ns = load64(_cur_rec + C_CON_NOSER);
+    store64(_cur_rec + C_CON_NOSER, cm_noser_next(ns, set, clear));
+    var r = prev;
+    if (ns != 0) { r = r | CM_NOSERIAL; }
+    return _net_emu(pid, regs, r);
+}
+
+# A child died (any death path): if it held the console's mode, the mode dies with it and the tty
+# echoes again (the kernel's kbd_line_release_pid). Called from the trace loop beside _wake_waiters.
+fn _cm_on_death(apid): i64 {
+    if (_cm_holder != apid) { return 0; }
+    _cm_mode = 0;
+    _cm_holder = 0;
+    _cm_sync_tty(0, 0);
+    return 0;
+}
+
+# Give the tty its echo back at mirshi exit if a mode is still hidden (the root held it, or the run was
+# torn down). Called from main AFTER _kbscan_restore_termios: when NOECHO came before kbscan armed raw,
+# kbscan's saved termios is a hidden one, and this puts the echo bits back on top of it.
+fn _cm_restore_termios(): i64 {
+    if (_cm_applied == 0) { return 0; }
+    if (_cm_fd < 0) { return 0; }
+    if (syscall(SYS_IOCTL, _cm_fd, TCGETS_KB, _cm_tio) != 0) { return 0; }
+    store32(_cm_tio + 12, (load32(_cm_tio + 12) & (0 - 1 - CM_ECHO_BITS)) | _cm_saved_echo);
+    syscall(SYS_IOCTL, _cm_fd, TCSETS_KB, _cm_tio);
+    _cm_applied = 0;
+    return 0;
+}

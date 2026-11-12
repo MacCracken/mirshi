@@ -64,5 +64,50 @@ else
     fail=1
 fi
 
+# 1.12.3: spawn_path#43's SPAWN_F_ARGV form (the cyrius stdlib's exec_* path): a NUL-separated argv blob,
+# an argument with a space kept whole. The child exits with argc; bad blobs and flags are -6 (SPAWN_E_ARGS).
+cat > "$sbox/argc_child.cyr" <<'EOF'
+include "lib/syscalls.cyr"
+fn main(): i64 { args_init(); return argc(); }
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/argc_child.cyr" "$sbox/argc_child" >/dev/null 2>&1 || { echo "FAIL: argc_child did not build" >&2; exit 1; }
+cat > "$sbox/argv_parent.cyr" <<EOF
+include "lib/syscalls.cyr"
+fn main(): i64 {
+    var path = "$sbox/argc_child";
+    var pl = strlen(path);
+    var blob = alloc(512);
+    var i = 0;
+    while (i < pl) { store8(blob + i, load8(path + i)); i = i + 1; }
+    store8(blob + pl, 0);
+    var a1 = "one two";                                   # one argument containing a space
+    var j = 0;
+    while (j < 7) { store8(blob + pl + 1 + j, load8(a1 + j)); j = j + 1; }
+    store8(blob + pl + 8, 0);
+    store8(blob + pl + 9, 120);                           # "x"
+    store8(blob + pl + 10, 0);
+    var blen = pl + 11;                                   # three entries
+    var c = syscall(43, blob, blen | 0x10000, 0, 0);
+    if (c < 0) { return 30; }
+    if (sys_waitpid(c) != 3) { return 31; }               # argc 3: the spaced argument stayed one
+    if (syscall(43, blob, (blen - 1) | 0x10000, 0, 0) != (0 - 6)) { return 32; }   # no final NUL
+    if (syscall(43, blob, blen | 0x40000, 0, 0) != (0 - 6)) { return 33; }         # unknown flag bit
+    if (syscall(43, blob, 1 | 0x10000, 0, 0) != (0 - 6)) { return 34; }            # blob shorter than 2
+    syscall(1, 1, "ARGV-FORM-OK\n", 13);
+    return 0;
+}
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/argv_parent.cyr" "$sbox/argv_parent" >/dev/null 2>&1 || { echo "FAIL: argv_parent did not build" >&2; exit 1; }
+set +e; aout="$(timeout 25 "$mirshi" "$sbox/argv_parent" 2>/dev/null)"; arc=$?; set -e
+if [ "$arc" -eq 0 ] && printf '%s' "$aout" | grep -q ARGV-FORM-OK; then
+    echo "OK: spawn_path#43 SPAWN_F_ARGV — a 3-entry blob gives argc 3; bad blob / flags / length answer -6"
+else
+    echo "FAIL: spawn_path#43 argv form rc=$arc (30/31 = the blob did not run as 3 args, 32-34 = not refused)" >&2; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "spawn: FAILED" >&2; exit 1; fi
 echo "OK: spawn — spawn#3 in-memory ELF -> traced grandchild (parent + child both run)"

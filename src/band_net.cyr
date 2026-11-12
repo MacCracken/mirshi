@@ -1,0 +1,690 @@
+# band_net.cyr — split out of src/dispatch.cyr in 1.12.3 (a pure move; included in order by src/intercept.cyr).
+
+# --- Net band (v1.1.0) — supervisor-EMULATED TCP client (docs/adr/0012). The socket
+#     ops run in the SUPERVISOR's own process (its fds, its unconfined privilege — no
+#     child seccomp-allowlist growth); the child only ever sees the opaque conn_id
+#     (0..7 = the slot index). connect#47 is egress-checked BEFORE the socket exists. ---
+# Linux x86_64 net syscall numbers + constants (verified by compiling C; close(3) reuses
+# MirshiConfine.HOST_CLOSE; AF_INET / SOCKADDR_IN_SIZE / NET_EAGAIN come from MirshiNet).
+enum MirshiNetSys {
+    SYS_GETSOCKOPT = 55;
+    SOCK_STREAM = 1;
+    SOCK_NONBLOCK = 0x800;
+    SOCK_CLOEXEC = 0x80000;      # host socket fd never leaks across an exec
+    SOL_SOCKET = 1;
+    SO_ERROR = 4;
+    EINPROGRESS = 115;           # non-blocking connect() in progress -> poll for completion
+    POLLOUT = 4;
+    MSG_DONTWAIT = 0x40;         # per-call non-blocking recv -> -EAGAIN maps to agnos WOULD_BLOCK
+    MSG_NOSIGNAL = 0x4000;       # send() must NOT raise SIGPIPE (it would kill the SUPERVISOR)
+    MSG_PEEK = 0x2;              # 1.12.3: recv without consuming — take the bytes only once the child has them
+    UDP_PAYLOAD_MAX = 1472;      # 1.12.3: the kernel's udp_send limit (one 1500-byte Ethernet frame)
+    UDP_FRAME_OVERHEAD = 42;     # 1.12.3: Ethernet 14 + IPv4 20 + UDP 8 — udp_send answers the frame length
+    NET_IO_CAP = 4096;           # one-page bound on a single send/recv payload (caller loops)
+    NET_SLOTS = 8;               # agnos conn_id / listener_id space is 0..7 (the kernel's 8 slots)
+    NET_SLOT_SIZE = 24;          # per-slot entry {i64 fd; i64 kind; i64 parent}
+    SLOT_FREE = 0;               # slot kind: free / a live conn / a TCP listener / a UDP socket
+    SLOT_CONN = 1;
+    SLOT_LISTEN = 2;
+    SLOT_UDP = 3;                # a bound UDP socket (udp_bind#51); its `parent` field holds the bound port
+    SOCK_DGRAM = 2;
+    CONNECT_TIMEOUT_S = 8;       # bound the supervisor connect to agnos's ~8s budget (never indefinite)
+    HOST_READ = 0;               # Linux read(2) — read the netns config files (/proc, /etc/resolv.conf)
+    SO_REUSEADDR = 2;
+    LISTEN_BACKLOG = 128;
+    LOOPBACK_IP = 0x7F000001;    # 127.0.0.1 in the agnos kernel-ip4 form (build_sockaddr_in bswaps it)
+    INADDR_ANY_IP = 0;           # 0.0.0.0 — the --net-listen-any bind (all interfaces)
+    IPPROTO_ICMP = 1;            # unprivileged ping socket: socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+    ICMP_ECHO = 8;               # ICMP type: echo request (the ping-socket kernel demands type==8, code==0)
+    ICMP_HDR_LEN = 8;            # sizeof(struct icmphdr) — the minimum a ping socket will send
+    ICMP_TIMEOUT_S = 3;          # bound the supervisor echo-reply wait to agnos's ~3s budget
+    POLLIN = 1;                  # ppoll event: the echo reply is readable
+    POLLERR = 8;                 # v1.7.0 epoll_wait: a socket error also counts as "ready"
+    POLLHUP = 16;                # v1.7.0 epoll_wait: peer hangup also counts as "ready"
+    EPOLL_YIELD_NS = 1000000;    # v1.7.0 epoll_wait bounded-yield quantum (1 ms, the pause#14 quantum)
+}
+
+# The conn_id/listener_id(0..7) slot table. Each 24-byte slot is {i64 fd; i64 kind; i64 parent}:
+# fd = host fd or -1; kind = SLOT_FREE / SLOT_CONN / SLOT_LISTEN / SLOT_UDP; `parent` is the slot's
+# extra datum — for an accepted conn it is the listen slot it came from (so closing a listener reaps
+# its children); for a SLOT_UDP it is the bound port (so udp_send#52 can find the socket by its
+# source port); else -1. The child only ever sees the slot INDEX (the opaque agnos conn_id /
+# listen_id), never a host fd. ONE unified 0..7 space (mirroring the agnos kernel's, so
+# sock_close#50(id) is unambiguous whether id is a conn or a listen).
+#
+# v1.5.0 BITE 3: the table is PER-CHILD — it lives in the child's record (C_NET_TBL), lazily
+# alloc'd on first net use. `_cur_rec` is the record of the child whose syscall is currently being
+# dispatched (set by the trace loop at each enter stop, before translate_dispatch). Every net-table
+# access funnels through _net_tbl(), so pointing it at _cur_rec's table gives per-child isolation
+# with no handler-signature churn. MANDATORY for multi-process: two children sharing one 0..7 index
+# space would cross-close each other's sockets (the child hands back a bare conn_id with no pid tag).
+# The bare-index reap invariant stays valid WITHIN each child's own table. _cur_rec is set on every
+# enter stop and read only during enter-stop dispatch (net handlers are EMULATE — all work at enter),
+# so it is never stale when _net_tbl() runs. Single-child today, so byte-identical.
+var _cur_rec = 0;
+fn _net_tbl(): i64 {
+    var slots = load64(_cur_rec + C_NET_TBL);
+    if (slots == 0) {
+        slots = alloc(NET_SLOTS * NET_SLOT_SIZE);
+        var i = 0;
+        while (i < NET_SLOTS) {
+            var b = slots + i * NET_SLOT_SIZE;
+            store64(b + 0, 0 - 1);         # fd = -1
+            store64(b + 8, SLOT_FREE);     # kind
+            store64(b + 16, 0 - 1);        # parent = -1
+            i = i + 1;
+        }
+        store64(_cur_rec + C_NET_TBL, slots);
+    }
+    return slots;
+}
+
+# First free slot index, or -1 if the 8-slot table is full.
+fn _net_slot_alloc(): i64 {
+    var tbl = _net_tbl();
+    var i = 0;
+    while (i < NET_SLOTS) {
+        if (load64(tbl + i * NET_SLOT_SIZE + 8) == SLOT_FREE) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Empty a dead child's tables (1.12.3): close every host socket its net slots hold and mark all its
+# net / signalfd / timerfd / epoll slots free. Called on every non-root death. The tables stay attached
+# to the record slot, so the next child in that slot reuses them.
+fn _child_release(rec): i64 {
+    var nt = load64(rec + C_NET_TBL);
+    if (nt != 0) {
+        var i = 0;
+        while (i < NET_SLOTS) {
+            var b = nt + i * NET_SLOT_SIZE;
+            if (load64(b + 8) != SLOT_FREE) {
+                if (load64(b + 0) >= 0) { syscall(HOST_CLOSE, load64(b + 0)); }
+            }
+            store64(b + 0, 0 - 1);
+            store64(b + 8, SLOT_FREE);
+            store64(b + 16, 0 - 1);
+            i = i + 1;
+        }
+    }
+    var st = load64(rec + C_SIGFD_TBL);
+    if (st != 0) {
+        var j = 0;
+        while (j < SIGNALFD_SLOTS) {
+            store64(st + j * SIGFD_SLOT_SIZE + 0, 0);
+            store64(st + j * SIGFD_SLOT_SIZE + 8, SIGFD_FREE);
+            j = j + 1;
+        }
+    }
+    var tt = load64(rec + C_TIMERFD_TBL);
+    if (tt != 0) {
+        var k = 0;
+        while (k < TIMERFD_SLOTS) {
+            store64(tt + k * TIMERFD_SLOT_SIZE + 0, 0 - 1);
+            store64(tt + k * TIMERFD_SLOT_SIZE + 8, 0);
+            store64(tt + k * TIMERFD_SLOT_SIZE + 16, 0);
+            store64(tt + k * TIMERFD_SLOT_SIZE + 24, 0);
+            k = k + 1;
+        }
+    }
+    var et = load64(rec + C_EPOLL_TBL);
+    if (et != 0) {
+        var m = 0;
+        while (m < EPOLL_SLOTS) {
+            store64(et + m * EPOLL_SLOT_SIZE + 0, 0 - 1);
+            m = m + 1;
+        }
+    }
+    store64(rec + C_CON_NOSER, 0);
+    return 0;
+}
+
+# Supervisor scratch for the emulated net calls (lazy-once): sockaddr_in@0(16) + pollfd@16(8)
+# + timespec@24(16) + SO_ERROR optval@40(4)/optlen@48(4). One call in flight at a time.
+var _net_scratch = 0;
+fn _net_scratch_buf(): i64 {
+    if (_net_scratch == 0) { _net_scratch = alloc(64); }
+    return _net_scratch;
+}
+
+# Inject a supervisor-computed return into the child's rax (STRAT_EMULATE): skip the foreign
+# agnos syscall (orig_rax=-1) so it never runs as a Linux call, stash the value for the exit
+# stop. Same discipline as uptime_ms#40 / sleep_ms#41.
+fn _net_emu(pid, regs, ret): i64 {
+    _xlat_emu_ret = ret;
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    # 1.12.3: the answer goes into rax in the SAME SETREGS. The kernel leaves rax alone for a skipped
+    # syscall (orig_rax = -1), so the child already has it at the exit stop, which then reads and writes
+    # nothing (STRAT_EMULATE_DONE) — two ptrace calls fewer per emulated syscall. A path that answers
+    # later (a parked waitpid#4 / execwait#37) keeps STRAT_EMULATE and the exit-stop injection.
+    store64(regs + REG_RAX, ret);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EMULATE_DONE;
+}
+
+# sock_connect#47(dst_ip, dst_port, src_port) -> conn_id 0..7 / -1. Egress-checked, then the
+# supervisor does socket()+non-blocking connect()+bounded ppoll(POLLOUT)+SO_ERROR, and records
+# the fd in a free slot. src_port is ignored in v1 (ephemeral). dst_ip is the agnos kernel-ip4 form.
+fn _net_connect(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    var dst_port = decode_arg(regs, 1);
+    if (dst_port <= 0) { return _net_emu(pid, regs, 0 - 1); }        # 1.12.3: the kernel's 1..65535
+    if (dst_port > 65535) { return _net_emu(pid, regs, 0 - 1); }
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) {
+        return _net_emu(pid, regs, 0 - 1);        # egress denied (default-deny / policy)
+    }
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, dst_port);
+    var r = syscall(SYS_CONNECT, fd, sb, SOCKADDR_IN_SIZE);
+    if (r != 0) {
+        if (r != (0 - EINPROGRESS)) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+        store32(sb + 16, fd);                     # pollfd.fd
+        store16(sb + 20, POLLOUT);                # pollfd.events (offset 4)
+        store16(sb + 22, 0);                      # pollfd.revents (offset 6)
+        store64(sb + 24, CONNECT_TIMEOUT_S);      # timespec.tv_sec
+        store64(sb + 32, 0);                      # timespec.tv_nsec
+        var pr = syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+        if (pr <= 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }   # timeout / error
+        store32(sb + 40, 0);                      # SO_ERROR optval
+        store32(sb + 48, 4);                      # optlen = sizeof(int)
+        syscall(SYS_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, sb + 40, sb + 48);
+        if (load32(sb + 40) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    }
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);                           # slot now holds the connected fd
+    store64(b + 8, SLOT_CONN);                    # kind = live client conn
+    store64(b + 16, 0 - 1);                       # no listener parent
+    return _net_emu(pid, regs, slot);             # agnos conn_id = slot index
+}
+
+# sock_close#50(conn_id | listen_id) -> 0 / -1. Close the host fd and free the slot. (When the
+# slot is a LISTEN, agnos also reaps its accepted children — that reap lands with sock_listen/
+# accept in the server bite; here every live slot is a SLOT_CONN, closed generically.)
+fn _net_close_conn(pid, regs): i64 {
+    var cid = decode_arg(regs, 0);
+    if (cid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (cid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) == SLOT_FREE) { return _net_emu(pid, regs, 0 - 1); }   # slot not open
+    # A LISTEN slot reaps its accepted children first (agnos #50 semantics): close + free every
+    # SLOT_CONN whose parent is this listener, so a server that closes its listener doesn't leak.
+    # INVARIANT (load-bearing): `parent` is a bare slot INDEX (not generation-stamped), so this is
+    # correct ONLY because a SLOT_LISTEN is NEVER freed without first reaping its children here —
+    # a listener index can therefore only be reused after all children carrying it are gone, so no
+    # stranded child can cross-close an unrelated (reused-index) listener. Any future path that
+    # frees a SLOT_LISTEN MUST reap first, or switch `parent` to a generation-stamped id.
+    if (load64(b + 8) == SLOT_LISTEN) {
+        var tbl = _net_tbl();
+        var i = 0;
+        while (i < NET_SLOTS) {
+            var cb = tbl + i * NET_SLOT_SIZE;
+            if (load64(cb + 8) == SLOT_CONN) {
+                if (load64(cb + 16) == cid) {         # a child accepted from this listener
+                    syscall(HOST_CLOSE, load64(cb + 0));
+                    store64(cb + 0, 0 - 1);
+                    store64(cb + 8, SLOT_FREE);
+                    store64(cb + 16, 0 - 1);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    syscall(HOST_CLOSE, load64(b + 0));
+    store64(b + 0, 0 - 1);
+    store64(b + 8, SLOT_FREE);                    # free the slot
+    store64(b + 16, 0 - 1);
+    return _net_emu(pid, regs, 0);
+}
+
+# A one-page I/O buffer for send/recv payloads (lazy-once; one net call in flight at a time,
+# same discipline as the M2 repack buffers). Bounds a single send/recv to NET_IO_CAP.
+var _net_io = 0;
+fn _net_io_buf(): i64 {
+    if (_net_io == 0) { _net_io = alloc(NET_IO_CAP); }
+    return _net_io;
+}
+
+# conn_id -> host fd, but ONLY for a live client/accepted connection (SLOT_CONN). -1 if the id
+# is out of range, free, or a LISTEN slot (you cannot send/recv on a listener). Blocks a hostile
+# or stale id and a send/recv aimed at a listen slot.
+fn _net_fd_conn(cid): i64 {
+    if (cid < 0) { return 0 - 1; }
+    if (cid >= NET_SLOTS) { return 0 - 1; }
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) != SLOT_CONN) { return 0 - 1; }
+    return load64(b + 0);
+}
+
+# conn_id/listen_id -> host fd for POLLING (v1.7.0 epoll_wait). Unlike _net_fd_conn this ACCEPTS any LIVE
+# slot (CONN / LISTEN / UDP) — a listener is POLLIN-readable on an incoming connection, which is exactly
+# what a server epolls for. -1 if out of range or FREE (the stale-slot-reuse guard at wait time).
+fn _net_fd_pollable(cid): i64 {
+    if (cid < 0) { return 0 - 1; }
+    if (cid >= NET_SLOTS) { return 0 - 1; }
+    var b = _net_tbl() + cid * NET_SLOT_SIZE;
+    if (load64(b + 8) == SLOT_FREE) { return 0 - 1; }
+    return load64(b + 0);
+}
+
+# sock_send#48(conn_id, buf, len) -> bytes (<=len) / 0 / -1. BLOCKS (agnos). The child buffer is
+# pvm_read into a supervisor page (bounded to NET_IO_CAP), then send()'d with MSG_NOSIGNAL so a
+# peer-closed socket cannot SIGPIPE the SUPERVISOR. The socket is non-blocking (for recv/connect),
+# so a full send buffer (-EAGAIN) is handled by one bounded ppoll(POLLOUT) + retry — emulating the
+# blocking send. A partial send is a valid agnos return (the caller loops). When the ~8 s window
+# expires with nothing sent the answer is 0, the committed count, as the kernel's D6 rule says
+# (TCP_PROGRESS_US); -1 is a dead conn or a real error only (1.12.2 — it was -1).
+fn _net_send(pid, regs): i64 {
+    var fd = _net_fd_conn(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var child_buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    if (len <= 0) { return _net_emu(pid, regs, 0); }        # nothing to send
+    if (len > NET_IO_CAP) { len = NET_IO_CAP; }             # cap; caller loops for the rest
+    var io = _net_io_buf();
+    if (pvm_read(pid, child_buf, io, len) != len) { return _net_emu(pid, regs, 0 - 1); }  # bad child ptr
+    var sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent != (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0 - 1); }   # real error
+    # send buffer full: wait (bounded) for writability, retry once.
+    var sb = _net_scratch_buf();
+    store32(sb + 16, fd);
+    store16(sb + 20, POLLOUT);
+    store16(sb + 22, 0);
+    store64(sb + 24, CONNECT_TIMEOUT_S);
+    store64(sb + 32, 0);
+    syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+    sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent == (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0); }    # the window expired, nothing sent
+    return _net_emu(pid, regs, 0 - 1);
+}
+
+# sock_send_dl#109(conn_id, buf, len, timeout_us) -> committed bytes (<= len, maybe 0) / -1 (1.12.1,
+# agnos 1.57.13). sock_send#48 with a CALLER CEILING on its waiting, measured once from entry. The
+# kernel's order is kept: the conn is checked FIRST (-1 for a dead or foreign conn even when len <= 0
+# — that is what the cyrius stdlib's support probe `#109(conn, buf, 0, 0)` relies on), then len <= 0
+# -> 0, then the buffer. A chunk that goes out without a wait still goes; when the wait expires with
+# nothing sent the answer is 0 ("no progress yet"), not -1.
+#   timeout_us == 0 -> byte-for-byte #48 (_net_send: the D6 window only, then 0).
+#   timeout_us <  0 -> a spent ceiling: one non-blocking attempt, never a wait.
+#   timeout_us >  0 -> wait at most min(timeout_us, the ~8 s D6 window) for send space.
+fn _net_send_dl(pid, regs): i64 {
+    var dl = decode_arg(regs, 3);                            # agnos a4 = r10
+    if (dl == 0) { return _net_send(pid, regs); }
+    var fd = _net_fd_conn(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var child_buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    if (len <= 0) { return _net_emu(pid, regs, 0); }        # a live conn, nothing to send
+    if (len > NET_IO_CAP) { len = NET_IO_CAP; }             # cap; caller loops for the rest
+    var io = _net_io_buf();
+    if (pvm_read(pid, child_buf, io, len) != len) { return _net_emu(pid, regs, 0 - 1); }  # bad child ptr
+    var sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent != (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0 - 1); }   # real error
+    var wus = send_dl_wait_us(dl);
+    if (wus <= 0) { return _net_emu(pid, regs, 0); }        # spent ceiling: no wait, nothing committed
+    var sb = _net_scratch_buf();
+    store32(sb + 16, fd);
+    store16(sb + 20, POLLOUT);
+    store16(sb + 22, 0);
+    store64(sb + 24, wus / 1000000);                        # timespec.tv_sec
+    store64(sb + 32, (wus % 1000000) * 1000);               # timespec.tv_nsec
+    syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+    sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, 0, 0);
+    if (sent >= 0) { return _net_emu(pid, regs, sent); }
+    if (sent == (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0); }    # the ceiling fired, nothing sent
+    return _net_emu(pid, regs, 0 - 1);
+}
+
+# sock_recv#49(conn_id, buf, maxlen) -> bytes / 0=WOULD_BLOCK / -1=EOF (INVERTED from Linux — see
+# net_recv_to_agnos). Non-blocking recv (MSG_DONTWAIT) into a supervisor page, map the return, then
+# pvm_write the received bytes into the child buffer. A short pvm_write (bad child ptr) -> -1.
+fn _net_recv(pid, regs): i64 {
+    var fd = _net_fd_conn(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var child_buf = decode_arg(regs, 1);
+    var maxlen = decode_arg(regs, 2);
+    if (maxlen <= 0) { return _net_emu(pid, regs, 0); }     # nothing requested
+    if (maxlen > NET_IO_CAP) { maxlen = NET_IO_CAP; }
+    var io = _net_io_buf();
+    # PEEK, write into the child, then take exactly what was written (1.12.3): a bad child buffer is -1
+    # and the bytes stay on the socket, where they used to be read off and dropped.
+    var lr = syscall(SYS_RECVFROM, fd, io, maxlen, MSG_DONTWAIT | MSG_PEEK, 0, 0);
+    var aret = net_recv_to_agnos(lr);
+    if (aret > 0) {
+        if (pvm_write(pid, child_buf, io, aret) != aret) { return _net_emu(pid, regs, 0 - 1); }
+        syscall(SYS_RECVFROM, fd, io, aret, MSG_DONTWAIT, 0, 0);
+    }
+    return _net_emu(pid, regs, aret);
+}
+
+
+# sock_listen#56(port) -> listen_id 0..7 / -1. Merges bind+listen. The supervisor creates a
+# non-blocking listening socket bound to LOOPBACK by default (safe: reachable only from
+# localhost / the same container); `--net-listen-any` binds INADDR_ANY (the faithful agnos
+# behavior, network-exposed — the ingress posture, docs/adr/0012). Recorded as a SLOT_LISTEN.
+fn _net_listen(pid, regs): i64 {
+    var dec = sock_listen_decode(decode_arg(regs, 0));
+    if (dec < 0) { return _net_emu(pid, regs, 0 - 1); }   # port 0, an unknown class, stray bits
+    var port = dec & 0xFFFF;
+    var loopback_only = (dec >> 16) & 0xFF;
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    store32(sb + 40, 1);                                   # SO_REUSEADDR optval = 1 (reuse optval slot)
+    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, sb + 40, 4);   # optlen is by VALUE for setsockopt
+    # 1.12.3: a LOOPBACK-class listener (the stdlib's sock_bind(127.0.0.1)) is bound to 127.0.0.1 even under
+    # --net-listen-any; that flag only widens an ANY-class one. It used to bind every listener to 0.0.0.0.
+    var bind_ip = LOOPBACK_IP;
+    if (_net_listen_any == 1) { if (loopback_only == 0) { bind_ip = INADDR_ANY_IP; } }
+    build_sockaddr_in(sb, bind_ip, port);
+    if (syscall(SYS_BIND, fd, sb, SOCKADDR_IN_SIZE) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    if (syscall(SYS_LISTEN, fd, LISTEN_BACKLOG) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);
+    store64(b + 8, SLOT_LISTEN);
+    store64(b + 16, 0 - 1);
+    return _net_emu(pid, regs, slot);                     # listen_id = slot index
+}
+
+# sock_accept#57(listen_id) -> conn_id / -1 (WOULD_BLOCK or bad id). Non-blocking. Verifies the
+# slot is a LISTEN, accept4()s the next pending connection (non-blocking + CLOEXEC), and records
+# the accepted fd in a FRESH SLOT_CONN whose parent is the listener (so close#50 reaps it). No
+# pending connection (-EAGAIN) or a bad listen_id -> agnos -1 (the server loops on -1).
+fn _net_accept(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var lb = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(lb + 8) != SLOT_LISTEN) { return _net_emu(pid, regs, 0 - 1); }   # not a listener
+    # 1.12.3: find the slot BEFORE taking the connection off the listen queue — with a full table the
+    # pending connection stays queued for a later accept instead of being accepted and dropped.
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }   # table full
+    var cfd = syscall(SYS_ACCEPT4, load64(lb + 0), 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (cfd < 0) { return _net_emu(pid, regs, 0 - 1); }   # WOULD_BLOCK / error -> agnos -1
+    var cb = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(cb + 0, cfd);
+    store64(cb + 8, SLOT_CONN);
+    store64(cb + 16, lid);                               # parent = the listener (reap on close#50)
+    return _net_emu(pid, regs, slot);                    # conn_id = the new slot
+}
+
+# udp_bind#51(port) -> listener_id 0..7 / -1. A bound non-blocking DGRAM socket (SLOT_UDP), the
+# bound port stashed in `parent` so udp_send#52 can find it by source port. Loopback bind by
+# default (ingress posture, like sock_listen); --net-listen-any binds all interfaces.
+fn _net_udp_bind(pid, regs): i64 {
+    var port = decode_arg(regs, 0);
+    if (port <= 0) { return _net_emu(pid, regs, 0 - 1); }        # the kernel's 1..65535 (1.12.3)
+    if (port > 65535) { return _net_emu(pid, regs, 0 - 1); }
+    var slot = _net_slot_alloc();
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    # 1.12.3: no SO_REUSEADDR. A port that is already bound is -1, as the kernel's udp_bind refuses it;
+    # with the option set, Linux let a second bind share the port with another socket.
+    var sb = _net_scratch_buf();
+    var bind_ip = LOOPBACK_IP;
+    if (_net_listen_any == 1) { bind_ip = INADDR_ANY_IP; }
+    build_sockaddr_in(sb, bind_ip, port);
+    if (syscall(SYS_BIND, fd, sb, SOCKADDR_IN_SIZE) != 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + slot * NET_SLOT_SIZE;
+    store64(b + 0, fd);
+    store64(b + 8, SLOT_UDP);
+    store64(b + 16, port);                               # `parent` = the bound source port
+    return _net_emu(pid, regs, slot);
+}
+
+
+# The bound UDP socket fd whose source port == `sport`, or -1. udp_send#52 sends FROM this socket
+# so the reply returns to the matching udp_recv#53 listener.
+fn _net_udp_fd_by_port(sport): i64 {
+    var tbl = _net_tbl();
+    var i = 0;
+    while (i < NET_SLOTS) {
+        var b = tbl + i * NET_SLOT_SIZE;
+        if (load64(b + 8) == SLOT_UDP) {
+            if (load64(b + 16) == sport) { return load64(b + 0); }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# udp_send#52(dst_ip, (sport<<16)|dport, buf, len[=r10]) -> bytes / 0 / -1. Egress-checked per
+# datagram (UDP is connectionless — the dst can change every call). Sends FROM the socket bound to
+# `sport` (udp_bind#51 must have created it) to dst_ip:dport. dst_ip is the agnos kernel-ip4 form.
+fn _net_udp_send(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    var packed = decode_arg(regs, 1);
+    var child_buf = decode_arg(regs, 2);
+    var len = decode_arg(regs, 3);                        # a4 = r10
+    # 1.12.3, the kernel's order: len <= 0 -> 0, len > 1472 (one Ethernet frame) -> -1, then the buffer
+    # and the source port; mirshi's egress policy last. It answers the FRAME length, payload + 42
+    # (Ethernet 14 + IPv4 20 + UDP 8), as the kernel's udp_send does (net_tx's byte count).
+    if (len <= 0) { return _net_emu(pid, regs, 0); }
+    if (len > UDP_PAYLOAD_MAX) { return _net_emu(pid, regs, 0 - 1); }
+    var io = _net_io_buf();
+    if (pvm_read(pid, child_buf, io, len) != len) { return _net_emu(pid, regs, 0 - 1); }
+    var sport = (packed >> 16) & 0xffff;
+    var dport = packed & 0xffff;
+    var fd = _net_udp_fd_by_port(sport);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # no socket bound to sport
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, dport);                # the destination sockaddr
+    var sent = syscall(SYS_SENDTO, fd, io, len, MSG_NOSIGNAL, sb, SOCKADDR_IN_SIZE);
+    if (sent < 0) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, sent + UDP_FRAME_OVERHEAD);
+}
+
+
+# udp_recv#53(listener_id, buf, maxlen, addr_out[=r10]) -> bytes / 0=none / -1. Non-blocking recv
+# on the bound UDP socket. NO EOF (UDP): -EAGAIN -> agnos 0 (none). If `addr_out` (a 16-byte child
+# buffer, 0 to skip) is given, writes the sender {peer_ip@0 kernel-ip4, peer_port@8 host-order}.
+fn _net_udp_recv(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    var child_buf = decode_arg(regs, 1);
+    var maxlen = decode_arg(regs, 2);
+    var addr_out = decode_arg(regs, 3);                  # a4 = r10 (0 = skip)
+    if (maxlen <= 0) { return _net_emu(pid, regs, 0); }  # the kernel checks this first (1.12.3)
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var lb = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(lb + 8) != SLOT_UDP) { return _net_emu(pid, regs, 0 - 1); }   # not a udp socket
+    var fd = load64(lb + 0);
+    if (maxlen > NET_IO_CAP) { maxlen = NET_IO_CAP; }
+    var io = _net_io_buf();
+    var sb = _net_scratch_buf();
+    store32(sb + 48, SOCKADDR_IN_SIZE);                  # addrlen (in/out) for the src sockaddr
+    # PEEK first and consume only after both writes into the child succeeded (1.12.3): a bad buf or
+    # addr_out is -1 with the datagram still queued, as on the kernel, which validates before it takes.
+    var lr = syscall(SYS_RECVFROM, fd, io, maxlen, MSG_DONTWAIT | MSG_PEEK, sb, sb + 48);
+    if (lr < 0) {
+        if (lr == (0 - NET_EAGAIN)) { return _net_emu(pid, regs, 0); }   # no datagram waiting
+        return _net_emu(pid, regs, 0 - 1);
+    }
+    if (lr > 0) {
+        if (pvm_write(pid, child_buf, io, lr) != lr) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    if (addr_out != 0) {
+        store64(sb + 24, net_ip4_to_inaddr(load32(sb + 4)));   # sin_addr(network) -> kernel-ip4 @0
+        store64(sb + 32, net_htons(load16(sb + 2)));           # sin_port(network) -> host @8
+        if (pvm_write(pid, addr_out, sb + 24, 16) != 16) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    syscall(SYS_RECVFROM, fd, io, maxlen, MSG_DONTWAIT, 0, 0);    # now take it
+    return _net_emu(pid, regs, lr);
+}
+
+
+# udp_unbind#54(listener_id) -> 0 / -1. Close the bound UDP socket + free the slot (SLOT_UDP only).
+fn _net_udp_unbind(pid, regs): i64 {
+    var lid = decode_arg(regs, 0);
+    if (lid < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (lid >= NET_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var b = _net_tbl() + lid * NET_SLOT_SIZE;
+    if (load64(b + 8) != SLOT_UDP) { return _net_emu(pid, regs, 0 - 1); }
+    syscall(HOST_CLOSE, load64(b + 0));
+    store64(b + 0, 0 - 1);
+    store64(b + 8, SLOT_FREE);
+    store64(b + 16, 0 - 1);
+    return _net_emu(pid, regs, 0);
+}
+
+# Monotonic clock in ms, read supervisor-side (the host CLOCK_MONOTONIC is shared). Reuses the
+# timer scratch (_emu_ts_buf), same one-call-in-flight discipline as uptime_ms#40 — used to
+# bracket the icmp_echo#55 round-trip.
+fn _mono_ms(): i64 {
+    var ts = _emu_ts_buf();
+    store64(ts, 0);
+    store64(ts + 8, 0);
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, ts);
+    return ms_from_timespec(load64(ts), load64(ts + 8));
+}
+
+# icmp_echo#55(dst_ip) -> RTT in ms (>=0; a sub-ms reply reads 0) / -1 (timeout / host down / no
+# permission). A PURE supervisor op — icmp_echo carries no child buffer, so no process_vm. Egress
+# is checked first (default-deny), then the supervisor opens an UNPRIVILEGED ping socket
+# (SOCK_DGRAM+IPPROTO_ICMP — NEVER SOCK_RAW/CAP_NET_RAW, a privilege a sandbox deputy must not
+# hold; ADR 0012), sends one echo request, and bounded-ppoll(POLLIN)s for the reply, measuring the
+# monotonic-clock delta. dst_ip is the agnos kernel-ip4 form. Fail-closed to -1 on ANY error
+# (socket denied by net.ipv4.ping_group_range, send failure, timeout, spurious wake).
+fn _net_icmp(pid, regs): i64 {
+    var dst_ip = decode_arg(regs, 0);
+    if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) { return _net_emu(pid, regs, 0 - 1); }
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }   # ping_group_range denies -> fail-closed
+    var io = _net_io_buf();
+    # ICMP echo request header (8 B): the ping-socket kernel overrides the id with the socket's
+    # source port and computes the checksum, so we only supply type=8 / code=0 / a sequence.
+    store8(io + 0, ICMP_ECHO);                   # type = 8 (echo request)
+    store8(io + 1, 0);                           # code = 0
+    store16(io + 2, 0);                          # checksum (kernel fills)
+    store16(io + 4, 0);                          # id (kernel overrides with the source port)
+    store16(io + 6, 1);                          # sequence
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, dst_ip, 0);            # ICMP has no port; sin_port is ignored
+    var t0 = _mono_ms();
+    var sent = syscall(SYS_SENDTO, fd, io, ICMP_HDR_LEN, 0, sb, SOCKADDR_IN_SIZE);
+    if (sent < 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }
+    store32(sb + 16, fd);                        # pollfd.fd
+    store16(sb + 20, POLLIN);                    # pollfd.events (offset 4) = POLLIN
+    store16(sb + 22, 0);                         # pollfd.revents (offset 6)
+    store64(sb + 24, ICMP_TIMEOUT_S);            # timespec.tv_sec
+    store64(sb + 32, 0);                         # timespec.tv_nsec
+    var pr = syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
+    if (pr <= 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }   # timeout / down
+    # Any datagram readable on this fresh, private ping socket IS our reply: the kernel delivers
+    # only echo-replies whose ICMP id matches our source port (it set the id), and ICMP errors ride
+    # the error queue (MSG_ERRQUEUE), not this path — so no type/seq re-check is needed here.
+    var got = syscall(SYS_RECVFROM, fd, io, NET_IO_CAP, MSG_DONTWAIT, 0, 0);
+    var rtt = _mono_ms() - t0;
+    syscall(HOST_CLOSE, fd);
+    if (got < 0) { return _net_emu(pid, regs, 0 - 1); }   # spurious wake, no datagram -> no reply
+    if (rtt < 0) { rtt = 0; }                    # monotonic never rewinds; clamp as a guard
+    return _net_emu(pid, regs, rtt);
+}
+
+# --- net_config#61 (v1.3.0): a supervisor EMULATE getter that reads the REAL container-netns
+#     interface config (host IP / gateway / DNS) from /proc + /etc/resolv.conf and returns it as
+#     a packed kernel-ip4. A minor infoleak (the child sees the container's gateway/DNS), accepted.
+#     Any missing file / parse failure -> 0 (unset), a valid net_config return. See docs/adr/0012. ---
+
+# Read a file into `buf` (cap bytes), NUL-terminate; return bytes read, or -1. Supervisor-side.
+fn _net_read_file(path, buf, cap): i64 {
+    var fd = syscall(HOST_OPEN, path, 0, 0);       # O_RDONLY = 0
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(HOST_READ, fd, buf, cap - 1);
+    syscall(HOST_CLOSE, fd);
+    if (n < 0) { return 0 - 1; }
+    store8(buf + n, 0);
+    return n;
+}
+
+# Find `needle` (nlen bytes) in buf[0..n); return the offset just AFTER the match, or -1.
+fn _net_find(buf, n, needle, nlen): i64 {
+    var i = 0;
+    while ((i + nlen) <= n) {
+        var j = 0;
+        var hit = 1;
+        while (j < nlen) {
+            if (load8(buf + i + j) != load8(needle + j)) { hit = 0; j = nlen; }
+            else { j = j + 1; }
+        }
+        if (hit == 1) { return i + nlen; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# net_config field 2 (gateway): the default route's Gateway from /proc/net/route. The default
+# route line has the Destination column all-zero, so "\t00000000\t" locates it; the Gateway hex
+# (little-endian sin_addr) follows. Byte-swap to kernel-ip4. 0 if unreadable / no default route.
+fn _net_config_gateway(): i64 {
+    var buf = _net_io_buf();
+    var n = _net_read_file("/proc/net/route", buf, NET_IO_CAP);
+    if (n < 0) { return 0; }
+    var off = _net_find(buf, n, "\t00000000\t", 10);
+    if (off < 0) { return 0; }
+    var hex = net_parse_hex32(buf + off);
+    if (hex < 0) { return 0; }
+    return net_ip4_to_inaddr(hex);                 # network-order LE hex -> kernel-ip4
+}
+
+# net_config field 3 (DNS): the first `nameserver <ip>` in /etc/resolv.conf, as kernel-ip4. 0 if
+# unreadable / none.
+fn _net_config_dns(): i64 {
+    var buf = _net_io_buf();
+    var n = _net_read_file("/etc/resolv.conf", buf, NET_IO_CAP);
+    if (n < 0) { return 0; }
+    var off = _net_find(buf, n, "nameserver", 10);
+    if (off < 0) { return 0; }
+    while (off < n) {                              # skip whitespace to the ip
+        var c = load8(buf + off);
+        if (c != 32) { if (c != 9) { break; } }    # stop at the first non-space, non-tab
+        off = off + 1;
+    }
+    var ip = net_parse_dotquad(buf + off, n - off);
+    if (ip < 0) { return 0; }
+    return ip;
+}
+
+# net_config field 0 (host IP): the source address the kernel picks to reach the gateway — a UDP
+# socket connect()ed to the gateway (no packets sent) + getsockname reveals our on-subnet IP. 0 if
+# there is no gateway or the trick fails.
+fn _net_config_hostip(): i64 {
+    var gw = _net_config_gateway();
+    if (gw == 0) { return 0; }
+    var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { return 0; }
+    var sb = _net_scratch_buf();
+    build_sockaddr_in(sb, gw, 1);                  # UDP connect just selects the route; no packet leaves
+    if (syscall(SYS_CONNECT, fd, sb, SOCKADDR_IN_SIZE) != 0) { syscall(HOST_CLOSE, fd); return 0; }
+    store32(sb + 48, SOCKADDR_IN_SIZE);
+    var r = syscall(SYS_GETSOCKNAME, fd, sb, sb + 48);
+    syscall(HOST_CLOSE, fd);
+    if (r != 0) { return 0; }
+    return net_ip4_to_inaddr(load32(sb + 4));      # our sin_addr (network) -> kernel-ip4
+}
+
+# net_config#61(field) -> packed kernel-ip4 / 0 unset / -1 bad field. 0=host IP, 1=netmask (0-unset,
+# not yet read), 2=gateway, 3=DNS. EMULATE (no child buffer). Gated on --net (part of the band).
+fn _net_config(pid, regs): i64 {
+    var field = decode_arg(regs, 0);
+    if (field == 0) { return _net_emu(pid, regs, _net_config_hostip()); }
+    if (field == 1) { return _net_emu(pid, regs, 0); }        # netmask — not read (0 = unset)
+    if (field == 2) { return _net_emu(pid, regs, _net_config_gateway()); }
+    if (field == 3) { return _net_emu(pid, regs, _net_config_dns()); }
+    # 1.12.3: fields 4..11 are the kernel's ICMP and interface counters (agnos 1.56.48 / 1.56.59). mirshi
+    # keeps none, so 0 — never -1, which the stdlib reads as "an older kernel".
+    if (field >= 4) { if (field <= 11) { return _net_emu(pid, regs, 0); } }
+    return _net_emu(pid, regs, 0 - 1);                         # bad field
+}

@@ -31,7 +31,6 @@ enum MirshiChild {
     SIGFD_SLOT_SIZE = 16;       # per slot {i64 watched_mask; i64 state} — SIGFD_FREE / SIGFD_OPEN
     SIGFD_FREE = 0 - 1;         # 1.12.2: the slot state is its own cell, never the caller's flags word
     SIGFD_OPEN = 0;
-    SFD_NONBLOCK = 2048;        # signalfd flag (agnos SFD_NONBLOCK); the MVP read is always non-blocking
     # --- record field offsets (all i64) ---
     C_AGNOS_PID = 0;            # the opaque guest-facing pid mirshi coined (root = 1)
     C_HOST_PID = 8;            # the real Linux pid (the wait4 / ptrace target)
@@ -232,6 +231,8 @@ var _next_agnos_pid = 1;        # 0 reserved (getppid=0 stays distinct); root ch
 fn _child_tbl(): i64 {
     if (_children == 0) {
         _children = alloc(MAX_CHILDREN * CHILD_REC_SIZE);
+        var z = 0;
+        while (z < MAX_CHILDREN * CHILD_REC_SIZE) { store64(_children + z, 0); z = z + 8; }   # 1.12.3: every field starts 0
         var i = 0;
         while (i < MAX_CHILDREN) {
             store64(_children + i * CHILD_REC_SIZE + C_STATE, CS_FREE);
@@ -249,16 +250,16 @@ fn _child_reset(): i64 {
     return 0;
 }
 
-# Find the live record for a host (Linux) pid, or 0 if none. A FREE slot's host_pid is stale,
-# so only non-FREE records match.
+# Find the live record for a host (Linux) pid, or 0 if none. Only RUNNING and BLOCKED records match
+# (1.12.3): an EXITED record's host process is already reaped, and the host may reuse its pid.
 fn _child_find_by_host(hpid): i64 {
     var tbl = _child_tbl();
     var i = 0;
     while (i < MAX_CHILDREN) {
         var b = tbl + i * CHILD_REC_SIZE;
-        if (load64(b + C_STATE) != CS_FREE) {
-            if (load64(b + C_HOST_PID) == hpid) { return b; }
-        }
+        var st = load64(b + C_STATE);
+        if (st == CS_RUNNING) { if (load64(b + C_HOST_PID) == hpid) { return b; } }
+        if (st == CS_BLOCKED) { if (load64(b + C_HOST_PID) == hpid) { return b; } }
         i = i + 1;
     }
     return 0;
@@ -304,12 +305,9 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_M2_OUT_PTR, 0);
             store64(b + C_M2_OUT_CAP, 0);
             store64(b + C_M2_SCRATCH, 0);
-            store64(b + C_NET_TBL, 0);
             store64(b + C_SIG_BLOCKED, 0);
-            store64(b + C_SIGFD_TBL, 0);
-            store64(b + C_EPOLL_TBL, 0);        # v1.7.0: lazy-alloc-once tables start unallocated
-            store64(b + C_TIMERFD_TBL, 0);
-            store64(b + C_PIPE_TBL, 0);         # reserved (unused in the MVP)
+            # 1.12.3: the slot keeps its net / signalfd / epoll / timerfd tables. _child_release emptied
+            # them when the previous holder died, so they are reused instead of allocated again.
             store64(b + C_CON_NOSER, 0);        # 1.12.1: a new process starts without CM_NOSERIAL
             return b;
         }

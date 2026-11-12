@@ -31,8 +31,9 @@ fn main(): i64 {
     # (4) CLEAR (op 2, fd ignored) wipes all watches; then a fresh ADD has room again
     if (sys_epoll_ctl(ep, 2, 0) != 0) { return 7; }
     if (sys_epoll_ctl(ep, 1, 300) != 0) { return 8; }             # room again -> 0
-    # (5) unknown op -> -1; (6) bad epfd -> -1
-    if (sys_epoll_ctl(ep, 9, 1) != (0 - 1)) { return 9; }
+    # (5) unknown op -> 0, op 3 -> -1 (not yet); (6) bad epfd -> -1
+    if (sys_epoll_ctl(ep, 9, 1) != 0) { return 9; }           # 1.12.3: an unknown op is 0 (the kernel falls through)
+    if (sys_epoll_ctl(ep, 3, 1) != (0 - 1)) { return 18; }    # op 3 SET (agnos 1.57.17): not yet -> -1
     if (sys_epoll_ctl(999, 1, 1) != (0 - 1)) { return 10; }        # 999 is not an epoll id
     # (7) instance cap: EPOLL_SLOTS=4. We hold 1 (ep); 3 more -> OK; the 5th -> -1.
     var e2 = sys_epoll_create(); if (e2 < 0) { return 11; }
@@ -53,7 +54,7 @@ cyrius build --agnos "$sbox/ep.cyr" "$sbox/ep" >/dev/null 2>&1
 
 set +e; out="$(timeout 25 "$mirshi" "$sbox/ep" 2>/dev/null)"; rc=$?; set -e
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "EPOLL-OK"; then
-    echo "OK: epoll#19/#20 — create + ADD(dedup,8-cap) + CLEAR + bad-op/epfd -1 + instance cap + close recycle"
+    echo "OK: epoll#19/#20 — create + ADD(dedup,8-cap) + CLEAR + unknown op 0 / bad epfd -1 + instance cap + close recycle"
 else
     echo "FAIL: epoll rc=$rc out='$(printf '%s' "$out" | tr '\n' '|')' (4=8-cap, 6=dedup, 8=clear, 14=inst-cap, 16=close-recycle)" >&2
     fail=1

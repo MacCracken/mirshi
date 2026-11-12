@@ -128,7 +128,7 @@ syscall(SYS_EXIT, r);
 EOF
 build_fix storm; ck_stable "syscall storm (100k)" "$(run storm)"
 
-# 7. agnos spawn#3 — mirshi ENOSYS-skips it: NO fork bomb, child gets -1.
+# 7. agnos spawn#3 with a bogus image, 50 times — each spawn fails cleanly (no runaway process growth).
 cat > "$fix/spawn.cyr" <<'EOF'
 include "lib/syscalls.cyr"
 fn main(): i64 {

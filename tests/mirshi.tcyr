@@ -29,7 +29,7 @@ fn main() {
     assert_streq(agnos_nr_name(109), "sock_send_dl", "nr 109 = sock_send_dl (NOT Linux setpgid)");
     assert_streq(agnos_nr_name(110), "console_mode", "nr 110 = console_mode (NOT Linux getppid)");
     assert_streq(agnos_nr_name(111), "fd_kind", "nr 111 = fd_kind (NOT Linux getpgrp)");
-    assert_streq(agnos_nr_name(36), "unknown", "nr 36 = unknown (unmirrored)");
+    assert_streq(agnos_nr_name(36), "unknown", "nr 36 (klug) = unknown (not handled yet)");
     assert_streq(agnos_nr_name(99), "unknown", "nr 99 = unknown (out of surface)");
 
     # --- register extraction from a synthetic user_regs_struct -------------
@@ -94,7 +94,8 @@ fn main() {
 
     # mmap 2 MB round-up (the load-bearing arithmetic — off by a granule = segfault).
     test_group("xlat-mmap-round");
-    assert_eq(mmap_round_up_2mb(0), 0, "0 -> 0");
+    assert_eq(mmap_round_up_2mb(0), 0x200000, "0 -> one 2 MB unit (the kernel's floor, 1.12.3)");
+    assert_eq(mmap_round_up_2mb(0 - 5), 0x200000, "negative -> one 2 MB unit");
     assert_eq(mmap_round_up_2mb(1), 2097152, "1 -> 2 MB");
     assert_eq(mmap_round_up_2mb(2097152), 2097152, "2 MB exact (no double-round)");
     assert_eq(mmap_round_up_2mb(2097153), 4194304, "2 MB + 1 -> 4 MB");
@@ -186,7 +187,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(6), 3, "close 6->3");
     assert_eq(agnos_to_linux_nr(33), 4, "stat 33->4");
     assert_eq(agnos_to_linux_nr(58), 8, "lseek 58->8");
-    assert_eq(agnos_to_linux_nr(8), 32, "dup 8->32");
+    assert_eq(agnos_to_linux_nr(8), 0 - 1, "dup#8 -> no peer (1.12.3: the kernel's identity, EMULATE)");
     assert_eq(agnos_to_linux_nr(31), 82, "rename 31->82");
     assert_eq(agnos_to_linux_nr(9), 83, "mkdir 9->83");
     assert_eq(agnos_to_linux_nr(10), 84, "rmdir 10->84");
@@ -222,13 +223,13 @@ fn main() {
     assert_eq(agnos_to_linux_nr(26), 0 - 1, "write_boot_checkpoint#26 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> no peer (v1.8.0: EMULATE, agnos-native struct)");
     assert_eq(agnos_to_linux_nr(35), 0 - 1, "sysinfo#35 -> no peer (v1.8.0: EMULATE, agnos-native struct)");
-    assert_eq(agnos_to_linux_nr(36), 0 - 1, "undefined#36 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(36), 0 - 1, "klug#36 -> ENOSYS (not handled yet: the 1.13.0 re-sync)");
     assert_eq(agnos_to_linux_nr(37), 0 - 1, "execwait#37 -> no peer (v1.10.0: EMULATE at the loop level, spawn-from-path + park)");
-    assert_eq(agnos_to_linux_nr(38), 0 - 1, "undefined#38 -> ENOSYS (ABI gap)");
-    assert_eq(agnos_to_linux_nr(39), 0 - 1, "undefined#39 -> ENOSYS (ABI gap)");
-    assert_eq(agnos_to_linux_nr(42), 0 - 1, "undefined#42 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(38), 0 - 1, "fbinfo#38 -> ENOSYS (a hardware band: the 1.x decision)");
+    assert_eq(agnos_to_linux_nr(39), 0 - 1, "blit#39 -> ENOSYS (a hardware band: the 1.x decision)");
+    assert_eq(agnos_to_linux_nr(42), 0 - 1, "kbscan#42 -> no peer (v1.11.0: EMULATE at the dispatcher)");
     assert_eq(agnos_to_linux_nr(43), 0 - 1, "spawn_path#43 -> no peer (v1.10.1: EMULATE at the loop level, spawn-from-path async)");
-    assert_eq(agnos_to_linux_nr(44), 0 - 1, "undefined#44 -> ENOSYS (ABI gap)");
+    assert_eq(agnos_to_linux_nr(44), 0 - 1, "sched_yield#44 -> ENOSYS (not handled yet: the 1.13.0 re-sync)");
     assert_eq(agnos_to_linux_nr(47), 0 - 1, "sock_connect#47 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(48), 0 - 1, "sock_send#48 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(49), 0 - 1, "sock_recv#49 -> ENOSYS (net band)");
@@ -250,6 +251,24 @@ fn main() {
     assert_eq(agnos_to_linux_nr(111), 0 - 1, "fd_kind#111 -> no peer (v1.12.1: EMULATE; Linux #111 is getpgrp)");
     assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
 
+    # --- 1.12.3 edge helpers ---
+    test_group("edges-1.12.3");
+    assert_eq(path_has_nul("abc", 3), 0, "no NUL in the first 3 bytes");
+    assert_eq(path_has_nul("abc", 4), 1, "the terminator counts once it is inside len");
+    var bl = alloc(64);
+    store8(bl + 0, 97); store8(bl + 1, 0); store8(bl + 2, 98); store8(bl + 3, 0);
+    assert_eq(spawn_blob_ok(bl, 4), 1, "a\\0b\\0 -> argv[0] length 1");
+    assert_eq(spawn_blob_ok(bl, 3), 0, "no final NUL -> refused");
+    assert_eq(spawn_blob_ok(bl, 1), 0, "shorter than 2 -> refused");
+    store8(bl + 0, 0);
+    assert_eq(spawn_blob_ok(bl, 4), 0, "an empty argv[0] -> refused");
+    var ek = 0;
+    while (ek < 34) { store8(bl + ek, 120); store8(bl + ek + 1, 0); ek = ek + 2; }   # 17 one-letter entries
+    assert_eq(spawn_blob_ok(bl, 34), 0, "17 entries -> refused (16 max)");
+    assert_eq(spawn_blob_ok(bl, 32), 1, "16 entries -> ok");
+    assert_eq(spawn_line_tokens("a  b c", 6), 3, "three tokens, a double space");
+    assert_eq(spawn_line_tokens("   ", 3), 0, "all spaces -> none");
+
     test_group("fs-ao-to-o");
     assert_eq(ao_to_o(0), 0, "RDONLY 0->0");
     assert_eq(ao_to_o(1), 1, "WRONLY 1->1");
@@ -264,6 +283,11 @@ fn main() {
     assert_eq(ao_to_o(0x3102), 0xC2 | 0x20000, "0x3102 (RDWR|CREAT|NOFOLLOW|EXCL) -> O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW");
     assert_eq(ao_to_o(0x4000), 0, "an unknown AO_* bit is NOT passed through (openat2 whitelist)");
     assert_eq(open_create_mode(), 384, "open mode = 0600 (0x180, least-privilege)");
+    assert_eq(ao_create_mode(0x102), 0 - 1, "no AO_MODE -> the default (1.12.3)");
+    assert_eq(ao_create_mode(0x4102 | (0x1ED << 32)), 0x1ED, "AO_MODE 0755 -> 0755");
+    assert_eq(ao_create_mode(0x4102 | (0xFFF << 32)), 0xFFF, "AO_MODE 07777 -> 07777");
+    assert_eq(ao_create_mode(0x4102 | (0x1000 << 32)), 0 - 2, "AO_MODE above 07777 -> refused");
+    assert_eq(ao_create_mode(0x102 | (0x1000 << 32)), 0 - 1, "mode bits without AO_MODE are ignored");
     assert_eq(mkdir_create_mode(), 448, "mkdir mode = 0700 (0x1C0, least-privilege)");
 
     test_group("fs-dtype");
@@ -305,18 +329,20 @@ fn main() {
     store8(glb + 55, 0);               # NUL
     var gab = alloc(128);
     var gbytes = getdents_repack(glb, 56, gab, 128);
-    assert_eq(gbytes, 25, "two records repack to 13+12=25 bytes");
-    assert_eq(load16(gab + 0), 13, "rec0 reclen = 8+5");
+    assert_eq(gbytes, 32, "two records repack to 16+16 bytes (each rounded to 8, 1.12.3)");
+    assert_eq(load16(gab + 0), 16, "rec0 reclen = 8+5 rounded to 16");
     assert_eq(load8(gab + 2), 1, "rec0 type = file");
     assert_eq(load8(gab + 3), 5, "rec0 namelen = 5");
     assert_eq(load32(gab + 4), 0x3456789A, "rec0 ino truncated to low 32");
     assert_eq(memeq(gab + 8, "alpha", 5), 1, "rec0 name = alpha (no NUL)");
-    assert_eq(load16(gab + 13), 12, "rec1 reclen = 8+4");
-    assert_eq(load8(gab + 15), 2, "rec1 type = dir");
-    assert_eq(load8(gab + 16), 4, "rec1 namelen = 4");
-    assert_eq(memeq(gab + 21, "beta", 4), 1, "rec1 name = beta");
-    # Overflow: a tiny cap stops before the first record's 13 bytes.
-    assert_eq(getdents_repack(glb, 56, gab, 10), 0, "cap 10 < 13 -> drop, return 0");
+    assert_eq(load8(gab + 13), 0, "rec0 padding zeroed");
+    assert_eq(load16(gab + 16), 16, "rec1 reclen = 8+4 rounded to 16");
+    assert_eq(load8(gab + 18), 2, "rec1 type = dir");
+    assert_eq(load8(gab + 19), 4, "rec1 namelen = 4");
+    assert_eq(memeq(gab + 24, "beta", 4), 1, "rec1 name = beta");
+    # Overflow: a cap that holds no record is -1 (the kernel's 1.57.18 rule), one that holds one returns it.
+    assert_eq(getdents_repack(glb, 56, gab, 10), 0 - 1, "cap 10 < 16 -> -1, never end-of-dir");
+    assert_eq(getdents_repack(glb, 56, gab, 20), 16, "cap 20 -> the first record only");
 
     # --- 0.7.1 path sanitization (the *at confinement gate — a bug here is an escape) ---
     test_group("sanitize-rootrel");
@@ -341,13 +367,13 @@ fn main() {
     assert_streq(sb, "a/..foo", "..foo preserved (not a .. component)");
     # ".." components in any position are REJECTED (-1):
     memcpy(sb, "/../etc", 7); store8(sb + 7, 0);
-    assert_eq(sanitize_rootrel(sb), 0 - 1, "/../etc -> reject (leading ..)");
+    assert_eq(sanitize_rootrel(sb), 0, "/../etc -> kept for openat2 to clamp (1.12.3)");
     memcpy(sb, "a/../b", 6); store8(sb + 6, 0);
-    assert_eq(sanitize_rootrel(sb), 0 - 1, "a/../b -> reject (internal ..)");
+    assert_eq(sanitize_rootrel(sb), 0, "a/../b -> kept (1.12.3)");
     memcpy(sb, "a/b/..", 6); store8(sb + 6, 0);
-    assert_eq(sanitize_rootrel(sb), 0 - 1, "a/b/.. -> reject (trailing ..)");
+    assert_eq(sanitize_rootrel(sb), 0, "a/b/.. -> kept (1.12.3)");
     memcpy(sb, "..", 2); store8(sb + 2, 0);
-    assert_eq(sanitize_rootrel(sb), 0 - 1, ".. -> reject (bare)");
+    assert_eq(sanitize_rootrel(sb), 0, ".. -> kept (1.12.3)");
 
     # --- Net band (v1.1.0) pure helpers (docs/adr/0012) --------------------
     test_group("net-htons");
@@ -404,6 +430,15 @@ fn main() {
     assert_eq(net_reserved_min_prefix(0xAC0F0001), 0, "172.15 not reserved -> 0");
     assert_eq(net_reserved_min_prefix(0xC0A80101), 16, "192.168 -> /16");
     assert_eq(net_reserved_min_prefix(0x08080808), 0, "8.8.8.8 public -> 0");
+    # 1.12.3: the blocks a broad allow must not reach
+    assert_eq(net_reserved_min_prefix(0x00000000), 8, "0.0.0.0 (routes to the local host) -> /8");
+    assert_eq(net_reserved_min_prefix(0x00FFFFFF), 8, "0.255.255.255 -> /8");
+    assert_eq(net_reserved_min_prefix(0x64400001), 10, "100.64.0.1 shared space -> /10");
+    assert_eq(net_reserved_min_prefix(0x64646464), 10, "100.100.100.100 -> /10");
+    assert_eq(net_reserved_min_prefix(0x64800000), 0, "100.128.0.0 is past 100.64/10 -> 0");
+    assert_eq(net_reserved_min_prefix(0xE0000001), 4, "224.0.0.1 multicast -> /4");
+    assert_eq(net_reserved_min_prefix(0xFFFFFFFF), 4, "255.255.255.255 -> /4");
+    assert_eq(net_reserved_min_prefix(0x01000000), 0, "1.0.0.0 public -> 0");
 
     test_group("net-egress-parse+decide");
     var ent = alloc(NET_ALLOW_MAX * ENTRY_SIZE);
@@ -418,6 +453,9 @@ fn main() {
     assert_eq(net_egress_ok(0x08080808, ent, n2), 1, "0/0 allows public 8.8.8.8");
     assert_eq(net_egress_ok(0x0A050507, ent, n2), 0, "0/0 does NOT expose RFC1918 [SSRF]");
     assert_eq(net_egress_ok(0xA9FEA9FE, ent, n2), 0, "0/0 does NOT expose metadata [SSRF]");
+    assert_eq(net_egress_ok(0x00000000, ent, n2), 0, "0/0 does NOT reach 0.0.0.0 (the local host) [1.12.3]");
+    assert_eq(net_egress_ok(0x64646464, ent, n2), 0, "0/0 does NOT expose 100.64/10 [1.12.3]");
+    assert_eq(net_egress_ok(0xE0000001, ent, n2), 0, "0/0 does NOT expose multicast [1.12.3]");
     # specific allow DOES reach a reserved block
     var n3 = net_parse_allow("127.0.0.1/32,10.0.0.0/8", ent, NET_ALLOW_MAX);
     assert_eq(n3, 2, "two CIDRs");
@@ -432,6 +470,17 @@ fn main() {
     assert_eq(net_parse_allow("99999999999999999999.0.0.0/8", ent, NET_ALLOW_MAX), 0 - 1, "overflow octet rejected (in-loop bound)");
 
     # net_config#61 parsing helpers (v1.3.0): dotted-quad + /proc/net/route hex.
+    test_group("net-listen-decode");
+    assert_eq(sock_listen_decode(8080), 8080, "a bare port -> class 0 (ANY)");
+    assert_eq(sock_listen_decode(8080 | (1 << 32)), (1 << 16) | 8080, "port | LOOPBACK -> class 1");
+    assert_eq(sock_listen_decode(65535), 65535, "port 65535");
+    assert_eq(sock_listen_decode(0), 0 - 1, "0 -> -1");
+    assert_eq(sock_listen_decode(1 << 32), 0 - 1, "class with port 0 -> -1");
+    assert_eq(sock_listen_decode(65536 + 80), 0 - 1, "bits 16-31 set -> -1 (no silent truncation)");
+    assert_eq(sock_listen_decode(80 | (2 << 32)), 0 - 1, "class 2 -> -1");
+    assert_eq(sock_listen_decode(80 | (1 << 40)), 0 - 1, "bits 40-63 set -> -1");
+    assert_eq(sock_listen_decode(0 - 80), 0 - 1, "negative -> -1");
+
     test_group("net-config-parse");
     var dq = alloc(32);
     memcpy(dq, "127.0.0.53", 10); store8(dq + 10, 0);

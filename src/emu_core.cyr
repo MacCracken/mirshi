@@ -1,0 +1,120 @@
+# src/dispatch.cyr — the IMPURE M1 syscall dispatcher (supervisor-only glue).
+#
+# Run mode uses PTRACE_SYSCALL (enter/exit stops). At the syscall-ENTER stop this
+# dispatcher rewrites the trapped registers and returns a STRAT_* code telling the
+# loop how to handle the matching EXIT stop:
+#   STRAT_EXECUTE — rewrite orig_rax to the Linux peer (+ synth/translate args) so
+#     the kernel runs it IN the child (pointers + a new mmap land natively); the
+#     loop maps the raw Linux return to the agnos convention at the exit stop.
+#   STRAT_EMULATE / STRAT_ENOSYS — SKIP the kernel syscall by setting orig_rax=-1
+#     (so the dangerous foreign agnos number is NEVER run as a Linux syscall), and
+#     stash the supervisor-computed return in `_xlat_emu_ret`; the loop writes it
+#     into rax at the exit stop (the skip path leaves rax=-ENOSYS otherwise).
+# agnos exit#0 is rewritten to a real Linux exit_group(code): the child terminates
+# and its status propagates through waitpid — no SIGKILL, no exit stop.
+#
+# The PURE translation arithmetic lives in src/translate.cyr (unit-tested). This
+# file is the ptrace + supervisor-side clock/sleep glue. x86_64 Linux only.
+#
+# INCLUDE ORDER (relies on the includer): src/intercept.cyr includes this AFTER
+# src/decode.cyr (REG_*/decode_*), the MirshiPtrace enum + pt() + _emit/_emit_int,
+# and src/translate.cyr (STRAT_*/the pure helpers).
+
+# Linux x86_64 syscall numbers the stdlib peer enum does NOT carry (chrono.cyr
+# uses these raw); mirshi defines them here for the supervisor-emulated timers.
+enum MirshiXlatNr {
+    SYS_TIME = 201;
+    SYS_CLOCK_GETTIME = 228;
+    SLEEP_MS_CAP = 3600000;     # mirror agnos's 1 h sleep cap
+    SYS_SCHED_GETAFFINITY = 204;# v1.8.0 sysinfo#35: the mirshi process's usable CPU mask -> cpu count
+    TIOCGWINSZ = 0x5413;        # ioctl: get the terminal window size (struct winsize: ws_row@0, ws_col@2)
+}
+
+# 0.7.1 rootfs confinement (docs/audit/2026-06-30-audit.md class-c fix). When a
+# --root is configured, every path-RESOLVING open#7 is rewritten to openat2 anchored
+# at a per-child rootfd with RESOLVE_IN_ROOT, so the kernel clamps absolute paths,
+# `..` traversal, AND symlink targets to the root (verified: all escape forms return
+# ENOENT, the host file is unreadable). x86_64 + Linux 5.6+ only.
+enum MirshiConfine {
+    SYS_OPENAT2 = 437;          # openat2(dirfd, path, &open_how, size) — the only RESOLVE_* op
+    OPEN_HOW_SIZE = 24;         # sizeof(struct open_how) {u64 flags; u64 mode; u64 resolve}
+    RESOLVE_IN_ROOT = 0x10;     # clamp resolution within the anchor dirfd (abs + .. + symlink)
+    RESOLVE_NO_MAGICLINKS = 0x2;  # block proc magic-links (/proc/*/root, /proc/*/fd/N, ...) — they
+    # can jump OUTSIDE a jail that contains /proc. (NB: this does NOT
+    # block /proc/self/mem — /proc/self is a regular symlink, clamped
+    # by IN_ROOT; the real /proc defense is a jail with no /proc.)
+    OPEN_RESOLVE = 0x12;        # RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS (the how.resolve we set)
+    O_PATH = 0x200000;          # rootfd open: an inert dirfd anchor (read/getdents -> EBADF)
+    ROOTFD = 100;               # the child's rootfs anchor fd (dup3'd here in _child_exec)
+    HOST_OPEN = 2;              # Linux open(2)  — used pre-execve in the child to get rootfd
+    HOST_CLOSE = 3;             # Linux close(2) — close the temporary low rootfd after dup3
+    HOST_DUP3 = 292;            # Linux dup3(2)  — pin rootfd at ROOTFD (flags=0, survives execve)
+    SYS_PIDFD_GETFD = 438;      # exec_redirect#62: dup the caller's dst_fd into the supervisor (files + pipes)
+    # bite 2: the path-mutation/metadata *at peers, anchored at ROOTFD with a
+    # lexically-sanitized relative path (the *at family has no RESOLVE_* of its own).
+    SYS_RENAMEAT2 = 316;        # rename#31 -> renameat2(ROOTFD, oldrel, ROOTFD, newrel, 0)
+    SYS_READLINKAT = 267;       # readlink#70 (--root)     -> readlinkat(ROOTFD, rel, buf, bufsize)
+    AT_REMOVEDIR = 0x200;       # unlinkat flag for rmdir (remove a directory, not a file)
+    SYS_PIPE2 = 293;            # v1.7.0 pipe#25 -> pipe2(int fds[2], flags) run IN the child
+}
+
+# Whether path confinement is active (a --root was configured). Set by intercept_run
+# in the supervisor BEFORE fork; read by the dispatcher to choose openat2 vs open(2).
+var _confine_active = 0;
+
+# Net band (v1.1.0, docs/adr/0012): whether the band is enabled (--net / --net-allow) + the
+# parsed egress allow-list (a packed {u64 net, u64 prefix} array + count) the emulated
+# connect/udp handlers check via net_egress_ok BEFORE opening a socket. Set by intercept_run
+# in the supervisor (run mode only). Deny-all when _net_count == 0 (default-deny). The
+# handlers that read these land in the follow-up bite; the plumbing is established here.
+var _net_active = 0;
+var _net_entries = 0;
+var _net_count = 0;
+# --net-listen-any: sock_listen#56 binds INADDR_ANY (all interfaces, the faithful agnos behavior)
+# instead of the safe loopback-only default. Ingress posture (docs/adr/0012). Set by intercept_run.
+var _net_listen_any = 0;
+
+# A supervisor-side 24-byte struct open_how staging buffer (lazily allocated once —
+# never per call, same discipline as _emu_ts_buf), filled then staged into the child.
+var _how_buf = 0;
+fn _how_buf_get(): i64 {
+    if (_how_buf == 0) { _how_buf = alloc(OPEN_HOW_SIZE); }
+    return _how_buf;
+}
+
+# The supervisor-computed return for the current EMULATE/ENOSYS call, carried
+# from the enter stop (where it is computed + the syscall skipped) to the exit
+# stop (where the loop writes it into the child's rax). Single in-flight call per
+# child + strict enter/exit alternation make a one-slot global safe here.
+var _xlat_emu_ret = 0;
+
+# Carry state for the M2 stat/getdents OUTPUT repack: the original agnos output
+# pointer the child gave us, its capacity (getdents), the red-zone scratch the
+# Linux struct was written into, and which repack to run. Set at the ENTER stop,
+# consumed at the EXIT stop. Single in-flight call per child + strict enter/exit
+# alternation make these one-slot globals safe (same discipline as _xlat_emu_ret).
+var _m2_out_ptr = 0;    # the agnos output pointer the child gave us (stat/getdents)
+var _m2_out_cap = 0;    # the agnos output capacity (getdents bufsize)
+var _m2_scratch = 0;    # the red-zone scratch the Linux output struct was written into
+
+# A 16-byte timespec scratch for the supervisor-emulated timers (uptime_ms#40 /
+# sleep_ms#41), allocated ONCE (lazily) — never per call. The bump allocator never
+# frees, so a per-call alloc here let a child that loops an emulated timer grow the
+# supervisor's heap without bound (a child-driven supervisor-OOM DoS, 0.6.0 hardening
+# — see docs/adr/0008). Single in-flight call per child + strict enter/exit
+# alternation make one shared slot safe (same discipline as _xlat_emu_ret); each call
+# overwrites both fields before use.
+var _emu_ts = 0;
+fn _emu_ts_buf(): i64 {
+    if (_emu_ts == 0) { _emu_ts = alloc(16); }
+    return _emu_ts;
+}
+
+# Fail a translated fs call without running it: skip the syscall (orig_rax=-1)
+# and inject the agnos error sentinel -1. Used when path staging short-fails.
+fn _m2_fail(pid, regs): i64 {
+    _xlat_emu_ret = 0 - 1;
+    store64(regs + REG_ORIG_RAX, 0 - 1);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EMULATE;
+}

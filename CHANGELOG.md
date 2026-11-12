@@ -4,6 +4,112 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.3] - 2026-11-12
+
+The P(-1) sweep: a whole-tree review against the agnos kernel at `aef48206` (1.57.19), with its repairs.
+The findings and their dispositions are in [`docs/audit/2026-11-12-audit.md`](docs/audit/2026-11-12-audit.md).
+
+### Security
+
+- **Confined path ops run in the supervisor** (`src/band_fs.cyr`):
+  - Under `--root`, `mkdir` / `rmdir` / `unlink` / `rename` / `link` / `stat` / `readlink` resolve their
+    parent directory with `openat2(RESOLVE_IN_ROOT)` on a supervisor-held root fd, then act on the fd it
+    returns.
+  - A symlink inside the rootfs that names an absolute host path now resolves inside the root.
+  - `..` clamps at the root, as on the kernel. A final `.` / `..` is refused.
+  - The child's seccomp allowlist loses `mkdirat` / `unlinkat` / `renameat2` / `linkat` / `newfstatat` /
+    `readlinkat`, and the long-unused `getpid`.
+  - ADR 0009 is amended.
+- **A child starts with fds 0–2 and its root anchor only** (`src/intercept.cyr`):
+  - Every other inherited fd is closed before exec (`close_range`).
+  - `close#6` refuses fd ≥ 32, so the anchor (fd 100) cannot be closed.
+  - `dup#8` is the kernel's identity.
+- **`execwait#37` / `spawn_path#43` paths resolve inside the root** under `--root` (`openat2` +
+  `execveat`).
+- **Egress reserved blocks** add 0.0.0.0/8, 100.64.0.0/10, 224.0.0.0/4 and 240.0.0.0/4. A broad allow
+  does not cover them.
+- **`sock_listen#56` decodes its argument** as the kernel does (`sock_listen_decode`):
+  - The port must be 1..65535, the class 0 or 1, and the other bits 0.
+  - A loopback-class listener stays on 127.0.0.1 under `--net-listen-any`.
+- **`udp_bind#51` drops `SO_REUSEADDR`**, so a port that is already bound is refused, as on the kernel.
+- **Paths** with a NUL inside their length, or of length 0, are refused.
+- **`spawn#3`'s image memfd** is `MFD_CLOEXEC`.
+
+### Fixed
+
+- **Children are cleaned up:**
+  - A dead child's host sockets are closed and its slots freed (`_child_release`). Its record slot keeps
+    the tables for reuse.
+  - Records no one can wait for are freed (`_reap_orphans`). Long runs used to fill the 16-slot table
+    with orphans and run out of fds.
+- **Trace-loop robustness:**
+  - A failed enter-stop `GETREGS` skips the stop.
+  - The host-pid lookup ignores exited records.
+- **Net receive and accept:**
+  - `sock_accept#57` finds a slot before it accepts.
+  - TCP and UDP receives peek, then take the data only after the child's buffers were written. A failed
+    write lost it.
+- **`spawn_path#43`:**
+  - The kernel's `len | flags` argument is decoded: `SPAWN_F_ARGV` blobs (validated: 2..1024 bytes, a
+    final NUL, 1..16 entries) and `SPAWN_F_CLEANFD`.
+  - It answers `-2` (table full) and `-6` (bad arguments), and refuses more than 16 tokens.
+  - The stdlib's `exec_*` / `run` used the argv form, which always failed before.
+- **Kernel edge answers:**
+  - `close#6`: a free fd < 32 closes to 0, and so does a closed signalfd.
+  - `open#7`: `AO_MODE` (bits 32..63) sets the create mode; above 07777 is refused.
+  - `getdents#29`: records are padded to 8; -1 when no record fits or the size is negative.
+  - `mmap#27` / `munmap#28`: a length ≤ 0 is 2 MB.
+  - `sleep_ms#41`: a negative value is -1.
+  - `lseek#58`: a whence outside 0..2 is -1.
+  - `getrandom#45`: a length ≤ 0 is 0, and the flags are ignored.
+- **Net arguments:**
+  - `sock_connect#47` / `udp_bind#51` take ports 1..65535.
+  - `udp_send#52` answers the frame length (payload + 42) and refuses more than 1472 bytes, with
+    len ≤ 0 → 0 first.
+  - `udp_recv#53` answers 0 for maxlen ≤ 0 first.
+  - `net_config#61` fields 4..11 are 0.
+- **Signals and epoll:**
+  - `kill#16`: signal 0 is the kernel's probe (0).
+  - `epoll_ctl#20`: an unknown op is 0, and op 3 is -1 until it is implemented.
+  - `epoll_wait#21`: the kernel's argument checks.
+- **The ENOSYS diagnostic** is printed once per number.
+
+### Changed
+
+- **Emulated calls get their answer at the enter stop**, which saves two ptrace calls each (getpid
+  25.4 → 24.1 µs per call).
+- **`src/dispatch.cyr` is split** (2,585 lines; a pure move in the same order) into:
+  - `src/emu_core.cyr`;
+  - the band files `src/band_{fs,net,signals,iomux,info,kbscan,fdkind,console}.cyr`;
+  - `src/dispatch.cyr` itself, which keeps `translate_dispatch`.
+- **28 constants** that the stdlib defines with the same value are removed from `src/`.
+- **`CHILD_REC_SIZE` is unchanged**, but the record table is zeroed once at creation.
+- **The roadmap** is rewritten: the 1.12 line is closed, and the sweep's design items are filed under
+  1.13.x–1.16.x and 1.x.
+
+### Tests
+
+- `tests/mirshi.tcyr` 402 → 440:
+  - the reserved egress blocks;
+  - `sock_listen_decode`;
+  - `ao_create_mode`;
+  - `path_has_nul`;
+  - `spawn_blob_ok` / `spawn_line_tokens`;
+  - the getdents padding and the mmap floor;
+  - the 1.12.3 freeze labels.
+- **New gates:**
+  - `scripts/it/churn.sh`: 40 children re-binding one UDP port, and 30 orphaning rounds.
+  - `scripts/it/edges.sh`: the kernel edge answers above.
+- **Extended gates:**
+  - `confine.sh`: path ops through an in-root host symlink, inherited fds, and execwait under `--root`.
+  - `net_server.sh`: the listen class.
+  - `net_udp.sh`: the UDP contract.
+  - `spawn.sh`: the argv form.
+- **Updated to the kernel's answers:** `signals.sh`, `epoll.sh`, `net_config.sh`.
+- **Regression checks:** `churn.sh` fails against builds with the child release or the orphan reaping
+  removed. `confine.sh`'s fd case failed before the fd cleanup landed.
+- **Re-verified:** `cyrius test` 440/0 + 2/0; all 31 `scripts/it/*` gates; `docker/smoke.sh`.
+
 ## [1.12.2] - 2026-11-12
 
 Quick kernel-fidelity repairs: places where mirshi gave a different answer than the agnos kernel, each

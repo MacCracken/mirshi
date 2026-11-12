@@ -6,7 +6,7 @@
 > returns **ENOSYS**. The source of truth is the code (`src/translate.cyr` +
 > `src/dispatch.cyr` + `src/decode.cyr`); this table mirrors it and is **pinned by
 > tests** (`tests/mirshi.tcyr`: `xlat-nr`, `fs-nr`, `xlat-coverage` assert
-> `agnos_to_linux_nr` for every number 0–61 + boundaries). Changing a row is a
+> `agnos_to_linux_nr` for every number 0–63 and each handled number above it, plus boundaries). Changing a row is a
 > deliberate contract change — update the code, this doc, **and** the freeze test together.
 > The v1.0 **core is frozen**; the **net band** (#47–50 TCP client / #56–57 TCP server / #51–54 UDP /
 > `icmp_echo#55` / `net_config#61`) is a documented **post-v1 extension** (v1.1.0–v1.4.0, EMULATE
@@ -26,7 +26,7 @@ not `rcx`). The agnos error convention is a **bare `-1`** for most calls (mmap#2
 time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 ([`linux_ret_to_agnos`](../../src/translate.cyr)).
 
-## Matrix (agnos# 0–61)
+## Matrix (agnos# 0–63, and the handled numbers above)
 
 | # | name | disp. | Linux peer | notes |
 |--:|------|:-----:|-----------:|-------|
@@ -36,9 +36,9 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 3 | spawn | EMULATE ³ | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
 | 4 | waitpid | EMULATE ³ | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
-| 6 | close | EXECUTE | `close` (3) | |
-| 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../../src/translate.cyr)); mode 0600 on `O_CREAT` |
-| 8 | dup | EXECUTE | `dup` (32) | |
+| 6 | close | EXECUTE | `close` (3) | **v1.12.3:** fd < 0 or ≥ 32 → −1 (the kernel's table); a free fd < 32 → 0, not EBADF; a closed emulated fd → 0. |
+| 7 | open | EXECUTE | `open` (2) ¹ | path staged (NUL-term); `AO_*`→`O_*` ([`ao_to_o`](../../src/translate.cyr)); mode 0600 on `O_CREAT` **v1.12.3:** `AO_MODE` (0x4000) sets the create mode from bits 32..63 (above 07777 → −1); a path with an interior NUL, or of length 0, → −1. |
+| 8 | dup | EMULATE | — | **v1.12.3:** the kernel's identity — returns its argument (Linux `dup` minted fds the kernel never would) |
 | 9 | mkdir | EXECUTE | `mkdir` (83) ¹ | path staged; mode 0700 |
 | 10 | rmdir | EXECUTE | `rmdir` (84) ¹ | path staged |
 | 11 | mount | ENOSYS | — | stub |
@@ -46,20 +46,20 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 13 | reboot | ENOSYS | — | |
 | 14 | pause | EMULATE ⁴ | — | signals (v1.6.0): **bounded yield** — returns 0 (idle a quantum, or immediately if a deliverable signal is pending); never wedges the recv poll loop; loop-level |
 | 15 | getuid | EMULATE ⁶ | — | info getters (v1.8.0): `getuid`/`geteuid` → **0** (always root; never the host uid) |
-| 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level |
+| 16 | kill | EMULATE ⁴ | — | signals (v1.6.0): sets `1<<sig` in the target's pending mask; self/direct-child scope, pid 0 protected, sig 1..63; loop-level **v1.12.3:** signal 0 is the kernel's probe → 0 (authorized target, nothing posted). |
 | 17 | sigprocmask | EMULATE ⁴ | — | signals (v1.6.0): read/apply/write the caller's blocked mask (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`), oldset round-trip. **v1.12.2:** `set` is required (NULL → −1, as on the kernel); `how` ≥ 2 stores the set verbatim |
 | 18 | signalfd | EMULATE ⁴ | — | signals (v1.6.0): opaque `SIGFD_BASE+slot` fd (per-child slot table). **v1.12.2, the kernel's contract:** every call is a new signalfd (fd and flags not consulted); `read#5` stores the lowest pending & watched signal — the blocked mask not consulted — as a **4-byte** number and answers 4, 0 when nothing is pending, −1 for a count < 4; `close#6` frees the slot |
 | 19 | epoll_create | EMULATE ⁵ | — | I/O-mux (v1.7.0): a per-child epoll instance (`EPOLL_BASE+slot`), an 8-watch list of raw agnos ids |
-| 20 | epoll_ctl | EMULATE ⁵ | — | I/O-mux (v1.7.0): op 1=ADD (dedup, 8-cap), op 2=CLEAR (whole list; fd ignored) |
-| 21 | epoll_wait | EMULATE ⁵ | — | I/O-mux (v1.7.0): heterogeneous **bounded-yield** readiness — `ppoll` sockets + mask-test signalfds + clock-test timerfds; packed 12 B events; never parks |
+| 20 | epoll_ctl | EMULATE ⁵ | — | I/O-mux (v1.7.0): op 1=ADD (dedup, 8-cap), op 2=CLEAR (whole list; fd ignored) **v1.12.3:** an unknown op → 0 (the kernel falls through); op 3 SET → −1 until implemented. |
+| 21 | epoll_wait | EMULATE ⁵ | — | I/O-mux (v1.7.0): heterogeneous **bounded-yield** readiness — `ppoll` sockets + mask-test signalfds + clock-test timerfds; packed 12 B events; never parks **v1.12.3:** `max < 0`, reserved bits above 32, a timed wait with room for no record, or a NULL events pointer → −1. |
 | 22 | timerfd_create | EMULATE ⁵ | — | I/O-mux (v1.7.0): a supervisor-side deadline (`TIMERFD_BASE+slot`); no real Linux timerfd |
 | 23 | timerfd_settime | EMULATE ⁵ | — | I/O-mux (v1.7.0): arm a `CLOCK_MONOTONIC` deadline (seconds; capped); `read#5` delivers the expiration count |
 | 24 | umount | ENOSYS | — | stub |
 | 25 | pipe | EXECUTE ⁵ | `pipe2` (293) | I/O-mux (v1.7.0): run **in the child** (`O_CLOEXEC`); exit-stop 2×i32→2×u64 repack; the sole child-bound delta. Not via `agnos_to_linux_nr` (intercepted before it) |
 | 26 | write_boot_checkpoint | ENOSYS | — | agnos-kernel-only |
-| 27 | mmap | EXECUTE | `mmap` (9) | a1=length → 6-arg synth: anon/private, `PROT_READ\|WRITE`, fd=-1, 2 MB round-up; fail→`0` |
+| 27 | mmap | EXECUTE | `mmap` (9) | a1=length → 6-arg synth: anon/private, `PROT_READ\|WRITE`, fd=-1, 2 MB round-up; fail→`0` **v1.12.3:** a length ≤ 0 is one 2 MB unit (the kernel's floor), as is `munmap#28`'s. |
 | 28 | munmap | EXECUTE | `munmap` (11) | length 2 MB round-up (matches mmap granularity) |
-| 29 | getdents | EXECUTE | `getdents64` (217) | one-page scratch staged; Linux→agnos dirent repack at exit (cap 4096) |
+| 29 | getdents | EXECUTE | `getdents64` (217) | one-page scratch staged; Linux→agnos dirent repack at exit (cap 4096) **v1.12.3:** records padded to 8 (the kernel's writer); a buffer that holds no record, or a negative size, → −1. |
 | 30 | unlink | EXECUTE | `unlink` (87) ¹ | path staged |
 | 31 | rename | EXECUTE | `rename` (82) ¹ | two paths staged; a4=r10 |
 | 32 | link | EXECUTE | `link` (86) ¹ | two paths staged; a **HARDLINK** (symlinks are `symlink#63`) |
@@ -70,27 +70,27 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path |
 | 38–39 | fbinfo / blit | ENOSYS | — | the framebuffer pair. A hardware band: permanent ENOSYS or a headless emulation is an open decision ([roadmap](../development/roadmap.md) 1.x) |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
-| 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; ≤0 → 0; cap 1 h |
+| 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; 0 → 0, **negative → −1** (v1.12.3, the kernel); cap 1 h |
 | 42 | kbscan | EMULATE | — | **v1.11.0:** the raw Set-1 scancode drain, synthesized from mirshi's stdin (the tty armed raw + non-blocking on the first call; a pipe works too) — cyim's per-key channel |
-| 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) |
+| 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) **v1.12.3:** `a2 = len | flags` decoded — `SPAWN_F_ARGV` (bit 16, a NUL-separated argv blob, 2..1024 B, 1..16 entries) and `SPAWN_F_CLEANFD` (bit 17); −2 table full, −6 bad arguments or more than 16 tokens; under `--root` the path resolves inside the root. |
 | 44 | sched_yield | ENOSYS | — | not handled yet — the 1.13.0 re-sync |
-| 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs |
+| 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs **v1.12.3:** a length ≤ 0 → 0 and the flags are ignored, as on the kernel (EMULATE for that case). |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
-| 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress |
+| 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress **v1.12.3:** port 1..65535, else −1. |
 | 48 | sock_send | EMULATE ² | — | net band client (v1.1.0): pvm-staged `send` (`MSG_NOSIGNAL`). **v1.12.2:** the ~8 s window expiring with nothing sent answers 0 (the committed count, the kernel's D6 rule), not −1 |
 | 49 | sock_recv | EMULATE ² | — | net band client (v1.1.0): **inverted EOF** (0=WOULD_BLOCK, −1=EOF) |
 | 50 | sock_close | EMULATE ² | — | net band (v1.1.0): free the slot; a LISTEN slot reaps children (v1.2.0) |
-| 51 | udp_bind | EMULATE ² | — | net band UDP (v1.3.0): bound DGRAM socket; loopback-default |
-| 52 | udp_send | EMULATE ² | — | net band UDP (v1.3.0): per-datagram egress; packed `(sport<<16)\|dport` |
-| 53 | udp_recv | EMULATE ² | — | net band UDP (v1.3.0): sender `addr_out` {ip@0, port@8}; no EOF |
+| 51 | udp_bind | EMULATE ² | — | net band UDP (v1.3.0): bound DGRAM socket; loopback-default **v1.12.3:** port 1..65535; no `SO_REUSEADDR`, so a bound port → −1. |
+| 52 | udp_send | EMULATE ² | — | net band UDP (v1.3.0): per-datagram egress; packed `(sport<<16)\|dport` **v1.12.3:** len ≤ 0 → 0, len > 1472 → −1, then buffer / source port / egress; answers the frame length (payload + 42). |
+| 53 | udp_recv | EMULATE ² | — | net band UDP (v1.3.0): sender `addr_out` {ip@0, port@8}; no EOF **v1.12.3:** maxlen ≤ 0 → 0 first; the datagram is taken only after `buf` and `addr_out` were written (a bad one → −1, datagram kept). |
 | 54 | udp_unbind | EMULATE ² | — | net band UDP (v1.3.0): free the SLOT_UDP |
 | 55 | icmp_echo | EMULATE ² | — | net band ICMP (v1.4.0): unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping; RTT ms (≥0, sub-ms=0) / −1; bounded ~3s |
-| 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) |
+| 56 | sock_listen | EMULATE ² | — | net band server (v1.2.0): bind+listen; loopback-default (`--net-listen-any`) **v1.12.3:** the argument decoded as the kernel does (port 1..65535, class 0 ANY / 1 LOOPBACK, other bits 0); a LOOPBACK listener stays on 127.0.0.1 under `--net-listen-any`. |
 | 57 | sock_accept | EMULATE ² | — | net band server (v1.2.0): `accept4` → a fresh conn_id |
-| 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical |
+| 58 | lseek | EXECUTE | `lseek` (8) | `(fd,offset,whence)` identical **v1.12.3:** a whence outside 0..2 → −1. |
 | 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta. **v1.12.2:** an fd that is not a file or a directory, or outside [0, 32), is −1 before the EXECUTE, as on the kernel |
 | 60 | winsize | EMULATE ⁷ | — | tty sizing (v1.9.0): `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default if no tty); the whole direction-1 graphics surface |
-| 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) |
+| 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) **v1.12.3:** fields 4..11 (the kernel's counters) → 0. |
 | 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
 | 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
 
@@ -101,13 +101,14 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 
 **#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3) and the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
-¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md)) the
-filesystem ops re-anchor at the child's rootfd: `open`→`openat2` (437, `RESOLVE_IN_ROOT`),
-`mkdir`→`mkdirat` (258), `rmdir`→`unlinkat` (263, `AT_REMOVEDIR`), `unlink`→`unlinkat` (263),
-`rename`→`renameat2` (316), `link`→`linkat` (265), `stat`→`newfstatat` (262), with the path
-lexically sanitized (`sanitize_rootrel`). The fd-based ops (`read`/`write`/`lseek`/`dup`/
-`close`/`getdents`) ride a fd from a confined `open`, so they are transitively confined.
-Without `--root`, the peers in the table above apply (transparent pass-through).
+¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md), amended v1.12.3):
+`open#7` runs in the child as `openat2(ROOTFD, path, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`. Since v1.12.3
+`mkdir` / `rmdir` / `unlink` / `rename` / `link` / `stat` / `readlink` run **in the supervisor**: each resolves
+its parent directory with the same `openat2` flags on a supervisor-held root fd, then calls `mkdirat` /
+`unlinkat` / `renameat2` / `linkat` / `readlinkat` on that fd (`stat`: `openat2(O_PATH)` + `fstat`). `..`
+clamps at the root, as on the kernel. The fd-based ops (`read`/`write`/`lseek`/`close`/`getdents`) ride
+fds from a confined `open`, and the child holds no other fd: it starts with 0–2 and ROOTFD only. Without
+`--root`, the peers in the table above apply (transparent pass-through).
 
 ² **Net band (post-v1 extension, `--net`).** #47–50 (TCP client, v1.1.0), #56/#57 (TCP server,
 v1.2.0), #51–54 (UDP) + `net_config#61` (v1.3.0), and `icmp_echo#55` (ICMP, v1.4.0) are

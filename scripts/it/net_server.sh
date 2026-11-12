@@ -77,5 +77,43 @@ EOF
 server_case "loopback-default (bind 127.0.0.1)" --net
 server_case "--net-listen-any (bind 0.0.0.0)"   --net-listen-any
 
+# 1.12.3: the listen CLASS. Under --net-listen-any a LOOPBACK-class listener (port | 1 << 32, the stdlib's
+# sock_bind(127.0.0.1)) must still be bound to 127.0.0.1, and a malformed argument must be refused.
+lport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+cat > "$sbox/lclass.cyr" <<EOF
+include "lib/syscalls.cyr"
+fn main(): i64 {
+    if (syscall(56, 0) != (0 - 1)) { return 3; }                    # port 0
+    if (syscall(56, $lport | (2 << 32)) != (0 - 1)) { return 4; }   # class 2
+    if (syscall(56, 65536 + $lport) != (0 - 1)) { return 5; }       # bits 16-31: no silent truncation
+    var l = syscall(56, $lport | (1 << 32));                        # LOOPBACK class
+    if (l < 0) { return 6; }
+    syscall(1, 1, "LISTENING\n", 10);
+    syscall(41, 1500);
+    return 0;
+}
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/lclass.cyr" "$sbox/lclass" >/dev/null 2>&1 || { echo "FAIL: lclass fixture did not build" >&2; exit 1; }
+timeout 20 "$mirshi" --net-allow 127.0.0.1/32 --net-listen-any "$sbox/lclass" >"$sbox/lclass.out" 2>/dev/null &
+lpid=$!
+for _ in $(seq 1 50); do grep -q LISTENING "$sbox/lclass.out" 2>/dev/null && break; sleep 0.1; done
+laddr="$(python3 - "$lport" <<'PY2'
+import sys
+port = "%04X" % int(sys.argv[1])
+for line in open("/proc/net/tcp").read().splitlines()[1:]:
+    f = line.split()
+    if f[1].endswith(":" + port) and f[3] == "0A":
+        print(f[1].split(":")[0])
+PY2
+)"
+wait "$lpid"; lrc=$?
+if [ "$lrc" -eq 0 ] && [ "$laddr" = "0100007F" ]; then
+    echo "OK: sock_listen#56 class — LOOPBACK stays on 127.0.0.1 under --net-listen-any; port 0 / class 2 / stray bits refused"
+else
+    echo "FAIL: sock_listen#56 class: rc=$lrc local=${laddr:-none} (want 0100007F)" >&2; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "net_server: FAILED" >&2; exit 1; fi
 echo "OK: net_server — TCP server (listen/accept/recv/send) + close-reaps-children"

@@ -274,6 +274,17 @@ jobs:
         # stops reading (not #48's ~8 s window), and the stdlib's own socket write path with no ENOSYS line.
         run: bash scripts/it/send_dl.sh
 
+      - name: Child churn — release + orphan reaping (v1.12.3)
+        # v1.12.3: many short-lived children. A dead child's host sockets are closed and its slots freed (40
+        # children re-bind one UDP port), and records no one can wait for are reaped (30 orphaning rounds leave
+        # the 16-slot table usable). Same-uid ptrace requirement; python3 for a free port.
+        run: bash scripts/it/churn.sh
+
+      - name: Kernel edge answers (v1.12.3)
+        # v1.12.3: getrandom / sleep_ms / dup / close / lseek / open / mmap / getdents at their edges (negative and
+        # zero lengths, fd ranges, an interior NUL, a too-small buffer) answer as the agnos kernel does.
+        run: bash scripts/it/edges.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

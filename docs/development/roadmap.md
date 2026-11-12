@@ -25,68 +25,13 @@ kernel has since made right on its side were dropped:
 
 ---
 
-## 1.12.2 — quick kernel-fidelity repairs
+The 1.12 line is done: 1.12.2 (kernel-fidelity repairs) and 1.12.3 (the P(-1) sweep, findings in
+[`../audit/2026-11-12-audit.md`](../audit/2026-11-12-audit.md)). What the sweep found and did not fix is
+filed below, each under the release it belongs to.
 
-Small, self-contained fixes where mirshi gives a different answer than the kernel. Each one is a
-contained change with a kernel line to check it against.
-
-**The signal band** (filed 2026-10-12 from darshana's 1.1.4 audit; together they meant an agnos
-signalfd never received a signal under mirshi):
-1. **A signalfd reads `pending & watched`, ignoring the blocked mask**, as the kernel's
-   `vfs_read_signalfd` and its epoll readiness test do. A signalfd consumer must block the signals
-   first, so under mirshi the signal a program waits for was exactly the one it could never read.
-   ADR 0014's `~blocked` term is corrected.
-2. **The signalfd `read#5` record is the kernel's.** A count below 4 is -1. With nothing pending the
-   answer is 0. Otherwise a 4-byte signal number is stored and the answer is 4. mirshi wrote 8 bytes,
-   required 8, and answered -1 for "nothing pending". The kernel's 1..63 range, which mirshi already
-   used, is unchanged.
-3. **`close#6` on a signalfd frees its slot.** It stayed taken, so the 9th `signalfd#18` in a process
-   was -1, and `fd_kind#111` kept answering SIGNALFD for a closed one.
-4. **`signalfd#18` always makes a new signalfd**, as the kernel does: it ignores the fd argument and
-   the flags. mirshi updated an existing one when given its id, and stored the flags word in the
-   slot's in-use marker, so a flags value of -1 freed the slot.
-5. **`sigprocmask#17` edges.** A NULL or unreadable `set` is -1, as on the kernel. `how` other than
-   0 (BLOCK) or 1 (UNBLOCK) stores the set verbatim, where mirshi left the mask unchanged for
-   `how >= 3`.
-
-**Other fidelity:**
-
-6. **`flock#59` refuses an fd that is neither a file nor a directory** (a pipe, a terminal, a device),
-   and refuses fd < 0 or >= 32, as the kernel does. This is what is left of hapi's 2026-10-28 finding:
-   the kernel now locks directories too.
-7. **`sock_send#48` answers 0, not -1, when its ~8 s window expires with nothing sent.** The kernel
-   returns the committed count (`TCP_PROGRESS_US`: "#48 returns the committed count after this long
-   with no ACK progress"); a -1 told the program its connection was dead. Found in the 1.12.1 review.
-8. **Coverage-doc corrections.** `kbscan#42` is listed as an undefined gap although it has been handled
-   since 1.11.0. #36 (`klug`), #38/#39 (`fbinfo`/`blit`) and #44 (`sched_yield`) are real agnos calls
-   now (still ENOSYS, see 1.13.0). `link#32`'s gap note says agnos has no symlink call, but #63 has
-   existed since 1.10.2.
-
-## 1.12.3 — P(-1) sweep: audit, refactor, hardening, optimization, security, and repairs
-
-A whole-tree pass with no new syscalls, ending in the repairs it finds. Scope:
-- **Correctness audit** of every arm against the kernel's current code (the drift found above suggests
-  more).
-- **Security sweep:**
-  - every `pvm_read`/`pvm_write` length and pointer;
-  - every child-controlled integer;
-  - the child seccomp allowlist kept least-privilege;
-  - the supervisor's own fds, signals and heap bounds.
-- **Hardening:** fault injection over the new arms (#109–#111) and the 1.12.2 changes.
-- **Refactor:** `src/dispatch.cyr` is ~2,200 lines, one file for every band.
-- **Optimization:** the per-syscall hot path (ADR 0010 is the last pass).
-
-Seeds already noticed:
-- `src/` still declares local `SYS_*` / `O_*` / `SO_*` numbers that the stdlib has since grown with the
-  same values (`SYS_PPOLL`, `SYS_MEMFD_CREATE`, `SYS_SENDTO` …). They compile silently today, but would
-  break the build if a stdlib value ever changed.
-- The `xlat-coverage` freeze test's labels name #36/#38/#39/#42/#44 as gaps.
-- `state.md`'s version history has gaps (1.10.1–1.11.3 are one line).
-- README's version paragraph stops at 1.11.1.
-- `docs/reference/syscall-coverage.md` is headed "agnos# 0–61" but now has rows up to #111.
-- The kernel's `sigprocmask#17` stores `oldset` before it reads `set`, so with `set == oldset`
-  (which POSIX allows) it reads back the old mask. mirshi keeps the POSIX-correct order. Report this
-  upstream rather than copy it.
+**Upstream report, ready to file:** the kernel's `sigprocmask#17` writes `oldset` before it reads `set`,
+so `set == oldset` applies the old mask. mirshi keeps the POSIX order (ADR 0014, *Amendment*). The draft
+is in the audit doc.
 
 ---
 
@@ -109,9 +54,31 @@ see 1.x).
   - mirshi passes `[NULL]` for the root child, `spawn#3`, `#37` and `#43`. So `getenv("HOME")` is null
     under mirshi, and hapi's `$HOME`-scoped verbs cannot run.
   - Under `--root`, `PWD` and `chdir` must stay inside the rootfs.
-- **1.13.2 — `fork#96`:** a second process image, traced like a `spawn#3` grandchild but sharing the
+  - **`exec_redirect#62`**, from the sweep:
+    - Its arm is one global, where the kernel keeps a set of up to 4 pairs per process.
+    - `REDIR_ADD` (`2>&1`) and `REDIR_CLEAR` (0x200) are not decoded, and src/dst outside [0, 32)
+      are not refused.
+    - The arm is not cleared when a `#37`/`#43` returns early.
+  - **Children of `#37`/`#43` start with fds 0–2 only** (1.12.3). Without `SPAWN_F_CLEANFD` the kernel
+    hands them the caller's table instead.
+  - **`spawn_path#43`/`execwait#37` exec failures** (-4 / -5 on the kernel) answer a pid under mirshi. It
+    needs an exec-status pipe from the grandchild.
+- **1.13.2 — the process band re-sync** (from the sweep). This needs a decision first.
+  - **The pid model:** the kernel's pids are process-table slots 0..15, reused. mirshi's are monotonic
+    (ADR 0013), and the stdlib's `sys_waitpid_block` refuses a pid above 15.
+  - **`waitpid#4`:**
+    - A plain call is a poll on the kernel: -2 while the child lives. mirshi parks the caller until the
+      child exits.
+    - mirshi does not support `0x100|pid` (WAIT_BLOCK), `0x1FF` (wait-any), or the restriction to
+      the caller's own children.
+    - The status word should be `0x100|sig` for a signal death and `128 + vector` for a fault; mirshi
+      answers -1.
+  - **`kill#16`:** signal 9 should end the target, 18/19 continue and stop it, `KILL_TREE` (0x100) signal
+    the whole tree, and a partial tree stop answer -2.
+  - **`spawn#3`'s image cap:** the kernel's is 16 KB. Decide whether mirshi follows it.
+- **1.13.3 — `fork#96`:** a second process image, traced like a `spawn#3` grandchild but sharing the
   parent's memory image at the fork point.
-- **1.13.3 — channels `chan_op#97`:** the PTY band a terminal emulator hands its child. It is
+- **1.13.4 — channels `chan_op#97`:** the PTY band a terminal emulator hands its child. It is
   `fd_kind`'s FDK_CHAN, which mirshi never answers today.
 - **Then:** `shm_*#71–74` and `ptrscan#98`. Read their arms before scheduling them.
 
@@ -135,6 +102,28 @@ Bigger divergences that need a design choice, not a one-line fix:
   `read`, so `sys_read_nb` blocks. darshana's terminal reads use it.
 - **`console_mode#110`:** a FLUSH while another process is mid-line waits for that reader on the
   kernel, and discards at once under mirshi.
+- **From the 1.12.3 sweep:**
+  - **`flock#59`'s owner** is the pid on the kernel and the open file on Linux. Two fds in one process
+    do not contend on the kernel, and closing either fd releases the lock.
+  - **Fd limits:**
+    - The kernel's table is 32 fds (`RLIMIT_NOFILE` 32 after ROOTFD is pinned).
+    - Its emulated fds share that one budget; mirshi has separate 8/8/4 slot tables.
+  - **`munmap#28`** outside the mmap arena, or not 2 MB-aligned, is refused on the kernel.
+  - **`sock_connect#47`'s timed form** (a3 bit 32, a4 = a timeout in ms, 0 = non-blocking) is ignored.
+  - **UDP:**
+    - The kernel keeps a separate 8-entry UDP table, where mirshi shares one table with TCP.
+    - The kernel sends from a source port that was never bound.
+  - **epoll:**
+    - 128 watches per instance (mirshi has 8).
+    - The 1.57.17 ABI: op 3 SET, EPOLLOUT / EPOLLRDHUP, `EP_TCP|id` targets, and EPW_TIMED's
+      blocking wait.
+    - Op 1 refusing tagged socket ids.
+  - **`kbscan#42`:**
+    - Keys beyond `max` should be kept for the next call.
+    - A bad buffer should be -1 with the keys kept.
+    - stdin's `O_NONBLOCK` should be restored at exit.
+  - **Smaller items:** `write(fd, NULL, 0)` is -1 on the kernel. `open#7`'s create mode is applied
+    under the child's umask, where the kernel has none.
 
 ## 1.15.x — the signal model
 
@@ -158,10 +147,20 @@ Bigger divergences that need a design choice, not a one-line fix:
 - **epoll.** Real child fds (stdin, a pipe end) are not watchable, which is the reserved `PIPE_BASE`
   watchable-pipe promotion. Socket watching resolves `id & 7` to a slot, which is exact for sequential
   servers but diverges under connect-failure churn; that needs a coordinated agnos + mirshi fix.
+- **Fairness** (from the sweep). `wait4(-1)` serves the oldest ready child first, so a syscall-dense
+  child can delay a sibling's first syscall by seconds. Serve the ready stops round-robin.
+- **`sleep_ms#41` in the child** (a nanosleep with a staged timespec) instead of in the supervisor, and
+  an opt-in CPU-pinning flag (measured: about 23–29 % per call when pinned).
 - **Revisit seccomp-notify** (ADR 0005, deferred-by-data) as the per-syscall cost path once the
   supervisor is event-driven.
 
 ## 1.x — open decisions
+
+- **Refactor leftovers** from 1.12.3:
+  - the `HOST_*` / `SYS_READ0` / `SYS_FCNTL_KB` aliases of stdlib names;
+  - `_net_emu`, the shared emulate helper, renamed for what it is;
+  - a per-mode seccomp allowlist (the unconfined path peers are allowed under `--root` too);
+  - the trace loop's assumption that a new child's first stop is its exec SIGTRAP.
 
 - **The hardware bands:** sound `#64–69`, block devices `#75–80`, the GPU `#82–94` (`#86` and
   `#87` share the shm band), `fbinfo#38` / `blit#39`, and the power query `#114`. Either they stay

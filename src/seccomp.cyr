@@ -62,8 +62,6 @@ fn _bound_allowlist(buf): i64 {
     n = _allow(buf, n, 8);      # lseek
     n = _allow(buf, n, 9);      # mmap
     n = _allow(buf, n, 11);     # munmap
-    n = _allow(buf, n, 32);     # dup
-    n = _allow(buf, n, 39);     # getpid
     n = _allow(buf, n, 82);     # rename
     n = _allow(buf, n, 83);     # mkdir
     n = _allow(buf, n, 84);     # rmdir
@@ -78,13 +76,10 @@ fn _bound_allowlist(buf): i64 {
     n = _allow(buf, n, 231);    # exit_group  (agnos exit#0)
     n = _allow(buf, n, 318);    # getrandom
     n = _allow(buf, n, 437);    # openat2     (0.7.1: open#7 under --root rootfs confinement)
-    n = _allow(buf, n, 262);    # newfstatat  (0.7.1 bite 2: stat#33 confined)
-    n = _allow(buf, n, 258);    # mkdirat     (0.7.1 bite 2: mkdir#9 confined)
-    n = _allow(buf, n, 263);    # unlinkat    (0.7.1 bite 2: unlink#30 / rmdir#10 confined)
-    n = _allow(buf, n, 316);    # renameat2   (0.7.1 bite 2: rename#31 confined)
-    n = _allow(buf, n, 265);    # linkat      (0.7.1 bite 2: link#32 confined)
+    # 1.12.3: the confined mkdir/rmdir/unlink/rename/link/stat/readlink run in the SUPERVISOR now
+    # (dispatch.cyr _cf_*), so mkdirat/unlinkat/renameat2/linkat/newfstatat/readlinkat left this list,
+    # and so did getpid (39): getpid#2 has been EMULATE since v1.5.0.
     n = _allow(buf, n, 89);     # readlink    (readlink#70 unconfined)
-    n = _allow(buf, n, 267);    # readlinkat  (readlink#70 under --root)
     # The child's own exec/teardown (NOT rewritten by mirshi — they run before the
     # PTRACE_SYSCALL loop / on the execve-failure path):
     n = _allow(buf, n, 59);     # execve  (the initial image load)

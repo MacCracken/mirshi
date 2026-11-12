@@ -16,6 +16,7 @@ enum MirshiStrat {
     STRAT_EXECUTE = 1;     # rewrite orig_rax to the Linux peer; kernel runs it in-child
     STRAT_EMULATE = 2;     # syscall skipped; supervisor-computed return injected into rax
     STRAT_ENOSYS = 3;      # out-of-M1-surface number — skipped, agnos -1 injected
+    STRAT_EMULATE_DONE = 4; # 1.12.3: skipped AND rax already set at the enter stop — the exit stop does nothing
 }
 
 # agnos syscall number -> its Linux x86_64 peer number, for the calls that
@@ -39,7 +40,6 @@ fn agnos_to_linux_nr(agnos_nr): i64 {
     if (agnos_nr == 6) { return 3; }      # close       -> close(3)
     if (agnos_nr == 33) { return 4; }     # stat        -> stat(4)     [+ path stage + 144->48 repack]
     if (agnos_nr == 58) { return 8; }     # lseek       -> lseek(8)
-    if (agnos_nr == 8) { return 32; }     # dup         -> dup(32)
     if (agnos_nr == 31) { return 82; }    # rename      -> rename(82)  [+ 2 path stages]
     if (agnos_nr == 9) { return 83; }     # mkdir       -> mkdir(83)   [+ path stage + mode]
     if (agnos_nr == 10) { return 84; }    # rmdir       -> rmdir(84)   [+ path stage]
@@ -76,6 +76,16 @@ fn ao_to_o(ao): i64 {
 # 0700 = 0x1C0 (rwx------). Pinned by a unit test so the octal<->hex value is not a
 # bare literal.
 fn open_create_mode(): i64 { return 0x180; }     # 0600
+
+# open#7's create mode (agnos 1.57.18, the kernel's sc_open_mode): with AO_MODE (0x4000) set, bits 32..63 of the
+# flags are the mode — 0..07777 is used, anything above is -2 (the call is refused). Without AO_MODE: -1, and the
+# default (open_create_mode) applies. 1.12.3: mirshi ignored the field. Pure.
+fn ao_create_mode(aflags): i64 {
+    if ((aflags & 0x4000) == 0) { return 0 - 1; }
+    var m = (aflags >> 32) & 0xFFFFFFFF;
+    if (m > 0xFFF) { return 0 - 2; }
+    return m;
+}
 fn mkdir_create_mode(): i64 { return 0x1C0; }    # 0700
 
 # 0.7.1 bite 2: sanitize a NUL-terminated agnos path IN PLACE into a root-RELATIVE form
@@ -91,26 +101,57 @@ fn mkdir_create_mode(): i64 { return 0x1C0; }    # 0700
 # lexical, so a PRE-EXISTING symlink component in the rootfs can still redirect (agnos
 # cannot create symlinks, so this needs a hostile rootfs — narrower than the blocker
 # tier; see docs/adr/0009). Pure: touches only the caller's buffer (unit-tested).
-fn sanitize_rootrel(buf): i64 {
-    # (1) Reject any ".." component. A component is ".." iff, at a component start
-    # (buffer start or just after '/'), the next bytes are ".." then '/' or NUL.
-    var p = buf;
-    var start = 1;
-    while (load8(p) != 0) {
-        if (start == 1) {
-            if (load8(p) == 46) {                  # '.'
-                if (load8(p + 1) == 46) {          # '.'
-                    var c2 = load8(p + 2);
-                    if (c2 == 0) { return 0 - 1; }     # ".." at end
-                    if (c2 == 47) { return 0 - 1; }    # "../"
-                }
-            }
-            start = 0;
-        }
-        if (load8(p) == 47) { start = 1; }         # '/' -> next byte starts a component
-        p = p + 1;
+# 1 when the first `len` bytes of `buf` hold a NUL, else 0 (1.12.3). agnos paths carry an explicit
+# length and the kernel looks up all of it; Linux stops at the first NUL, so a path with one inside would
+# name a different, shorter path under mirshi. Every staged path is refused when this is 1. Pure.
+fn path_has_nul(buf, len): i64 {
+    var i = 0;
+    while (i < len) {
+        if (load8(buf + i) == 0) { return 1; }
+        i = i + 1;
     }
-    # (2) Strip leading '/' (make it relative to the anchor dirfd).
+    return 0;
+}
+
+# spawn_path#43 SPAWN_F_ARGV blob check, the kernel's sc_argv_blob_ok: `argv0\0argv1\0...\0`, 2..1024
+# bytes, last byte NUL, 1..16 entries, argv[0] 1..255 bytes. Returns argv[0]'s length, or 0. Pure.
+fn spawn_blob_ok(buf, len): i64 {
+    if (len < 2) { return 0; }
+    if (len > 1024) { return 0; }
+    if (load8(buf + len - 1) != 0) { return 0; }
+    var entries = 0;
+    var a0 = 0;
+    var i = 0;
+    while (i < len) {
+        var st = i;
+        while (i < len) { if (load8(buf + i) == 0) { break; } i = i + 1; }
+        if (entries == 0) { a0 = i - st; }
+        entries = entries + 1;
+        if (entries > 16) { return 0; }
+        i = i + 1;
+    }
+    if (a0 < 1) { return 0; }
+    if (a0 > 255) { return 0; }
+    return a0;
+}
+
+# Space-separated token count of a line, the kernel's spawn_line_tokens rule. Pure.
+fn spawn_line_tokens(buf, len): i64 {
+    var n = 0;
+    var i = 0;
+    while (i < len) {
+        while (i < len) { if (load8(buf + i) != 32) { break; } i = i + 1; }
+        if (i >= len) { break; }
+        n = n + 1;
+        while (i < len) { if (load8(buf + i) == 32) { break; } i = i + 1; }
+    }
+    return n;
+}
+
+fn sanitize_rootrel(buf): i64 {
+    # (1.12.3) `..` is kept: every confined path now resolves through openat2 RESOLVE_IN_ROOT,
+    # which clamps `..` at the root as the kernel does, instead of being refused here.
+    # Strip leading '/' (make it relative to the anchor dirfd).
     var src = buf;
     while (load8(src) == 47) { src = src + 1; }
     if (src != buf) {
@@ -169,13 +210,18 @@ fn getdents_repack(lb, n_linux, ab, cap): i64 {
         var avail = n_linux - (li + 19);            # bound the name to the Linux buffer
         if (namelen > avail) { namelen = avail; }
         if (namelen > 255) { namelen = 255; }       # agnos namelen is u8
-        var arec = 8 + namelen;                     # agnos fixed header (8) + name
-        if ((ai + arec) > cap) { return ai; }       # would overflow the agnos buffer — stop
+        var arec = (8 + namelen + 7) & (0 - 8);     # header (8) + name, rounded to 8 as the kernel's ext2 writer does (1.12.3)
+        if ((ai + arec) > cap) {                    # would overflow the agnos buffer — stop
+            if (ai == 0) { return 0 - 1; }          # not even one record fits: -1, never "end of directory" (kernel 1.57.18)
+            return ai;
+        }
         store16(ab + ai + 0, arec);                 # DIRENT_RECLEN@0 (u16)
         store8(ab + ai + 2, dtype_to_agnos(d_type));# DIRENT_TYPE@2
         store8(ab + ai + 3, namelen);               # DIRENT_NAMELEN@3
         store32(ab + ai + 4, d_ino & 0xFFFFFFFF);   # DIRENT_INO@4 (u32, low 32 bits of d_ino)
         memcpy(ab + ai + 8, name, namelen);         # DIRENT_NAME@8 (raw, no NUL)
+        var pad = 8 + namelen;
+        while (pad < arec) { store8(ab + ai + pad, 0); pad = pad + 1; }   # zero the padding
         ai = ai + arec;
         li = li + d_reclen;
     }
@@ -187,6 +233,7 @@ fn getdents_repack(lb, n_linux, ab, cap): i64 {
 # no-op there but defends a non-aligned length. A one-granule error here would
 # reintroduce the M0→M1 heap segfault, so it is unit-pinned.
 fn mmap_round_up_2mb(length): i64 {
+    if (length < 1) { return 0x200000; }       # 1.12.3: the kernel floors a length <= 0 at one 2 MB unit
     return (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
 }
 
@@ -207,6 +254,7 @@ fn is_linux_err(rax): i64 {
 # unreadable"), NOT -1. Success values (counts, 0=EOF, pid, addr) pass through.
 fn linux_ret_to_agnos(agnos_nr, linux_ret): i64 {
     if (is_linux_err(linux_ret) == 1) {
+        if (agnos_nr == 6) { if (linux_ret == (0 - 9)) { return 0; } }   # close of a free fd: 0 (kernel), not EBADF
         if (agnos_nr == 27) { return 0; }   # mmap failure -> 0 (not -1)
         if (agnos_nr == 46) { return 0; }   # time_unix failure -> 0 (not -1)
         return 0 - 1;                       # generic agnos error
@@ -567,12 +615,32 @@ fn net_reserved_min_prefix(ip): i64 {
     if (net_in_cidr(ip, 0x0A000000, 8) == 1)  { if (8 > req)  { req = 8; } }   # RFC1918 10/8
     if (net_in_cidr(ip, 0xAC100000, 12) == 1) { if (12 > req) { req = 12; } }  # RFC1918 172.16/12
     if (net_in_cidr(ip, 0xC0A80000, 16) == 1) { if (16 > req) { req = 16; } }  # RFC1918 192.168/16
+    # 1.12.3: blocks a broad allow (0.0.0.0/0) must not reach either. 0.0.0.0/8 matters most: Linux routes
+    # a connect to 0.0.0.0 to the local host, so without it a /0 allow reached loopback services.
+    if (net_in_cidr(ip, 0x00000000, 8) == 1)  { if (8 > req)  { req = 8; } }   # "this network" 0/8
+    if (net_in_cidr(ip, 0x64400000, 10) == 1) { if (10 > req) { req = 10; } }  # shared space 100.64/10
+    if (net_in_cidr(ip, 0xE0000000, 4) == 1)  { if (4 > req)  { req = 4; } }   # multicast 224/4
+    if (net_in_cidr(ip, 0xF0000000, 4) == 1)  { if (4 > req)  { req = 4; } }   # reserved 240/4 (+ broadcast)
     return req;
 }
 
 # Egress decision (default-deny): is `dst_ip` allowed by the parsed allow-list? Allowed iff
 # SOME entry contains it AND entry.prefix >= the reserved-block minimum for it. `entries` is
 # a packed array of ENTRY_SIZE-byte {u64 net, u64 prefix}; `count` entries (0 -> deny all).
+# sock_listen#56's argument, decoded as the kernel's sock_listen_decode does (agnos 1.57.7): port in bits
+# 0-15 (1..65535) | class << 32 (bits 32-39: 0 = ANY, 1 = LOOPBACK); bits 16-31 and 40-63 must be 0.
+# Returns (class << 16) | port, or -1. The cyrius stdlib's sock_bind(127.0.0.1) issues class 1 (1.12.3:
+# mirshi used to take the whole argument as the port). Pure.
+fn sock_listen_decode(a): i64 {
+    if (a <= 0) { return 0 - 1; }
+    if ((a & 0xFFFF) == 0) { return 0 - 1; }
+    if (((a >> 16) & 0xFFFF) != 0) { return 0 - 1; }
+    if ((a >> 40) != 0) { return 0 - 1; }
+    var c = (a >> 32) & 0xFF;
+    if (c > 1) { return 0 - 1; }
+    return (c << 16) | (a & 0xFFFF);
+}
+
 fn net_egress_ok(dst_ip, entries, count): i64 {
     var req = net_reserved_min_prefix(dst_ip);
     var i = 0;

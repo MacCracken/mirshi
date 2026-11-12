@@ -42,7 +42,8 @@ fn main(): i64 {
     emit("mask=", sys_net_config(1));
     emit("gw=", sys_net_config(2));
     emit("dns=", sys_net_config(3));
-    emit("bad=", sys_net_config(9));
+    emit("ctr=", sys_net_config(9));                 # 1.12.3: a counter field (4..11) -> 0
+    emit("bad=", sys_net_config(12));                # past the kernel's fields -> -1
     return 0;
 }
 var r = main(); syscall(SYS_EXIT, r);
@@ -58,7 +59,9 @@ bad="$(printf '%s\n' "$out" | sed -n 's/^bad=//p')"
 [ "$g" = "$exp_gw" ]   && echo "OK: net_config(2) gateway matches /proc/net/route ($g)" || { echo "FAIL: gw=$g want $exp_gw" >&2; fail=1; }
 [ "$d" = "$exp_dns" ]  && echo "OK: net_config(3) DNS matches /etc/resolv.conf ($d)"    || { echo "FAIL: dns=$d want $exp_dns" >&2; fail=1; }
 [ "$m" = "0" ]         && echo "OK: net_config(1) netmask = 0 (unset)"                  || { echo "FAIL: mask=$m want 0" >&2; fail=1; }
-[ "$bad" = "-1" ]      && echo "OK: net_config(9) bad field -> -1"                      || { echo "FAIL: bad=$bad want -1" >&2; fail=1; }
+[ "$bad" = "-1" ]      && echo "OK: net_config(12) bad field -> -1"                     || { echo "FAIL: bad=$bad want -1" >&2; fail=1; }
+ctr="$(printf '%s\n' "$out" | sed -n 's/^ctr=//p')"
+[ "$ctr" = "0" ]       && echo "OK: net_config(9) counter field -> 0 (mirshi keeps no counters)" || { echo "FAIL: ctr=$ctr want 0" >&2; fail=1; }
 
 # without --net: the net band (incl. net_config) is ENOSYS -> -1.
 out2="$("$mirshi" "$sbox/ncfg" 2>/dev/null)"

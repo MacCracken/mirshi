@@ -1,6 +1,6 @@
 # 0009 — Rootfs confinement via openat2 RESOLVE_IN_ROOT in the child
 
-**Status**: Accepted
+**Status**: Accepted; **amended v1.12.3** (see *Amendment* below)
 **Date**: 2026-06-30
 
 ## Context
@@ -117,3 +117,23 @@ yet confined is DENIED fail-closed so `--root` is never a false-confidence footg
   that pass absolute paths (rebased to the root) and is the chroot-like semantic the
   pass-through model expects. `RESOLVE_NO_SYMLINKS` is available as a stricter knob if a
   consumer needs symlinks rejected outright.
+
+## Amendment (v1.12.3)
+
+The P(-1) sweep ([2026-11-12 audit](../audit/2026-11-12-audit.md)) changed three things in this design.
+
+- **The confined path-mutation and metadata ops moved to the supervisor.** `mkdir` / `rmdir` / `unlink` /
+  `rename` / `link` / `stat` / `readlink` had run in the child as `*at` calls on ROOTFD with a lexically
+  sanitized path, and the `*at` family has no `RESOLVE_*` flags.
+  - Each op now resolves its parent directory with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` on
+    a root fd the supervisor holds (`_sup_rootfd`), then runs the `*at` call on the returned fd.
+  - So a symlink inside the rootfs resolves inside the root, like `open#7`'s.
+  - Resolution and use share one fd, so a concurrent sibling process cannot change the path in between.
+  - `stat` resolves the whole path with `openat2(O_PATH)` and `fstat`s it.
+  - `..` is no longer refused: it clamps at the root, as on the kernel. A final `.` / `..` is refused.
+  - The child's allowlist drops the six `*at` numbers.
+- **The premise "every fd the child holds came from a confined open" is now enforced.** The child starts
+  with fds 0–2 and ROOTFD only (`close_range` before exec). `close#6` refuses fd ≥ 32, the kernel's table
+  size, so ROOTFD cannot be closed, and `dup#8` is the kernel's identity.
+- **`execwait#37` / `spawn_path#43` resolve their path inside the root** (`openat2(ROOTFD, …,
+  RESOLVE_IN_ROOT)` + `execveat`). The operator's own target on the command line is still a host path.

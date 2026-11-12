@@ -1,0 +1,106 @@
+# band_fdkind.cyr — split out of src/dispatch.cyr in 1.12.3 (a pure move; included in order by src/intercept.cyr).
+
+# ============================================================================
+# fd_kind#111 (1.12.1, agnos 1.57.13) — what the caller's fd IS, as an FdKind (>= 1), or -1.
+#
+# EMULATE, supervisor-side; no child buffer, so nothing to stage and no TOCTOU. Order:
+#   fd < 0                       -> -1 (the kernel's bound).
+#   one of mirshi's emulated ids -> SIGNALFD / TIMERFD / EPOLL while its slot is OPEN, else -1. On the
+#                                   kernel these are real fds < 32; under mirshi they are BASE+slot ids,
+#                                   so they are answered before the fd-table bound below. A socket-tagged
+#                                   id (bit 30) is the stdlib's own handle: -1, as the kernel answers.
+#   fd >= 32                     -> -1 (the kernel's 32-entry table; ROOTFD = 100 lands here too).
+#   a real child fd              -> the supervisor DUPLICATES it with pidfd_getfd (no side effect on the
+#                                   child's open file), fstat's it and asks TCGETS, then closes the dup.
+#                                   A closed fd fails pidfd_getfd (EBADF) -> -1.
+# A terminal is FDK_CONSOLE: the agnos console is "the" terminal, and under mirshi the child's console
+# is the host tty it inherited. `prog | other` sees FDK_PIPE on fd 1, which is what #111 exists for.
+# ============================================================================
+var _fdk_buf = 0;
+fn _fdk_scratch(): i64 {
+    if (_fdk_buf == 0) { _fdk_buf = alloc(256); }   # struct stat (144 B) @0 + termios (60 B) @160
+    return _fdk_buf;
+}
+
+# 1 when emulated id `fd` (of _emu_classify kind `kind`) names an OPEN slot of the calling child, else 0.
+# Reads the lazy tables without allocating them: a child that never made one has nothing open.
+fn _fdk_emu_open(fd, kind): i64 {
+    if (kind == KIND_SIGFD) {
+        var st = load64(_cur_rec + C_SIGFD_TBL);
+        var ss = fd - SIGFD_BASE;
+        if (st == 0) { return 0; }
+        if (ss >= SIGNALFD_SLOTS) { return 0; }
+        if (load64(st + ss * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return 0; }
+        return 1;
+    }
+    if (kind == KIND_TIMERFD) {
+        var tt = load64(_cur_rec + C_TIMERFD_TBL);
+        var ts = fd - TIMERFD_BASE;
+        if (tt == 0) { return 0; }
+        if (ts >= TIMERFD_SLOTS) { return 0; }
+        if (load64(tt + ts * TIMERFD_SLOT_SIZE + 0) == (0 - 1)) { return 0; }
+        return 1;
+    }
+    if (kind == KIND_EPOLL) {
+        var et = load64(_cur_rec + C_EPOLL_TBL);
+        var es = fd - EPOLL_BASE;
+        if (et == 0) { return 0; }
+        if (es >= EPOLL_SLOTS) { return 0; }
+        if (load64(et + es * EPOLL_SLOT_SIZE + 0) == (0 - 1)) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+# A supervisor-side duplicate of the child's real fd `fd` (pidfd_getfd: the same open file, no effect on
+# the child's table, O_CLOEXEC), or -1 when the child has no such fd. The caller closes it.
+fn _child_fd_dup(pid, fd): i64 {
+    var pfd = syscall(SYS_PIDFD_OPEN, pid, 0);
+    if (pfd < 0) { return 0 - 1; }
+    var dfd = syscall(SYS_PIDFD_GETFD, pfd, fd, 0);
+    syscall(HOST_CLOSE, pfd);
+    if (dfd < 0) { return 0 - 1; }
+    return dfd;
+}
+
+fn _do_fd_kind(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var ek = _emu_classify(fd);
+    if (ek != KIND_REAL) {
+        if (_fdk_emu_open(fd, ek) == 1) { return _net_emu(pid, regs, fdk_from_emu_kind(ek)); }
+        return _net_emu(pid, regs, 0 - 1);
+    }
+    if (fd >= FDK_FD_MAX) { return _net_emu(pid, regs, 0 - 1); }
+    var dfd = _child_fd_dup(pid, fd);
+    if (dfd < 0) { return _net_emu(pid, regs, 0 - 1); }     # a closed fd
+    var sb = _fdk_scratch();
+    var k = 0 - 1;
+    if (syscall(SYS_FSTAT, dfd, sb) == 0) {
+        var tty = 0;
+        if (syscall(SYS_IOCTL, dfd, TCGETS_KB, sb + 160) == 0) { tty = 1; }
+        k = fdk_from_mode(load32(sb + 24), tty);           # x86_64 struct stat: st_mode (u32) @24
+    }
+    syscall(HOST_CLOSE, dfd);
+    return _net_emu(pid, regs, k);
+}
+
+# flock#59's fd gate (1.12.2): 1 when `fd` may be locked, as the kernel's arm decides — fd in [0, 32) and
+# a file or a directory (ext2 FILE / DIR on the kernel) — else 0. A pipe, a terminal, a device, an event
+# fd or one of mirshi's emulated ids is refused there; Linux flock(2) locks any of them, so the check has to
+# happen here, before the EXECUTE. (The kernel also answers -2 for a full lock table; mirshi has none.)
+fn _flock_fd_ok(pid, fd): i64 {
+    if (fd < 0) { return 0; }
+    if (fd >= FDK_FD_MAX) { return 0; }
+    var dfd = _child_fd_dup(pid, fd);
+    if (dfd < 0) { return 0; }
+    var sb = _fdk_scratch();
+    var ok = 0;
+    if (syscall(SYS_FSTAT, dfd, sb) == 0) {
+        var k = fdk_from_mode(load32(sb + 24), 0);
+        if (k == FDK_FILE) { ok = 1; }
+        if (k == FDK_DIR) { ok = 1; }
+    }
+    syscall(HOST_CLOSE, dfd);
+    return ok;
+}

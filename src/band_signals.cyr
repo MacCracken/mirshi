@@ -1,0 +1,124 @@
+# band_signals.cyr — split out of src/dispatch.cyr in 1.12.3 (a pure move; included in order by src/intercept.cyr).
+
+# Supervisor scratch for signal-mask pvm I/O (sigprocmask#17 / signalfd#18): an 8-byte word, lazy-
+# alloc-once (one call in flight, same discipline as _emu_ts). Never a per-call alloc.
+var _sig_buf = 0;
+fn _sig_buf_get(): i64 {
+    if (_sig_buf == 0) { _sig_buf = alloc(8); }
+    return _sig_buf;
+}
+
+# sigprocmask#17(how, set_ptr, oldset_ptr) -> 0 / -1. EMULATE (per-caller, no loop cooperation), the
+# kernel's arm: `set` is REQUIRED (8 bytes at set_ptr); if oldset_ptr != 0 the caller's CURRENT blocked mask
+# is written there (the mask BEFORE the change); then `how` 0 = BLOCK (|=), 1 = UNBLOCK (&= ~), and any other
+# value stores the set verbatim (2 is SETMASK; the kernel does the same for 3 and up). Masks are agnos
+# `1<<sig`. _cur_rec is the caller's record (set by the loop at this enter stop).
+fn _do_sigprocmask(pid, regs): i64 {
+    var how = decode_arg(regs, 0);
+    var set_ptr = decode_arg(regs, 1);
+    var oldset_ptr = decode_arg(regs, 2);
+    var sb = _sig_buf_get();
+    var cur = load64(_cur_rec + C_SIG_BLOCKED);
+    # The kernel requires `set` (is_user_range(arg2, 8) first): a NULL or unreadable set is -1 with nothing
+    # changed (1.12.2; mirshi took NULL as a query). It is read BEFORE oldset is written, so a set_ptr ==
+    # oldset_ptr alias (POSIX permits it) still applies the caller's set — the kernel writes oldset first.
+    if (set_ptr == 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (pvm_read(pid, set_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    var newset = load64(sb);
+    if (oldset_ptr != 0) {                                 # oldset gets the mask BEFORE the change
+        store64(sb, cur);
+        if (pvm_write(pid, oldset_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    }
+    var result = newset;                                   # any other `how` stores the set verbatim (kernel)
+    if (how == 0) { result = cur | newset; }               # SIG_BLOCK   — add bits
+    if (how == 1) { result = cur & (0 - newset - 1); }     # SIG_UNBLOCK — clear bits (cur & ~newset)
+    store64(_cur_rec + C_SIG_BLOCKED, result);
+    return _net_emu(pid, regs, 0);
+}
+
+# The caller's per-child signalfd slot table (lazy-alloc-once, mirrors _net_tbl). Each slot is
+# {watched_mask@0, flags@8}; flags == -1 marks a FREE slot. _cur_rec is the current child.
+fn _sigfd_tbl(): i64 {
+    var t = load64(_cur_rec + C_SIGFD_TBL);
+    if (t == 0) {
+        t = alloc(SIGNALFD_SLOTS * SIGFD_SLOT_SIZE);
+        var i = 0;
+        while (i < SIGNALFD_SLOTS) {
+            store64(t + i * SIGFD_SLOT_SIZE + 0, 0);        # watched_mask = 0
+            store64(t + i * SIGFD_SLOT_SIZE + 8, SIGFD_FREE);
+            i = i + 1;
+        }
+        store64(_cur_rec + C_SIGFD_TBL, t);
+    }
+    return t;
+}
+
+# signalfd#18(fd, mask_ptr, flags) -> fd / -1. EMULATE (per-caller). Like the kernel's arm, every call makes a
+# NEW signalfd: the fd and flags arguments are not consulted (1.12.2 — mirshi used to update an existing
+# SIGFD_BASE+slot in place, and stored the flags word in the slot's in-use cell, where a flags of -1 read as
+# FREE). The watched mask (8-byte 1<<sig) is read from mask_ptr; an unreadable one is -1. Returns an OPAQUE
+# emulated id, SIGFD_BASE + slot — a real Linux fd is meaningless in the child (separate fd tables across
+# the ptrace boundary). read#5 on it delivers pending signals; close#6 frees the slot.
+fn _do_signalfd(pid, regs): i64 {
+    var mask_ptr = decode_arg(regs, 1);
+    var sb = _sig_buf_get();
+    if (pvm_read(pid, mask_ptr, sb, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    var watched = load64(sb);
+    var tbl = _sigfd_tbl();
+    var slot = 0 - 1;
+    var i = 0;
+    while (i < SIGNALFD_SLOTS) {
+        if (load64(tbl + i * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { slot = i; i = SIGNALFD_SLOTS; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }         # table full
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 0, watched);
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, SIGFD_OPEN);
+    return _net_emu(pid, regs, SIGFD_BASE + slot);
+}
+
+# close#6 on an emulated signalfd: free its slot -> 0 (also 0 when it is already free, as the kernel's close
+# of a free slot; -1 only for an id past the table) (1.12.2; until
+# then the close fell through to a real Linux close of the id, which failed EBADF and left the slot taken,
+# so the 9th signalfd#18 in a process was -1).
+fn _sigfd_close(pid, regs): i64 {
+    var slot = decode_arg(regs, 0) - SIGFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _sigfd_tbl();
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return _net_emu(pid, regs, 0); }   # already closed: 0, as the kernel's close of a free slot
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 0, 0);
+    store64(tbl + slot * SIGFD_SLOT_SIZE + 8, SIGFD_FREE);
+    return _net_emu(pid, regs, 0);
+}
+
+# read#5 on an emulated signalfd (fd >= SIGFD_BASE) -> 4 / 0 / -1, the kernel's vfs_read_signalfd (1.12.2):
+#   count < 4                 -> -1 (the kernel stores exactly 4 bytes, so it refuses a shorter buffer);
+#   nothing pending & watched -> 0 ("nothing yet": the signalfd is non-blocking; the caller polls);
+#   else the lowest such signal (1..63) as a 4-byte number at buf -> 4, and that pending bit is consumed.
+# The BLOCKED mask is not consulted: a signalfd consumer blocks its signals first (so they take no default
+# action), and it is exactly those it reads — as on the kernel and on Linux. Until 1.12.2 mirshi delivered
+# `pending & watched & ~blocked`, wrote 8 bytes, required 8 and answered -1 for "nothing pending", so the
+# signal a program waited for was the one it could never read. Deliver first, then consume: a failed write
+# leaves the signal pending.
+fn _sigfd_read(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    var buf = decode_arg(regs, 1);
+    var len = decode_arg(regs, 2);
+    var slot = fd - SIGFD_BASE;
+    if (slot < 0) { return _net_emu(pid, regs, 0 - 1); }            # belt-and-suspenders (net-band idiom)
+    if (slot >= SIGNALFD_SLOTS) { return _net_emu(pid, regs, 0 - 1); }
+    var tbl = _sigfd_tbl();
+    if (load64(tbl + slot * SIGFD_SLOT_SIZE + 8) == SIGFD_FREE) { return _net_emu(pid, regs, 0 - 1); }   # not open
+    if (len < 4) { return _net_emu(pid, regs, 0 - 1); }             # the record is 4 bytes
+    var watched = load64(tbl + slot * SIGFD_SLOT_SIZE + 0);
+    var ready = load64(_cur_rec + C_PENDING_SIG) & watched;
+    if (ready == 0) { return _net_emu(pid, regs, 0); }              # nothing pending (non-blocking)
+    var sig = _sig_lowest(ready);
+    var sb = _sig_buf_get();
+    store64(sb, 0);
+    store32(sb, sig);                                              # the signal number, 4 bytes
+    if (pvm_write(pid, buf, sb, 4) != 4) { return _net_emu(pid, regs, 0 - 1); }   # nothing consumed on failure
+    store64(_cur_rec + C_PENDING_SIG, _sig_clear(load64(_cur_rec + C_PENDING_SIG), sig));   # THEN consume
+    return _net_emu(pid, regs, 4);
+}

@@ -49,7 +49,8 @@ fn main(): i64 {
     if (pid < 0) { return 2; }
     if (sys_kill(pid, 15) != 0) { return 20; }          # kill a DIRECT child (SIGTERM) -> 0
     if (sys_kill(0, 15) != (0 - 1)) { return 21; }      # pid 0 protected -> -1
-    if (sys_kill(pid, 0) != (0 - 1)) { return 22; }     # invalid signal number -> -1
+    if (sys_kill(pid, 0) != 0) { return 22; }           # 1.12.3: signal 0 is the kernel's probe -> 0
+    if (sys_kill(pid, 64) != (0 - 1)) { return 28; }    # invalid signal number -> -1
     if (sys_kill(99999, 15) != (0 - 1)) { return 23; }  # unknown pid -> -1
     if (sys_kill(1, 15) != 0) { return 24; }            # self (root) -> 0
     if (sys_waitpid(pid) != 0) { return 9; }            # the child asserted its own checks
@@ -170,7 +171,7 @@ fn main(): i64 {
     }
     if (sys_signalfd(0 - 1, m, 0) != (0 - 1)) { return 64; }   # full
     if (sys_close(last) != 0) { return 65; }        # close frees the slot...
-    if (sys_close(last) != (0 - 1)) { return 66; }  # ...once
+    if (sys_close(last) != 0) { return 66; }        # ...and a second close is 0, the kernel's close of a free slot
     if (sys_signalfd(0 - 1, m, 0) < 0) { return 67; }          # ...so a new one fits
     var msg = "SIGNALFD-OK\n";
     sys_write(1, msg, strlen(msg));

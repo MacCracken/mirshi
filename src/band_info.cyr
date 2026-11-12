@@ -1,0 +1,182 @@
+# band_info.cyr — split out of src/dispatch.cyr in 1.12.3 (a pure move; included in order by src/intercept.cyr).
+
+# --- v1.8.0 info getters. uname#34 is EMULATE — mirshi synthesizes the agnos-NATIVE identity struct
+#     (NOT Linux utsname). Both uname/sysinfo hard-reject -1 if the caller's len is below the struct size
+#     (no partial fill — the agnos ABI; see ../agnos/docs/development/agnos-userland-abi.md §4.3/§4.4 and
+#     the kernel writers in ../agnos/kernel/core/syscall.cyr syscalls 34/35). ---
+
+# Copy a NUL-terminated string into a fixed 16-byte NUL-padded field at dst (the uname slot format).
+fn _put_field16(dst, src): i64 {
+    var i = 0;
+    var go = 1;
+    while (i < 16) {
+        var c = 0;
+        if (go == 1) {
+            c = load8(src + i);
+            if (c == 0) { go = 0; c = 0; }
+        }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Supervisor scratch for the v1.8.0 info structs (uname 64 B / sysinfo 40 B / a Linux sysinfo read),
+# lazy-alloc-once — one call in flight, never a per-call alloc.
+var _info_buf = 0;
+fn _info_scratch(): i64 {
+    if (_info_buf == 0) { _info_buf = alloc(384); }     # sysinfo: host reads at +0, the 208 B agnos struct at +128
+    return _info_buf;
+}
+
+# A supervisor-side /proc/stat image for sysinfo#35's per-core band (1.11.3), allocated ONCE (lazily),
+# never per call — same discipline as _emu_ts_buf. The cpu lines lead the file, so the first 64 KiB
+# holds them for well over a thousand CPUs; a truncated tail (the long `intr` line) is never read.
+var _procstat_buf = 0;
+fn _procstat_read(): i64 {
+    if (_procstat_buf == 0) { _procstat_buf = alloc(65536); }
+    var fd = syscall(SYS_OPEN, "/proc/stat", 0, 0);            # O_RDONLY
+    if (fd < 0) { return 0; }
+    var n = 0;
+    while (n < 65536) {
+        var r = syscall(SYS_READ, fd, _procstat_buf + n, 65536 - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    syscall(SYS_CLOSE, fd);
+    return n;
+}
+
+# Fill agnos's per-core tick band (4 slots × {user u64, kernel u64}) at `band` from host /proc/stat.
+# Slot k is the k-th CPU in mirshi's affinity mask (`mask`, `nb` bytes) — the same CPUs sysinfo's `cpus`
+# field counts — so slot k is populated exactly when k < cpus (up to 4), as on the kernel. The band is
+# pre-zeroed by the caller; an unreadable /proc/stat (no /proc in the container) leaves it zero.
+fn _sysinfo_cpu_band(band, mask, nb): i64 {
+    var n = _procstat_read();
+    if (n <= 0) { return 0; }
+    var slot = 0;
+    var bi = 0;
+    while (bi < nb) {
+        var b = load8(mask + bi) & 0xFF;
+        var k = 0;
+        while (k < 8) {
+            if (((b >> k) & 1) != 0) {
+                if (slot < 4) {
+                    procstat_cpu_ticks(_procstat_buf, n, bi * 8 + k, band + slot * 16);
+                    slot = slot + 1;
+                }
+            }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    return slot;
+}
+
+# uname#34(buf, len) -> 0 / -1. EMULATE: write the 64-byte agnos identity struct — four 16-byte NUL-padded
+# fields at 0/16/32/48 = sysname / nodename / release / machine (agnos-NATIVE, NOT Linux utsname). Hard-
+# reject -1 if len < 64 (the ABI: no partial fill). sysname/machine are the fixed AGNOS identity (match the
+# kernel); nodename="agnos" (the kernel default — no sethostname yet); release="mirshi" marks the shim (the
+# real agnos kernel writes _AGNOS_VERSION — a documented value assumption, ADR 0016).
+fn _do_uname(pid, regs): i64 {
+    if (decode_arg(regs, 1) < 64) { return _net_emu(pid, regs, 0 - 1); }
+    var s = _info_scratch();
+    _put_field16(s +  0, "AGNOS");     # sysname
+    _put_field16(s + 16, "agnos");     # nodename
+    _put_field16(s + 32, "mirshi");    # release
+    _put_field16(s + 48, "x86_64");    # machine
+    if (pvm_write(pid, decode_arg(regs, 0), s, 64) != 64) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
+# sysinfo#35(buf, len) -> 0 / -1. EMULATE: write the agnos counters struct — 5×u64 LE at
+# 0/8/16/24/32 = uptime_secs / totalram / freeram / procs / cpus (agnos-NATIVE, NOT the ~112 B Linux
+# struct) — plus the TAIL TIERS the kernel appends by caller length (1.11.3; `sysinfo_len`): len >= 104
+# adds the per-core user/kernel tick band at +40 (4 × 16 B, from host /proc/stat, see
+# `procstat_cpu_ticks`), >= 200 the per-BLK-tag sector band at +104 (ZERO: mirshi has no agnos block
+# devices), >= 208 sched_kicks at +200 (ZERO: no agnos scheduler). Exactly the tier's bytes are
+# written, never the caller's whole `len` — up to 1.11.2 mirshi wrote 40 for ANY len, so a len >= 104
+# caller got rc 0 over an untouched tail.
+# Hard-reject -1 if len < 40 (the ABI: no partial fill). mirshi sources LIVE HOST values: uptime
+# + total/free RAM from the host Linux sysinfo(99) (RAM = value * mem_unit -> bytes, matching the agnos
+# kernel's pages*4096); procs = mirshi's tracked agnos-process count (`_child_count`, the faithful "agnos
+# procs"); cpus = the mirshi process's usable CPU count (popcount of sched_getaffinity). All supervisor-
+# side — no child-seccomp delta.
+fn _do_sysinfo(pid, regs): i64 {
+    var si_len = sysinfo_len(decode_arg(regs, 1));
+    if (si_len == 0) { return _net_emu(pid, regs, 0 - 1); }
+    var s = _info_scratch();
+    # (1) host uptime + RAM via Linux sysinfo(99) into s+0 (a ~112 B struct: uptime@0, totalram@32,
+    # freeram@40, mem_unit@104 u32). mem_unit scales totalram/freeram to bytes (usually 1).
+    var i = 0;
+    while (i < 112) { store8(s + i, 0); i = i + 1; }
+    var uptime = 0;
+    var totalram = 0;
+    var freeram = 0;
+    if (syscall(SYS_SYSINFO, s) == 0) {
+        var mu = load32(s + 104) & 0xFFFFFFFF;
+        if (mu == 0) { mu = 1; }
+        uptime = load64(s + 0);
+        totalram = load64(s + 32) * mu;
+        freeram = load64(s + 40) * mu;
+    }
+    # (2) cpu count = popcount of the process's affinity mask (raw sched_getaffinity returns the mask
+    # byte count). Reuses s+0 (the sysinfo values are already extracted into locals above).
+    var cpus = 0;
+    var nb = syscall(SYS_SCHED_GETAFFINITY, 0, 128, s);
+    if (nb > 0) {
+        if (nb > 128) { nb = 128; }
+        var bi = 0;
+        while (bi < nb) {
+            var b = load8(s + bi) & 0xFF;
+            var k = 0;
+            while (k < 8) {
+                if (((b >> k) & 1) != 0) { cpus = cpus + 1; }
+                k = k + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+    if (cpus < 1) { cpus = 1; }                          # fallback (never report 0 CPUs)
+    # (3) build the agnos struct at s+128 (the sysinfo values at s+0 are consumed; the affinity mask
+    # stays at s+0..nb for the per-core band). Zeroed to the widest tier first, so every band mirshi
+    # has no source for reads 0, never a stale byte.
+    var o = s + 128;
+    var z = 0;
+    while (z < 208) { store8(o + z, 0); z = z + 1; }
+    store64(o +  0, uptime);                             # uptime seconds
+    store64(o +  8, totalram);                           # total RAM bytes
+    store64(o + 16, freeram);                            # free RAM bytes
+    store64(o + 24, _child_count());                     # agnos procs mirshi supervises
+    store64(o + 32, cpus);                               # usable CPUs
+    if (si_len >= 104) {
+        if (nb > 0) { _sysinfo_cpu_band(o + 40, s, nb); }   # +40: per-core user/kernel ticks
+    }
+    # +104 per-BLK-tag sectors and +200 sched_kicks stay ZERO (see the header).
+    if (pvm_write(pid, decode_arg(regs, 0), o, si_len) != si_len) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
+# winsize#60() -> (cols<<16)|rows. EMULATE (a pure supervisor return, no args / no child buffer — like
+# uptime_ms#40). The real agnos kernel reads the live framebuffer char grid (`fb_winsize`); a headless mirshi
+# has no FB, so mirshi reads the CONTROLLING TERMINAL's size via TIOCGWINSZ on its own stdio (the child
+# inherits it) and packs it agnos-style. No tty (redirected stdio / a plain container) -> a virtual 80×24
+# default. Always returns a usable size (never -1) — an agnos TUI sizes to the real console or a sane default.
+fn _do_winsize(pid, regs): i64 {
+    var ws = _info_scratch();
+    var cols = 80;                                       # virtual default (headless / no tty)
+    var rows = 24;
+    var got = 0;
+    var fd = 0;
+    while (fd < 3) {                                     # the controlling terminal on stdin/stdout/stderr
+        if (got == 0) {
+            if (syscall(SYS_IOCTL, fd, TIOCGWINSZ, ws) == 0) {
+                var r = load16(ws + 0) & 0xFFFF;         # struct winsize: ws_row @0 (u16)
+                var c = load16(ws + 2) & 0xFFFF;         #                 ws_col @2 (u16)
+                if (c > 0) { if (r > 0) { cols = c; rows = r; got = 1; } }
+            }
+        }
+        fd = fd + 1;
+    }
+    return _net_emu(pid, regs, ((cols & 0xFFFF) << 16) | (rows & 0xFFFF));
+}

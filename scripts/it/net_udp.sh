@@ -73,5 +73,48 @@ set +e; "$mirshi" --net-allow "10.0.0.0/8" "$sbox/udpc" >/dev/null 2>&1; rc2=$?;
 if [ "$rc2" -eq 2 ]; then echo "OK: udp_send egress-denied (loopback not in 10/8) -> agnos -1"
 else echo "FAIL: udp egress-deny rc=$rc2 (want 2)" >&2; fail=1; fi
 
+# 1.12.3: the kernel's UDP contract, self-contained (one socket sends to another, both in the fixture).
+pa="$(freeudp)"; pb="$(freeudp)"
+cat > "$sbox/udpk.cyr" <<EOF
+include "lib/syscalls.cyr"
+fn main(): i64 {
+    if (sys_udp_bind(0) != (0 - 1)) { return 10; }                 # port 0
+    if (sys_udp_bind(65536) != (0 - 1)) { return 11; }             # past 65535
+    var a = sys_udp_bind($pa);
+    if (a < 0) { return 12; }
+    if (sys_udp_bind($pa) != (0 - 1)) { return 13; }               # already bound
+    var b = sys_udp_bind($pb);
+    if (b < 0) { return 14; }
+    var packed = ($pa << 16) | $pb;
+    var big = alloc(2048);
+    if (sys_udp_send(0x7F000001, packed, big, 0) != 0) { return 15; }      # len 0 -> 0
+    if (sys_udp_send(0x7F000001, packed, big, 2000) != (0 - 1)) { return 16; }   # > 1472
+    if (sys_udp_send(0x7F000001, packed, "hello", 5) != 47) { return 17; }      # the frame length
+    var buf[64];
+    if (sys_udp_recv(b, &buf, 0, 0) != 0) { return 18; }           # maxlen 0 -> 0
+    var deadline = 0;
+    var r = 0 - 1;
+    while (deadline < 200) {                                        # bad addr_out: -1, nothing taken
+        r = sys_udp_recv(b, &buf, 64, 8);
+        if (r != 0) { deadline = 200; } else { syscall(41, 5); deadline = deadline + 1; }
+    }
+    if (r != (0 - 1)) { return 19; }
+    var addr[16];
+    if (sys_udp_recv(b, &buf, 64, &addr) != 5) { return 20; }      # ...so the datagram is still there
+    if (load64(&addr + 8) != $pa) { return 21; }                   # from port A
+    syscall(1, 1, "UDP-KERNEL-OK\n", 14);
+    return 0;
+}
+var r = main();
+syscall(SYS_EXIT, r);
+EOF
+cyrius build --agnos "$sbox/udpk.cyr" "$sbox/udpk" >/dev/null 2>&1 || { echo "FAIL: udpk fixture did not build" >&2; exit 1; }
+set +e; uout="$(timeout 25 "$mirshi" --net-allow "127.0.0.1/32" "$sbox/udpk" 2>/dev/null)"; urc=$?; set -e
+if [ "$urc" -eq 0 ] && printf '%s' "$uout" | grep -q UDP-KERNEL-OK; then
+    echo "OK: UDP — port range, no double bind, len 0 / > 1472, frame-length answer, a bad addr_out keeps the datagram"
+else
+    echo "FAIL: UDP kernel contract rc=$urc (10-11 port range, 13 double bind, 15-17 send, 18-21 recv)" >&2; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "net_udp: FAILED" >&2; exit 1; fi
 echo "OK: net_udp — UDP bind/send/recv/unbind + addr_out + per-datagram egress"

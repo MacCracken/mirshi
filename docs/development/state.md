@@ -5,6 +5,22 @@
 
 ## Version
 
+**1.12.3** — 2026-11-12. **The P(-1) sweep** ([audit](../audit/2026-11-12-audit.md)): four parallel reviews against the
+kernel at agnos `aef48206`, and their repairs.
+- **Hardening:**
+  - `--root` path ops run in the supervisor on `RESOLVE_IN_ROOT`-resolved parents.
+  - Children start with fds 0–2 and ROOTFD only.
+  - `#37`/`#43` paths resolve inside the root.
+  - More reserved egress blocks.
+  - `sock_listen`'s class is decoded.
+  - UDP bind has no `SO_REUSEADDR`.
+- **Robustness:** a dead child's sockets and slots are released, orphaned records are reaped, and receives
+  peek before they take.
+- **Fidelity:** `spawn_path`'s argv form plus about 20 kernel edge answers.
+- **Speed and structure:** emulated calls answer at the enter stop (−2 ptrace calls), and `dispatch.cyr` is
+  split into band files.
+
+`cyrius test` 440/0; 31 `scripts/it/*` gates (new: `churn.sh`, `edges.sh`) and `docker/smoke.sh` green.
 **1.12.2** — 2026-11-12. **Quick kernel-fidelity repairs**, each checked against the kernel at agnos
 `aef48206` (1.57.19):
 - The signalfd follows `vfs_read_signalfd`: `pending & watched` with the blocked mask not consulted, a
@@ -39,9 +55,18 @@ green at the new pin.
 `cyrius.lock`). The one source change: mirshi's local `sys_memfd_create` is gone, because cyrius 6.6.5's
 stdlib grew the identical wrapper and the duplicate made the build warn. Build is warning-free; `cyrius
 test` 329/0; all 27 `scripts/it/*` gates and `docker/smoke.sh` green at the new pin.
-**1.10.1 → 1.11.3** — `spawn_path#43`, `exec_redirect#62`, `symlink#63`, `kbscan#42`, `readlink#70`,
-`AO_NOFOLLOW`/`AO_EXCL`, `uptime_us#95`, the `sysinfo#35` length tiers. Per-release detail is in
-[`../../CHANGELOG.md`](../../CHANGELOG.md).
+**1.11.3** — 2026-09-30. `uptime_us#95` emulated (µs `CLOCK_MONOTONIC`, the #40 epoch), so the stdlib clock
+stops latching to ms and printing an ENOSYS line; `sysinfo#35` writes the kernel's length tier (40/104/200/208:
+the per-core tick band from host `/proc/stat`).
+**1.11.2** — 2026-09-14. `ao_to_o` maps `AO_NOFOLLOW` / `AO_EXCL`, so an agnos `open` no longer follows a symlink
+or clobbers a file the same call refuses on the kernel.
+**1.11.1** — 2026-09-11. Toolchain `6.4.32` → `6.6.2`, no source change.
+**1.11.0** — 2026-07-08. `kbscan#42` (raw Set-1 scancodes synthesized from mirshi's stdin, for full-screen agnos
+TUIs such as cyim) and `readlink#70`.
+**1.10.2** — 2026-07-07. `exec_redirect#62` (agnsh's `>` and pipes, by stealing the caller's fd with
+`pidfd_getfd`) and `symlink#63`, completing the exec-band re-sync.
+**1.10.1** — 2026-07-07. `spawn_path#43`, the non-blocking from-path spawn behind the stdlib's `exec_*`.
+Per-release detail for all of these is in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 **1.10.0** — 2026-07-02. **argv forwarding — the root child gets its command line.** Before this the target
 agnos ELF ran with a hard-coded `argv = [path, NULL]` and every argument past the ELF path was **silently
 dropped** — any arg-taking tool (kii `<image>`, descent `serve <port>`, kriya/dig/cmdrs…) saw none; iam
@@ -194,8 +219,12 @@ trap-log mode.
   (`ao_to_o`, `dtype_to_agnos`, the stat 144→48 + getdents dirent repacks).
 - `src/scratch.cyr` — M2 child-memory staging: `process_vm_readv`/`writev` + the
   red-zone `stage_at` (NUL-terminated paths / Linux structs into the stopped child).
-- `src/dispatch.cyr` — the impure dispatcher: execute-in-child / emulate / ENOSYS
-  rewrites (M1) + the 13 fs handlers incl. the stat/getdents exit-stop repack (M2).
+- `src/dispatch.cyr` — `translate_dispatch`, the per-number router (execute-in-child / emulate /
+  ENOSYS). Since 1.12.3 its handlers live in `src/emu_core.cyr` (shared enums, globals, the emulate
+  helper) and the band files, included in this order by `src/intercept.cyr`:
+  - `src/band_fs.cyr`: the fs handlers, the supervisor-side confined ops, the exit-stop repacks;
+  - `src/band_net.cyr`, `src/band_signals.cyr`, `src/band_iomux.cyr`, `src/band_info.cyr`;
+  - `src/band_kbscan.cyr`, `src/band_fdkind.cyr`, `src/band_console.cyr`.
 - `src/seccomp.cyr` — M3 bounding seccomp: a classic-BPF allowlist of the
   translation's output syscalls, installed on the child (default-on in run mode).
 - `src/limits.cyr` — 0.6.0 host-resource bounds: kernel-enforced child rlimits
@@ -269,7 +298,7 @@ paths in the child red zone + repack output structs at the exit stop
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
-  **402 assertions**, hermetic)
+  **440 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
