@@ -22,10 +22,16 @@
 # Sigil's hkdf_expand max OKM bound (255 * HashLen). We never request
 # that much; max single TLS expansion is the digest itself (48 bytes
 # for SHA-384). Buffer caps:
-var TLS_HKDF_LABEL_BUF_LEN = 512;     # HkdfLabel.length(2) + label(≤256) + ctx(≤256)
+# HkdfLabel at its largest: uint16 length + opaque label<7..255> + opaque context<0..255>,
+# each opaque a 1-byte length and up to 255 bytes = 514. (6.7.6: it was 512 — the comment
+# beside it added 2 + 256 + 256 and the constant did not — so the scratch it sizes was two
+# bytes short; see tls_native_hkdf_expand_label.)
+const _TLS_HKDF_LABEL_BUF_LEN = 2 + (1 + 255) + (1 + 255);
+var TLS_HKDF_LABEL_BUF_LEN = _TLS_HKDF_LABEL_BUF_LEN;
 var TLS_KEYSCHED_STATE_LEN = 104;     # 13 i64 slots (+1 @ v6.2.25: ALLOC) — see layout below
 var TLS_KS_OFF_ALLOC       = 96;      # v6.2.25 Allocator handle (0=global bump); derive fns route through it
-var TLS_MAX_DIGEST_LEN = 48;          # SHA-384
+const _TLS_MAX_DIGEST_LEN = 48;       # SHA-384
+var TLS_MAX_DIGEST_LEN = _TLS_MAX_DIGEST_LEN;
 
 # Key schedule "which sec" identifiers (for keysched_get_secret).
 var TLS_KS_EARLY            = 0;
@@ -84,7 +90,15 @@ fn tls_native_hkdf_expand_label(sec, secret_len, label, label_len,
     # Build the HkdfLabel into a stack scratch buffer (v6.2.25: was a per-call
     # alloc on the global bump — called for every expand-label, so a per-handshake
     # leak on a long-running server; the bytes never escape this fn).
-    var infobuf[512];   # == TLS_HKDF_LABEL_BUF_LEN (array size must be a literal)
+    # ⛔ 6.7.6: the scratch was 512 bytes and the largest label the checks above admit is
+    # 514 (2 + 1 + 6 + 249 + 1 + 255), so a 249-byte label with a 255-byte context wrote the
+    # context's last two bytes past it. On x86 they land in the spilled `out_len`, so
+    # hkdf_expand then wrote that many bytes (258 for a context ending 01 02) into the
+    # caller's `out` — a heap overrun of the caller's buffer. Every internal label is short
+    # and every internal context at most a 48-byte hash (the ticket nonce is 8), so it
+    # was reachable only by calling this public fn directly. Pinned by
+    # tests/tcyr/crossos/tls_native_scratch_bounds.tcyr.
+    var infobuf[_TLS_HKDF_LABEL_BUF_LEN];
     var info = &infobuf;
     # uint16 length BE
     _tn_be16_w(info, out_len);
@@ -138,7 +152,7 @@ fn tls_native_derive_secret(sec, secret_len, label, label_len,
     # Compute Transcript-Hash(Messages) into a stack scratch buffer (v6.2.25:
     # was a per-Derive-Secret alloc on the global bump → per-handshake leak;
     # the digest never escapes this fn).
-    var thbuf[48];   # == TLS_MAX_DIGEST_LEN (array size must be a literal)
+    var thbuf[_TLS_MAX_DIGEST_LEN];
     var th = &thbuf;
     tls_native_transcript_digest(transcript_state, th);
 

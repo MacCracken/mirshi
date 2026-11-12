@@ -144,7 +144,8 @@ fn _uts_field(a, b, dst, scratch, cap): i64 {
 # uptime); with the third arg 0, the sentinel was untouched on both.
 # ⚠ The compiler's own x86 reroute of syscall(228) (EMACHO_CLOCK_X86) made exactly this
 # mistake from v6.5.16 to 6.6.9 — it set rdi and rsi and never zeroed rdx — so every
-# clock_now_* on Intel-Mac wrote mach time through a stale rdx. CVE-51, CHANGELOG [6.6.10].
+# clock_now_* on Intel-Mac wrote mach time through a stale rdx. the Intel-Mac clock stale-register bug, CHANGELOG
+# [6.6.10].
 # Since 6.6.12 it points rdx at its own 8-byte stack slot and returns that mach time for
 # every clock id but 0 (the monotonic read); this wrapper wants only the timeval, so NULL.
 fn _macos_gettimeofday(tv): i64 {

@@ -129,9 +129,9 @@ fn _tn_client_hello_write(ctx, out, out_max, cookie, cookie_len): i64 {
 fn _tn_sh_is_hrr(msg, len): i64 {
     if (len < TLS_HANDSHAKE_HEADER_LEN + 2 + 32) { return 0; }
     if ((load8(msg) & 0xFF) != TLS_HS_SERVER_HELLO) { return 0; }
-    var hrr[32];
+    var hrr[_TLS_RANDOM_LEN];
     _tn_hrr_random(&hrr);
-    return _tn_ct_eq(msg + TLS_HANDSHAKE_HEADER_LEN + 2, &hrr, 32);
+    return _tn_ct_eq(msg + TLS_HANDSHAKE_HEADER_LEN + 2, &hrr, _TLS_RANDOM_LEN);
 }
 
 # Client: process a HelloRetryRequest (`hrr`, `hrr_len` bytes, header included; RFC 8446 §4.1.4)
@@ -925,7 +925,7 @@ fn tls_native_install_app_keys(ctx): i64 {
     tls_native_derive_iv(ss, hlen, hash_algo, siv, iv_len);
     store64(ctx + TLS_CTX_OFF_SRV_APP_KEY, sk);
     store64(ctx + TLS_CTX_OFF_SRV_APP_IV, siv);
-    store64(ctx + TLS_CTX_OFF_SRV_APP_SECRET, ss);   # CVE-30: retain for KeyUpdate
+    store64(ctx + TLS_CTX_OFF_SRV_APP_SECRET, ss);   # the TLS post-handshake false-EOF bug: retain for KeyUpdate
     var cs = _tn_alloc(ctx, TLS_MAX_DIGEST_LEN);
     if (cs == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     if (tls_native_keysched_get_secret(ks, TLS_KS_CLIENT_APPLICATION, cs) < 0) {
@@ -939,7 +939,7 @@ fn tls_native_install_app_keys(ctx): i64 {
     tls_native_derive_iv(cs, hlen, hash_algo, civ, iv_len);
     store64(ctx + TLS_CTX_OFF_CLI_APP_KEY, ck);
     store64(ctx + TLS_CTX_OFF_CLI_APP_IV, civ);
-    store64(ctx + TLS_CTX_OFF_CLI_APP_SECRET, cs);   # CVE-30: retain for KeyUpdate
+    store64(ctx + TLS_CTX_OFF_CLI_APP_SECRET, cs);   # the TLS post-handshake false-EOF bug: retain for KeyUpdate
     tls_native_seq_init(ctx + TLS_CTX_OFF_SRV_APP_SEQ);
     tls_native_seq_init(ctx + TLS_CTX_OFF_CLI_APP_SEQ);
     return TLS_OK;
@@ -989,7 +989,7 @@ fn _tn_open_alert(out, n): i64 {
 # `out_inner_ct` (0 to ignore), and return the decrypted plaintext length for
 # application data (inner ct 23) AND post-handshake handshake records (inner ct
 # 22 — NewSessionTicket / KeyUpdate), or a negative error (TLS_ERR_DECRYPT on a
-# bad tag). v6.1.36 (CVE-30): surfacing the inner content type lets
+# bad tag). v6.1.36 (the TLS post-handshake false-EOF bug): surfacing the inner content type lets
 # tls_native_read drain post-handshake records instead of treating them as EOF.
 # An ALERT record (inner ct 21) returns its disposition instead of a length
 # (6.6.13, _tn_alert_disposition): _TN_ALERT_EOF (0) for a warning-level
@@ -1041,7 +1041,7 @@ fn tls_native_open_app(ctx, record, record_len, out, out_max): i64 {
 }
 
 # ================================================================
-# Post-handshake messages (RFC 8446 §4.6) — CVE-30
+# Post-handshake messages (RFC 8446 §4.6) — the TLS post-handshake false-EOF bug
 # ================================================================
 # Rotate the PEER's (receive-direction) application-traffic keys after a
 # KeyUpdate: secret_{N+1} = HKDF-Expand-Label(secret_N, "traffic upd", ...),
@@ -1427,7 +1427,8 @@ var TLS_EXT_EXTENDED_MASTER_SECRET = 23;   # 0x0017, RFC 7627 §5.1 — empty ex
 # value coincides with TLS_GROUP_SECP256R1
 # (0x0017); disjoint namespaces, benign.
 var TLS_X25519_KEY_LEN = 32;
-var TLS_RANDOM_LEN     = 32;
+const _TLS_RANDOM_LEN  = 32;
+var TLS_RANDOM_LEN     = _TLS_RANDOM_LEN;
 
 # Find extension `want_type` in an extensions block (entries:
 # uint16 type + uint16 length + data). Stores the data ptr+len via
@@ -1893,7 +1894,7 @@ fn _tn_transcript_after_hrr(ctx, hash_algo, ch1, ch1_len): i64 {
     var t1 = tls_native_transcript_init_in(a, hash_algo);
     if (t1 == 0) { return 0; }
     tls_native_transcript_update(t1, ch1, ch1_len);
-    var mh[56];
+    var mh[_TLS_HANDSHAKE_HEADER_LEN + _TLS_MAX_DIGEST_LEN];
     var hl = tls_native_transcript_digest(t1, &mh + 4);
     if (hl < 0) { return 0; }
     store8(&mh, TLS_HS_MESSAGE_HASH);
@@ -2147,7 +2148,7 @@ fn _tn_build_empty_certificate(out, out_max): i64 {
 # ⛔ 6.6.20: the Ed25519 arm's expanded key (seed || pk) is a `secret var`, zeroised on every
 # return. It was two _tn_alloc buffers never wiped, so every Ed25519 CertificateVerify /
 # ServerKeyExchange left one more copy of the long-term private seed in the no-free heap or the
-# connection's arena (CVE-70's wipe covers the ephemeral ECDHE secrets only). Pinned by
+# connection's arena (the ECDHE key zeroisation gap's wipe covers the ephemeral ECDHE secrets only). Pinned by
 # tests/tcyr/crypto/tls_native_ed25519_sign_wipe.tcyr. CHANGELOG [6.6.20]
 fn _tn_sign(ctx, msg, msg_len, sig_out, sig_max, scheme_out): i64 {
     secret var sk64[64];
@@ -2361,7 +2362,7 @@ fn _tn_ct_eq(a, b, n): i64 {
 # must fill the list exactly. Returns TLS_OK or a negative TLS_ERR_* with the ctx failed:
 # TLS_ERR_BAD_HANDSHAKE (framing), TLS_ERR_CERT_INVALID (the leaf does not parse, or the chain
 # does not verify — no trust roots included), TLS_ERR_OOM. The DER stays in `list`'s buffer,
-# which the parsed certs point into. CHANGELOG [6.6.14] (CVE-64)
+# which the parsed certs point into. CHANGELOG [6.6.14] (CYRIUS-2026-0019)
 fn _tn_server_take_client_chain(ctx, list, list_len, is13): i64 {
     var inters = _tn_alloc(ctx, 8 + 16 * 8);
     if (inters == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
@@ -2433,7 +2434,7 @@ fn _tn_ecdsa_p384_verify_digest_der(pk, digest, digest_len, sig_der, sig_der_len
 fn _tn_ecdsa_verify_12(scheme, leaf, content, content_len, sig, sig_len): i64 {
     var curve = x509_cert_curve(leaf);
     var pk = x509_cert_pubkey(leaf);
-    var dg[48];
+    var dg[_TLS_MAX_DIGEST_LEN];
     var dl = 32;
     if (scheme == TLS_SIG_ECDSA_SECP384R1_SHA384) {
         sha384(content, content_len, &dg);
@@ -2501,7 +2502,7 @@ fn _tn_cert_msg_list_len(msg, msg_len, is13): i64 {
 # TLS client identity (_tn_server_take_client_chain) — and its leaf is then kept for the
 # CertificateVerify and the peer getters. Advances the transcript and the state machine
 # (RECV_CERT).
-# ⛔ 6.6.14 (CVE-64) — WHY. Until 6.6.13 this parsed the leaf and nothing else: the server checked
+# ⛔ 6.6.14 (CYRIUS-2026-0019) — WHY. Until 6.6.13 this parsed the leaf and nothing else: the server checked
 # POSSESSION (the client's CertificateVerify against that leaf) and never a chain, so any
 # well-formed leaf — self-signed, expired, issued by anyone — was accepted as an identity by a
 # server that asked for verification, and a server with no trust roots at all accepted every
@@ -2720,7 +2721,7 @@ fn tls_native_server_new_session_ticket(ctx, out, out_max): i64 {
     var age_add = _tn_alloc(ctx, 4);
     if (nonce == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     if (age_add == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-    # CVE-19 (v6.1.36): fail-closed — these were the only unchecked sys_getrandom
+    # the entropy-fallback hardening item (v6.1.36): fail-closed — these were the only unchecked sys_getrandom
     # callers; on a platform whose getrandom is unavailable (Windows/AGNOS stub
     # → -1) the nonce/age_add would otherwise stay uninitialized = a predictable
     # ticket. Never emit a weak NewSessionTicket.
@@ -2807,9 +2808,22 @@ fn tls_native_psk_binder(psk, psk_len, hash_algo, transcript_hash, th_len, out):
 
 # Seal `inner` (with TLS-1.3 inner content type `inner_ct`) into a
 # protected record at `out`. Increments seq. Returns the record length.
+# More than 2^14 content bytes is TLS_ERR_RECORD_OVERFLOW (RFC 8446 §5.2 — the caller
+# fragments) and a negative length TLS_ERR_INVALID_PARAM, both before anything is written.
+#
+# ⛔ 6.7.6: this guarded only the CIPHERTEXT cap (inner_len + 1 + tag <= 2^14 + 256), which
+# admits up to 16623 content bytes, while the plaintext scratch below holds 2^14 + 1 — so a
+# caller of this public primitive (or of tls_native_seal_app / *_seal_handshake, which reach
+# it) passing 16385..16623 bytes copied up to 239 of its own bytes past the scratch, over this
+# frame's saved registers and return address (SIGSEGV), and a negative length wrote the inner
+# type byte BELOW the scratch. The library's own callers never exceed 2^14 (tls_native_write
+# refuses more), so it was latent. TLS 1.2's seal_12 has carried this plaintext cap since
+# 6.0.72. Pinned by tests/tcyr/crossos/tls_native_scratch_bounds.tcyr.
 fn tls_native_record_seal(cipher, key, static_iv, seq8, inner_ct, inner, inner_len, out, out_max): i64 {
     var tag_len = tls_native_cipher_tag_len(cipher);
     if (tag_len < 0) { return TLS_ERR_CIPHER_NOT_SUPPORTED; }
+    if (inner_len < 0) { return TLS_ERR_INVALID_PARAM; }
+    if (inner_len > _TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     var rec_len = inner_len + 1 + tag_len;
     if (rec_len > TLS_RECORD_MAX_CIPHERTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     var total = TLS_RECORD_HEADER_LEN + rec_len;
@@ -2818,15 +2832,15 @@ fn tls_native_record_seal(cipher, key, static_iv, seq8, inner_ct, inner, inner_l
     if (wh < 0) { return wh; }
     # v6.2.25: per-record plaintext scratch on the STACK (was a global-bump
     # alloc per sealed record — the highest-rate leak on a long-running server,
-    # one per app-data record up to ~16 KB). inner_len <= TLS_RECORD_MAX_PLAINTEXT
-    # (guarded above via rec_len <= TLS_RECORD_MAX_CIPHERTEXT), and pt is consumed
-    # by aead_encrypt before return, so the fixed 16385-B frame is sound. This is
+    # one per app-data record up to ~16 KB). 0 <= inner_len <= _TLS_RECORD_MAX_PLAINTEXT
+    # (refused above — the same const sizes the scratch), and pt is consumed
+    # by aead_encrypt before return, so the fixed frame is sound. This is
     # a ctx-less generic primitive (no arena to thread) → stack-local is the fit.
-    var ptbuf[16385];   # TLS_RECORD_MAX_PLAINTEXT + 1 (array size must be a literal)
+    var ptbuf[_TLS_RECORD_MAX_PLAINTEXT + 1];   # the content + the inner content-type byte
     var pt = &ptbuf;
     memcpy(pt, inner, inner_len);
     store8(pt + inner_len, inner_ct);
-    var nonce[12];
+    var nonce[_TLS_AEAD_NONCE_LEN];
     tls_native_aead_nonce(static_iv, seq8, &nonce);
     var ct_out = out + TLS_RECORD_HEADER_LEN;
     var tag_out = ct_out + inner_len + 1;
@@ -2855,7 +2869,7 @@ fn tls_native_record_open(cipher, key, static_iv, seq8, record, record_len, out,
     var inner_ct_len = len - tag_len;
     if (inner_ct_len < 1) { return TLS_ERR_BAD_RECORD; }
     if (inner_ct_len > out_max) { return TLS_ERR_BUFFER_FULL; }
-    var nonce[12];
+    var nonce[_TLS_AEAD_NONCE_LEN];
     tls_native_aead_nonce(static_iv, seq8, &nonce);
     var cipher_in = record + TLS_RECORD_HEADER_LEN;
     var tag_in = cipher_in + inner_ct_len;

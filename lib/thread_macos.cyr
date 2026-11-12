@@ -28,7 +28,7 @@
 # (stdlib_modules_self_sufficient.sh includes every module alone on every target).
 #ifdef CYRIUS_TARGET_MACOS
 include "lib/fnptr.cyr"
-# thread_local.cyr supplies thread_local_get/set, TLOCAL_MAX_SLOTS (128) and the per-thread slot
+# thread_local.cyr supplies thread_local_get/set, _TLOCAL_MAX_SLOTS (128) and the per-thread slot
 # machinery each arm binds below (_tls_bind on arm64, _tls_gs_install on x86).
 include "lib/thread_local.cyr"
 # The x86 thread stack is a raw mmap with a PROT_NONE guard page (MAP_* / PROT_* / cyr_mprotect).
@@ -85,10 +85,10 @@ fn thread_create(fp, arg): i64 {
     _threads_active = 1;            # arm the shared-heap lock BEFORE the thread can run
     var ctl = alloc(_THR_CTL);
     if (ctl == 0) { return 0; }
-    var blk = alloc(TLOCAL_MAX_SLOTS * 8);
+    var blk = alloc(_TLOCAL_MAX_SLOTS * 8);      # the const, as every slot store (6.7.9)
     if (blk == 0) { return 0; }
     var i = 0;
-    while (i < TLOCAL_MAX_SLOTS) {  # a fresh thread must see zeroed slots
+    while (i < _TLOCAL_MAX_SLOTS) {  # a fresh thread must see zeroed slots
         store64(blk + i * 8, 0);
         i = i + 1;
     }
@@ -137,8 +137,8 @@ fn gettid(): i64 { return _thr_self(); }
 # The HANDLE a caller holds IS this pointer, as on arm64, so join / is_done are shared below.
 var _THR_CTL = 48;
 var _THR_STACK = 2097152;            # lib/thread.cyr THREAD_STACK_SIZE parity (2 MiB)
-var _THR_GUARD = 4096;               # one PROT_NONE page below the stack (CVE-29 parity)
-var _THR_HDR = 1040;                 # TLS header: word 0 + TLOCAL_MAX_SLOTS (128) slots, 16-rounded
+var _THR_GUARD = 4096;               # one PROT_NONE page below the stack (the thread guard-page hardening item parity)
+const _THR_HDR = ((_TLOCAL_MAX_SLOTS + 1) * 8 + 15) / 16 * 16;   # TLS header: word 0 + the slots, 16-rounded
 var _thr_registered = 0;
 
 # The registered trampoline. Runs on the new thread, on our stack, with no return address

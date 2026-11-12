@@ -19,7 +19,7 @@
 #
 # >>> include "lib/fnptr.cyr"
 include "lib/fnptr.cyr"
-# thread_local.cyr supplies thread_local_get/set + TLOCAL_MAX_SLOTS (128), used
+# thread_local.cyr supplies thread_local_get/set + _TLOCAL_MAX_SLOTS (128), used
 # by thread_create below to emulate per-thread TLS isolation. On a real system
 # thread creation and TLS setup are coupled (thread.cyr's _thread_spawn uses
 # CLONE_SETTLS to give the child a fresh block), so this dependency mirrors the
@@ -56,22 +56,22 @@ fn thread_create(fp, arg): i64 {
     # precisely the corruption the comment above says this code exists to prevent. The stale
     # value was documented as correct too ("TLOCAL_MAX_SLOTS (128)"), which is why reading the
     # comment did not catch it. Present identically in BOTH serial peers (macOS and agnos).
-    # ⚠ The array size must be a LITERAL (`#assert` accepts only numbers/sizeof, not a global),
-    # so 128 here duplicates `thread_local.cyr`'s TLOCAL_MAX_SLOTS — a hand-maintained copy of
-    # a derivable fact, which is the shape this cycle keeps finding wrong. The LOOP bound uses
-    # the real constant so it can never under-copy again, and
-    # `tests/gates/concurrency/tls_window_matches_max_slots.sh` fails the build if the constant
-    # is ever raised above this literal.
-    var save: i64[128];
+    # The buffer is sized by `thread_local.cyr`'s const _TLOCAL_MAX_SLOTS (6.7.6: an array size
+    # is a const context since 6.7.2; until then it had to be a literal 128, a hand-kept copy of
+    # the bound) and so are both loops (6.7.9 — they read the writable public var, so a program
+    # that raised TLOCAL_MAX_SLOTS copied past this stack buffer), so neither can under-copy or
+    # overrun.
+    # `tests/gates/concurrency/tls_window_matches_max_slots.sh` pins both.
+    var save: i64[_TLOCAL_MAX_SLOTS];
     var i = 0;
-    while (i < TLOCAL_MAX_SLOTS) {
+    while (i < _TLOCAL_MAX_SLOTS) {
         store64(&save + i * 8, thread_local_get(i));
         thread_local_set(i, 0);
         i = i + 1;
     }
     fncall1(fp, arg);
     i = 0;
-    while (i < TLOCAL_MAX_SLOTS) {
+    while (i < _TLOCAL_MAX_SLOTS) {
         thread_local_set(i, load64(&save + i * 8));
         i = i + 1;
     }

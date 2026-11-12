@@ -1032,36 +1032,43 @@ fn async_spawn_process(rt, path, argv, envp): i64 {
 # (`_proc_kill_begin`) and a task on the same reactor finishes the kill: it parks on a 10 ms
 # timerfd and takes one non-blocking look (`_proc_kill_step`) per tick until nothing is left
 # or the grace has run out, then KILLs and reaps (`_proc_kill_finish`) and closes the pidfd.
-# ctx (88 B) = { kill state @0 (40 B, lib/process.cyr), status @40, pidfd @48, tfd @56,
-# waited ms @64, rt @72, parked @80 }.
+# ctx (_AK_SIZE B) = lib/process.cyr's kill state (_PROC_KILL_STATE B) @0, then six words named
+# FROM that size, so a kill state that grows moves them rather than overlapping them (6.7.9).
+const _AK_STATUS = _PROC_KILL_STATE;         # the reaped child's wait status
+const _AK_PIDFD = _PROC_KILL_STATE + 8;      # the child's pidfd, closed at the end
+const _AK_TFD = _PROC_KILL_STATE + 16;       # the 10 ms timerfd the task parks on
+const _AK_WAITED = _PROC_KILL_STATE + 24;    # ms of the grace waited so far
+const _AK_RT = _PROC_KILL_STATE + 32;        # the runtime
+const _AK_PARKED = _PROC_KILL_STATE + 40;    # 1 while parked on the timer
+const _AK_SIZE = _PROC_KILL_STATE + 48;
 fn _async_kill_task(ctx): i64 {
-    if (load64(ctx + 80) == 1) {
-        store64(ctx + 80, 0);
+    if (load64(ctx + _AK_PARKED) == 1) {
+        store64(ctx + _AK_PARKED, 0);
         var buf[8];
         store64(&buf, 0);
         # a timerfd read is the number of 10 ms periods since the last one
-        if (syscall(SYS_READ, load64(ctx + 56), &buf, 8) == 8) {
-            store64(ctx + 64, load64(ctx + 64) + 10 * load64(&buf));
+        if (syscall(SYS_READ, load64(ctx + _AK_TFD), &buf, 8) == 8) {
+            store64(ctx + _AK_WAITED, load64(ctx + _AK_WAITED) + 10 * load64(&buf));
         }
     }
-    if (_proc_kill_step(ctx, ctx + 40) == 0) {
-        if (load64(ctx + 64) < _PROC_GRACE_MS) {
-            store64(ctx + 80, 1);
-            if (async_wait_fd(load64(ctx + 72), load64(ctx + 56)) == 0) { return 0; }
-            store64(ctx + 80, 0);
+    if (_proc_kill_step(ctx, ctx + _AK_STATUS) == 0) {
+        if (load64(ctx + _AK_WAITED) < _PROC_GRACE_MS) {
+            store64(ctx + _AK_PARKED, 1);
+            if (async_wait_fd(load64(ctx + _AK_RT), load64(ctx + _AK_TFD)) == 0) { return 0; }
+            store64(ctx + _AK_PARKED, 0);
             # the reactor would not take the timer: finish the grace here, blocking
-            _proc_kill_wait(ctx, ctx + 40, load64(ctx + 64));
+            _proc_kill_wait(ctx, ctx + _AK_STATUS, load64(ctx + _AK_WAITED));
             return _async_kill_close(ctx);
         }
     }
-    _proc_kill_finish(ctx, ctx + 40);
+    _proc_kill_finish(ctx, ctx + _AK_STATUS);
     return _async_kill_close(ctx);
 }
 
 # Close the kill task's timer and the child's pidfd. Returns 0.
 fn _async_kill_close(ctx): i64 {
-    syscall(SYS_CLOSE, load64(ctx + 56));
-    if (load64(ctx + 48) > 0) { syscall(SYS_CLOSE, load64(ctx + 48)); }
+    syscall(SYS_CLOSE, load64(ctx + _AK_TFD));
+    if (load64(ctx + _AK_PIDFD) > 0) { syscall(SYS_CLOSE, load64(ctx + _AK_PIDFD)); }
     return 0;
 }
 
@@ -1075,7 +1082,7 @@ fn _async_process_end(rt, pctx): i64 {
     if (pid <= 0) { return 0; }
     store64(pctx, 2);
     var a = load64(rt + 32);
-    var ctx = alloc_via(a, 88);
+    var ctx = alloc_via(a, _AK_SIZE);
     var tfd = 0 - 1;
     if (ctx != 0) { tfd = _async_timerfd(10, 10); }
     if (tfd < 0) {
@@ -1084,15 +1091,15 @@ fn _async_process_end(rt, pctx): i64 {
         if (load64(pctx + 40) > 0) { syscall(SYS_CLOSE, load64(pctx + 40)); }
         return 0;
     }
-    store64(ctx + 48, load64(pctx + 40));
-    store64(ctx + 56, tfd);
-    store64(ctx + 64, 0);
-    store64(ctx + 72, rt);
-    store64(ctx + 80, 0);
+    store64(ctx + _AK_PIDFD, load64(pctx + 40));
+    store64(ctx + _AK_TFD, tfd);
+    store64(ctx + _AK_WAITED, 0);
+    store64(ctx + _AK_RT, rt);
+    store64(ctx + _AK_PARKED, 0);
     _proc_kill_begin(ctx, pid, 0);
     # The /proc snapshot lives in process.cyr's one shared buffer, which the next snapshot —
     # any process verb another task runs during the grace — overwrites. Keep a copy.
-    var n = load64(ctx + 24);
+    var n = load64(ctx + 24);                     # the kill state's own n @24 / snap @32
     var kt = 0;
     if (n > 0) {
         var cp = alloc_via(a, n * 8);
@@ -1105,7 +1112,7 @@ fn _async_process_end(rt, pctx): i64 {
         kt = async_spawn(rt, &_async_kill_task, ctx);
     }
     if (kt == 0) {
-        _proc_kill_wait(ctx, ctx + 40, 0);        # no task: finish it here, blocking
+        _proc_kill_wait(ctx, ctx + _AK_STATUS, 0);   # no task: finish it here, blocking
         _async_kill_close(ctx);
     }
     return kt;

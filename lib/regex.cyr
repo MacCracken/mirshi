@@ -690,6 +690,10 @@ fn _re_apply_simple_q(atom_start, op_char): i64 {
     return 0;
 }
 
+# The most optional copies one {n,m} may emit (m - n, or m for {0,m}): one split pc each, held
+# in a stack table sized by this const and refused past it by the same const. CHANGELOG [6.7.9]
+const _RE_MAX_SPLITS = 64;
+
 # Apply {n,m} or {n,} or {n} to the atom at [atom_start, _re_instr_n).
 # `save_primary_start` is the source position right before parse_primary
 # was called for the FIRST copy — used to re-parse for additional copies.
@@ -737,11 +741,11 @@ fn _re_apply_brace_q(save_primary_start, atom_start): i64 {
             if (_re_err == 1) { return 0; }
             _re_apply_star_inline(ts, lazy);
         } else {
-            var splits: i64[64];   # v6.2.1: 64 split-pc slots (matches `sn >= 64` guard; was [64]=8 slots → OOB)
+            var splits: i64[_RE_MAX_SPLITS];   # one split pc per optional copy (v6.2.1: `[64]` was 8 slots → OOB)
             var sn = 0;
             var k = 0;
             while (k < n_max) {
-                if (sn >= 64) { _re_err = 1; return 0; }
+                if (sn >= _RE_MAX_SPLITS) { _re_err = 1; return 0; }
                 var sx = _re_emit_split(0, 0);
                 store64(&splits + sn * 8, sx);
                 sn = sn + 1;
@@ -774,11 +778,11 @@ fn _re_apply_brace_q(save_primary_start, atom_start): i64 {
             if (_re_err == 1) { return 0; }
             _re_apply_star_inline(ts2, lazy);
         } elif (n_max > n_min) {
-            var splits2: i64[64];   # v6.2.1: 64 split-pc slots (matches `sn2 >= 64` guard)
+            var splits2: i64[_RE_MAX_SPLITS];   # one split pc per optional copy
             var sn2 = 0;
             var k2 = n_min;
             while (k2 < n_max) {
-                if (sn2 >= 64) { _re_err = 1; return 0; }
+                if (sn2 >= _RE_MAX_SPLITS) { _re_err = 1; return 0; }
                 var sy = _re_emit_split(0, 0);
                 store64(&splits2 + sn2 * 8, sy);
                 sn2 = sn2 + 1;

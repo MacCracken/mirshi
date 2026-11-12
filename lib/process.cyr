@@ -131,7 +131,34 @@ fn proc_timeout_ms(): i64 {
     return _PROC_DEADLINE_MS;
 }
 
-# Called in the CHILD, between fork and execve. PR_SET_PDEATHSIG = 1, SIGKILL = 9; it
+# ⛔ 6.7.9 — A CHILD STARTS WITH A FRESH PROGRAM'S SIGNAL STATE, NOT ITS PARENT'S. A blocked mask
+# and an IGNORED disposition both survive fork AND execve (a handler does not), and nothing here
+# touched either, so every child ran with what its parent blocked or ignored: under a parent that
+# ignores SIGPIPE (sandhi's server entry points; a Python or Node launcher) the child's
+# `yes | head -1` printed "Broken pipe" instead of ending quietly, and under one that blocks SIGINT
+# (a signalfd reader) the child could not be interrupted. Called in the CHILD, between fork and
+# execve — by `_proc_child_guard` and by `spawn` (which has no guard): the mask is emptied and
+# SIGPIPE / SIGXFSZ go back to SIG_DFL (Python's `restore_signals` pair; Rust's Command empties
+# the mask and resets SIGPIPE). Every OTHER ignore is kept on purpose: a SIGHUP that `nohup`
+# ignored is the operator's choice and must reach the command. The mask half is Linux only: the
+# macOS floor declines sigprocmask (-78, no Mach-O route), so a cyrius program there cannot block
+# a signal to hand on — but a mask it inherited from its own launcher still passes through
+# (issues/2026-10-11-macos-exec-child-keeps-launcher-signal-mask.md). CHANGELOG [6.7.9]
+var _PROC_SIGXFSZ = 25;   # Linux (x86_64 and aarch64) and Darwin alike; lib/'s Signal enums have no name for it
+
+fn _proc_child_signals(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var empty[8];          # a kernel sigset: 8 bytes, rt_sigprocmask's sigsetsize
+    store64(&empty, 0);
+    sys_sigprocmask(SIG_SETMASK, &empty, 0);
+    #endif
+    signal_default(SIGPIPE);
+    signal_default(_PROC_SIGXFSZ);
+    return 0;
+}
+
+# Called in the CHILD, between fork and execve. It resets the signal state first
+# (`_proc_child_signals`, above). PR_SET_PDEATHSIG = 1, SIGKILL = 9; it
 # survives execve for a non-setuid binary, so the exec'd program inherits it. Linux only —
 # prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes the
 # race where the parent died between the fork and the prctl: the death signal was then
@@ -145,6 +172,7 @@ fn proc_timeout_ms(): i64 {
 # which an unbounded call — `git` prompting for credentials through cbt/deps.cyr — must keep.
 # PR_SET_PDEATHSIG still ends a Linux child when its parent dies. CHANGELOG [6.6.10] [6.6.11]
 fn _proc_child_guard(ppid_before): i64 {
+    _proc_child_signals();
     #ifdef CYRIUS_TARGET_LINUX
     sys_prctl(1, 9, 0, 0, 0);
     if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
@@ -368,7 +396,7 @@ fn _proc_kill_group(pid, stbuf): i64 {
 #   got   0 until `pid` is reaped; 1 reaped into the caller's status buffer; 2 waitpid failed.
 #   n, snap   the /proc descendant snapshot (Linux, `grp` 0): `n` entries at `snap` — which is
 #         `_proc_tree`; a caller whose kill outlives the next snapshot copies it and repoints.
-var _PROC_KILL_STATE = 40;
+const _PROC_KILL_STATE = 40;
 
 # Begin ending `pid`: with `grp` 1 target its process group when it leads one, else snapshot its
 # descendants; then TERM the target. Fills the kill state `ks`. Returns 0.
@@ -439,7 +467,7 @@ fn _proc_kill_wait(ks, stbuf, waited): i64 {
 # The blocking kill: begin, then `_proc_kill_wait`. `grp` 1 ends `pid`'s process group (macOS's
 # `proc_kill_tree`, and `_proc_end_cut_group`), 0 its /proc tree.
 fn _proc_kill_run(pid, stbuf, grp): i64 {
-    var ks[40];
+    var ks[_PROC_KILL_STATE];
     _proc_kill_begin(&ks, pid, grp);
     _proc_kill_wait(&ks, stbuf, 0);
     return 0;
@@ -745,10 +773,12 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
 # The census in tests/gates/toolchain/check_driver_bounded.sh reads this marker, so the
 # exemption is one line in one place rather than a file the census stops looking at.
 # CHANGELOG [6.6.6]
+# The signal reset is NOT exempt: the child still starts with an empty mask and SIGPIPE /
+# SIGXFSZ at SIG_DFL (`_proc_child_signals`). CHANGELOG [6.7.9]
 fn spawn(cmd, arg1, arg2): Result {
     var pid = sys_fork();
     if (pid < 0) { return Err(0 - pid); }
-    if (pid == 0) { _exec3(cmd, arg1, arg2); }
+    if (pid == 0) { _proc_child_signals(); _exec3(cmd, arg1, arg2); }
     return Ok(pid);
 }
 

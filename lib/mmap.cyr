@@ -40,12 +40,21 @@ fn cyr_munmap(addr, length): i64 {
 }
 
 # cyr_mprotect(addr, length, prot) → 0 on success
+# PE: -38 (-ENOSYS) returned directly — no PE route takes syscall 10 (Windows spells it
+# VirtualProtect). The raw call returned the same -38 but drew the compiler's unrouted-syscall
+# warning on every PE build that included this file (lib/freelist.cyr and lib/thread.cyr pull it
+# in), called or not. CHANGELOG [6.7.9]
 fn cyr_mprotect(addr, length, prot): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 38;
+    #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
     return syscall(10, addr, length, prot);
+    #endif
     #endif
 }
 

@@ -65,7 +65,7 @@ fn ws_fd(ws): i64 { return load64(ws); }
 fn ws_state(ws): i64 { return load64(ws + 8); }
 
 # Generate the 4-byte frame mask key from the kernel CSPRNG.
-# CVE-19 (v6.1.36): fail-CLOSED. RFC 6455 §5.3 requires an UNPREDICTABLE
+# the entropy-fallback hardening item (v6.1.36): fail-CLOSED. RFC 6455 §5.3 requires an UNPREDICTABLE
 # masking key; the old `/dev/urandom` open could fail (absent on macOS sandbox /
 # Windows) and silently store an uninitialized stack value. sys_getrandom routes
 # through getrandom(2) (getentropy on macOS); on failure we MUST NOT emit a weak
@@ -78,7 +78,7 @@ fn _ws_gen_mask(ws): i64 {
 }
 
 # Build WebSocket upgrade request. Returns the request buffer, or 0 if the
-# CSPRNG is unavailable (CVE-19 v6.1.36: fail-CLOSED — the old /dev/urandom open
+# CSPRNG is unavailable (the entropy-fallback hardening item v6.1.36: fail-CLOSED — the old /dev/urandom open
 # could fail and emit an uninitialized Sec-WebSocket-Key nonce).
 fn _ws_handshake_request(path, host, key_out): i64 {
     # Generate the 16-byte Sec-WebSocket-Key nonce from the kernel CSPRNG.
@@ -90,7 +90,7 @@ fn _ws_handshake_request(path, host, key_out): i64 {
     store8(key_out + strlen(key), 0);
 
     # 6.6.10: sized from the request, not a fixed 512. The path and host were memcpy'd into a
-    # 512-byte buffer with no length check, so a long path overran the heap (the CVE-50 shape
+    # 512-byte buffer with no length check, so a long path overran the heap (the CYRIUS-2026-0010 shape
     # in lib/http.cyr); the fixed text below is 114 bytes plus the NUL. CHANGELOG [6.6.10]
     var buf = alloc(strlen(path) + strlen(host) + strlen(key) + 160);
     if (buf == 0) { return 0; }
@@ -120,7 +120,8 @@ fn ws_connect(sock, path, host): i64 {
     if (ws == 0) { return 0; }
     var key[32];
     var req = _ws_handshake_request(path, host, &key);
-    if (req == 0) { store64(ws + 8, WS_CLOSED); return ws; }   # CVE-19: no entropy → fail closed
+    # the entropy-fallback hardening item: no entropy → fail closed
+    if (req == 0) { store64(ws + 8, WS_CLOSED); return ws; }
     # v6.6.8: the whole request or nothing — a short write left the server reading half a
     # handshake. CHANGELOG [6.6.8]
     var qlen = strlen(req);
@@ -163,7 +164,7 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0 - 1; }
     if (len < 0) { return 0 - 1; }
     # The 64-bit length below carries the low 32 bits only — the same bound ws_recv_frame
-    # accepts (CVE-53) — so a frame of 4 GiB or more is refused before a byte is sent, not
+    # accepts (CYRIUS-2026-0011) — so a frame of 4 GiB or more is refused before a byte is sent, not
     # announced as len mod 2^32 with the whole payload streamed after it. CHANGELOG [6.6.20]
     if (len > 0xFFFFFFFF) { return 0 - 1; }
     var fd = ws_fd(ws);
@@ -194,7 +195,7 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
         hlen = 10;
     }
 
-    # Mask key (CVE-19: fail closed if the CSPRNG is unavailable — never send
+    # Mask key (the entropy-fallback hardening item: fail closed if the CSPRNG is unavailable — never send
     # a frame under a predictable/uninitialized mask).
     if (_ws_gen_mask(ws) != 0) { return 0 - 1; }
     var mask = load64(ws + 16) & 0xFFFFFFFF;
@@ -278,7 +279,7 @@ fn _ws_recv_fail(ws): i64 {
 # len_out 0 and the connection CLOSED, on EOF, a read error, a short frame, a length above
 # WS_RECV_MAX_PAYLOAD, or a failed allocation.
 #
-# ⛔ CVE-53 (6.6.10). The extended-length, mask and payload reads were single unchecked
+# ⛔ CYRIUS-2026-0011 (6.6.10). The extended-length, mask and payload reads were single unchecked
 # sys_read calls: a short read (routine for any frame larger than one TCP segment) left stale
 # stack bytes as the length or mask, and the payload was reported complete when it was not.
 # The 64-bit length dropped its high 32 bits, and `alloc(plen + 1)` took the peer's length

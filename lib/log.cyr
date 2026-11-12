@@ -123,19 +123,20 @@ fn _log_mark_trunc(buf, off): i64 {
     return 0;
 }
 
-# The line limit: a 512-byte scratch holds at most 511 bytes plus the NUL.
-var _LOG_LINE_MAX = 511;
+# The line limit: the scratch holds at most _LOG_LINE_MAX bytes plus the NUL, and is sized by
+# this one const (6.7.6 — it was a literal 512 beside a var 511, two copies of one bound).
+const _LOG_LINE_MAX = 511;
 
 # Log with key=value context: "msg key=val". A line longer than 511 bytes is cut at 511
 # and ends "..." — the sink never sees more than 511 bytes.
 #
-# ⛔ CVE-56 (6.6.12): the three copies had no bound, so a logged caller-controlled value
+# ⛔ CYRIUS-2026-0013 (6.6.12): the three copies had no bound, so a logged caller-controlled value
 # (a request header, a path) longer than the 512-byte stack scratch overwrote this fn's
 # own locals and its return address — a 4 KB value killed the process with SIGSEGV
-# before the sink was reached. Same class as CVE-50. CHANGELOG [6.6.12]
+# before the sink was reached. Same class as CYRIUS-2026-0010. CHANGELOG [6.6.12]
 fn log_info_kv(msg, key, val): i64 {
     if (LOG_INFO < _log_level) { return 0; }
-    var buf[512];
+    var buf[_LOG_LINE_MAX + 1];
     var lim = _LOG_LINE_MAX;
     var off = _log_cat(&buf, 0, msg, lim);
     off = _log_cat(&buf, off, " ", lim);
@@ -150,10 +151,10 @@ fn log_info_kv(msg, key, val): i64 {
 
 # Log with integer value: "msg key=<decimal>". The value is never truncated: msg and key
 # share 511 - 22 bytes (22 = '=' + '-' + 19 digits, with one to spare) and end "..." when
-# they do not fit. CVE-56, CHANGELOG [6.6.12]
+# they do not fit. CYRIUS-2026-0013, CHANGELOG [6.6.12]
 fn log_info_int(msg, key, val): i64 {
     if (LOG_INFO < _log_level) { return 0; }
-    var buf[512];
+    var buf[_LOG_LINE_MAX + 1];
     var lim = _LOG_LINE_MAX - 22;
     var off = _log_cat(&buf, 0, msg, lim);
     off = _log_cat(&buf, off, " ", lim);

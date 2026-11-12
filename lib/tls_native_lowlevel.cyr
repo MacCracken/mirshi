@@ -175,7 +175,8 @@ var TLS_ERR_KEY_UNSUPPORTED = 0 - 21;
 # Handshake messages are emitted inside record fragments
 # (ContentType = TLS_CT_HANDSHAKE) and may span multiple records.
 
-var TLS_HANDSHAKE_HEADER_LEN = 4;
+const _TLS_HANDSHAKE_HEADER_LEN = 4;
+var TLS_HANDSHAKE_HEADER_LEN = _TLS_HANDSHAKE_HEADER_LEN;
 
 # Write a 4-byte handshake message header into `buf`. Returns
 # TLS_HANDSHAKE_HEADER_LEN on success, TLS_ERR_INVALID_PARAM if
@@ -226,7 +227,8 @@ var TLS_HASH_SHA384_LEN = 48;
 # hash ctx.
 var TLS_TRANSCRIPT_STATE_LEN = 16;
 var TLS_SHA256_CTX_LEN = 144;
-var TLS_SHA384_CTX_LEN = 208;
+const _TLS_SHA384_CTX_LEN = 208;
+var TLS_SHA384_CTX_LEN = _TLS_SHA384_CTX_LEN;
 
 # Initialize a transcript-hash accumulator. `hash_algo` is one of
 # TLS_HASH_SHA256 / TLS_HASH_SHA384. Returns a state handle (>0) or
@@ -294,11 +296,11 @@ fn tls_native_transcript_digest(state, digest_out): i64 {
     if (state == 0) { return 0 - 1; }
     var algo = load64(state);
     var hctx = load64(state + 8);
-    # v6.2.25: stack-local clone (208 B covers both SHA-256=144 / SHA-384=208)
+    # v6.2.25: stack-local clone (_TLS_SHA384_CTX_LEN covers both SHA-256=144 / SHA-384=208)
     # instead of a per-snapshot alloc — the transcript is digested ~10× per
     # handshake, so on a long-running server those clones were a per-connection
     # leak on the global bump. Consumed by sha*_finalize before return.
-    var clone[208];
+    var clone[_TLS_SHA384_CTX_LEN];
     if (algo == TLS_HASH_SHA256) {
         memcpy(&clone, hctx, TLS_SHA256_CTX_LEN);
         sha256_finalize(&clone, digest_out);

@@ -335,10 +335,8 @@ fn unicode_compose(cp1, cp2) {
 # ────────
 # Walk s, decomposing each cp recursively until no further expansion.
 # Writes the expanded cp sequence to buf as i64 slots; returns count.
-# Canonical only (NFC/NFD); the NFKC/NFKD compat path is unbuilt — tracked on the
-# roadmap-future watching list ("Unicode NFKC/NFKD compatibility forms"), which carries
-# the ~445 KB table cost that is the actual reason it is not here yet. See this file's
-# header for the enum and buffer sizing that already anticipate it.
+# Canonical only (NFC/NFD); NFKC/NFKD take `_uc_decompose_cp_recursive_compat` below
+# (the K-forms shipped at v5.8.60 — see this file's header).
 
 # Returns the new count, or -1 when a step buffer could not be allocated. ⚠ It used to return
 # `off` on a refused alloc — "this cp decomposed to nothing" — so str_normalize dropped the

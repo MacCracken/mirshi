@@ -5,7 +5,7 @@
 # The URL's host is resolved with net.cyr's net_resolve_ipv4 — an IPv4 literal, `localhost`,
 # /etc/hosts, then DNS; the system resolver on Windows (v6.6.9; before it no http_* call could
 # reach any host). The request is at most _HTTP_REQ_CAP (2048) bytes; a longer one is refused as
-# a bad URL (CVE-50). Every socket is closed with net.cyr's sock_close: on Windows it is a
+# a bad URL (CYRIUS-2026-0010). Every socket is closed with net.cyr's sock_close: on Windows it is a
 # Winsock SOCKET, which sys_close (CloseHandle there) does not close (6.6.11).
 
 # v5.8.31: Result-returning *_r variant (`http_get_r`) for typed
@@ -119,7 +119,7 @@ var _HTTP_REQ_CAP = 2048;
 # `:port` whenever port is not 80 (RFC 9110 §7.2: a Host without a port means the scheme's
 # default, so a server on :8080 used to be told :80 — virtual hosting and absolute-URL
 # redirects then named the wrong origin). The suffix counts toward the cap. CHANGELOG [6.6.11]
-# ⛔ CVE-50: this used to alloc(2048) and memcpy the method, path and host into it unchecked, so a
+# ⛔ CYRIUS-2026-0010: this used to alloc(2048) and memcpy the method, path and host into it unchecked, so a
 # long URL (caller-controlled — a crawled link, a redirect, user input) wrote past the buffer
 # into whatever the allocator handed out next; measured, the NEXT alloc() came back full of the
 # path's bytes. The length is now computed first and an over-long request is refused before the
@@ -162,7 +162,7 @@ fn _http_build_request(method, host, port, path): i64 {
 
 # Build the request for `host`:`port` `path` and resolve `host`, IN THAT ORDER: the request is
 # stored at slot[0] and the address at slot[8]. Returns 0, 1 for a request over _HTTP_REQ_CAP
-# (CVE-50), or 2 for a host that does not resolve. slot[8] is written only after a lookup ran, so it is left
+# (CYRIUS-2026-0010), or 2 for a host that does not resolve. slot[8] is written only after a lookup ran, so it is left
 # as the caller set it on 1.
 # ⛔ WHY THE ORDER: the refusal must cost nothing. Resolving first made an over-long URL read
 # /etc/hosts and /etc/resolv.conf and send a DNS datagram for its host before it was refused —
@@ -261,7 +261,7 @@ fn http_get(url): i64 {
     var host = load64(parsed);
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
-    # v6.6.9: an over-long request (CVE-50) is refused before any lookup, and a host that does
+    # v6.6.9: an over-long request (CYRIUS-2026-0010) is refused before any lookup, and a host that does
     # not resolve before any TCP socket. sock_connect wants a packed address; it used to get the
     # host STRING pointer, so no http_* call reached any host. CHANGELOG [6.6.9]
     var slot = alloc(16);
@@ -344,7 +344,7 @@ fn http_get_r(url) : Result {
     var slot = alloc(16);
     if (slot == 0) { return Err(HttpOther); }
     var prep = _http_prepare(host, port, path, slot);
-    if (prep == 1) { return Err(HttpBadUrl); }                # v6.6.9: over-long (CVE-50)
+    if (prep == 1) { return Err(HttpBadUrl); }                # v6.6.9: over-long (CYRIUS-2026-0010)
     if (prep != 0) { return Err(HttpNetErr); }                # v6.6.9: does not resolve
     var req = load64(slot);
     var addr = load64(slot + 8);
@@ -404,7 +404,7 @@ fn http_get_a(a, url): i64 {
     var path = load64(parsed + 16);
     var slot = alloc(16);
     if (slot == 0) { return 0; }
-    if (_http_prepare(host, port, path, slot) != 0) {               # v6.6.9: CVE-50 / unresolved
+    if (_http_prepare(host, port, path, slot) != 0) {               # v6.6.9: CYRIUS-2026-0010 / unresolved
         var unr = alloc_via(a, 24);
         if (unr == 0) { return 0; }
         store64(unr, HTTP_ERROR);

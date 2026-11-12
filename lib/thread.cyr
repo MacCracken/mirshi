@@ -127,7 +127,7 @@ var CHAN_BLOCKING = 0;
 # the str_builder concurrency root cause) — fit on a spawned thread's stack even for
 # large arrays (the largest array local in the toolchain is 256KB). Virtual reservation
 # only; physical pages are touched on demand, and the PROT_NONE guard page below the
-# stack (CVE-29) turns any overflow into a loud SIGSEGV rather than corruption. A
+# stack (the thread guard-page hardening item) turns any overflow into a loud SIGSEGV rather than corruption. A
 # per-call heap path for large arrays was rejected: the global bump allocator has no
 # free(), so it would leak every call.
 var THREAD_STACK_SIZE = 2097152;
@@ -140,7 +140,7 @@ var THREAD_TLS_SIZE = 4096;
 # Thread struct: { tid: i64, stack_base: i64, stack_size: i64 } = 24 bytes
 var THREAD_SIZE = 24;
 
-# CVE-29: one PROT_NONE guard page below each thread stack. Stacks grow
+# the thread guard-page hardening item: one PROT_NONE guard page below each thread stack. Stacks grow
 # DOWN, so an overflow runs off the LOW end; without a guard it silently
 # scribbles whatever the allocator handed out just below (the global
 # 256 MB chunk arena) instead of faulting. 4096 = one page on x86_64 +
@@ -149,7 +149,7 @@ var THREAD_SIZE = 24;
 var THREAD_GUARD_SIZE = 4096;
 
 # Allocate stack via mmap (returns USABLE base, or <0 on failure).
-# CVE-29: over-maps one extra page and mprotects it PROT_NONE at the low
+# the thread guard-page hardening item: over-maps one extra page and mprotects it PROT_NONE at the low
 # (overflow) end; a stack overflow then SIGSEGVs instead of corrupting the
 # adjacent allocator region. Usable stack = [base+GUARD, base+GUARD+size).
 fn mmap_stack(size): i64 {

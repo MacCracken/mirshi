@@ -82,7 +82,8 @@ fn _w_cmdbuf(nchars): i64 {
     return alloc(need);
 }
 
-# ⛔ 6.6.20 (CVE-102) — A SYSTEM PROGRAM IS STARTED BY ITS ABSOLUTE PATH, NEVER BY A BARE NAME.
+# ⛔ 6.6.20 (the Windows bare-name process-start bug) — A SYSTEM PROGRAM IS STARTED BY ITS ABSOLUTE PATH, NEVER BY A BARE
+# NAME.
 # CreateProcessW with no lpApplicationName resolves a bare first token by SEARCHING, and the
 # documented order visits the PARENT'S CURRENT DIRECTORY before System32 (the caller's own
 # directory, the current directory, the system directories, then PATH). Every Windows
@@ -150,7 +151,7 @@ fn _win_sys_exe(name): i64 {
     return p;
 }
 
-# 6.6.20 (SEC-02, CVE-97) — 1 when `s` CANNOT be one double-quoted operand of a `cmd /s /c`
+# 6.6.20 (SEC-02, the build-output quoting bug) — 1 when `s` CANNOT be one double-quoted operand of a `cmd /s /c`
 # line. Inside cmd's quotes `& | < > ^ ( )` are literal; three things are not: a `"` ENDS the
 # operand, so the rest of the line runs as cmd's own commands (`out.exe" & echo X> pwned.txt &
 # "y` as cyrius build's output ran its echo under wine); `%NAME%` expands even quoted (`q%OS%z`
@@ -263,8 +264,8 @@ fn _win_wenvblock_vec(env, is_str): i64 {
 # child is meant to outlive us, and only `wait_pid`'s deadline may end its tree.
 # ⚠ Not thread-safe (the table, like the bump allocator): spawn from one thread.
 # CHANGELOG [6.6.10]
-var _win_job_tab[128];          # 64 × {hProcess, hJob}; hProcess 0 = a free slot
-var _WIN_JOB_SLOTS = 64;
+const _WIN_JOB_SLOTS = 64;
+var _win_job_tab[_WIN_JOB_SLOTS * 2];   # _WIN_JOB_SLOTS × {hProcess, hJob}; hProcess 0 = a free slot
 
 # Remember `job` for process handle `hp`. Returns 1, or 0 when the table is full — then the
 # job's KILL_ON_JOB_CLOSE is cleared and its handle closed, so the child runs untracked.
@@ -837,7 +838,8 @@ fn exec_env_str(args, env): i64 {
 # bare first token via CreateProcessW directly — shell metacharacters became
 # literal argv and nothing piped. See CHANGELOG; mirrors the POSIX
 # /bin/sh -c fix in lib/process.cyr.
-# 6.6.20 (CVE-102): cmd.exe by its absolute path (`_win_sys_exe`), and the command runs with
+# 6.6.20 (the Windows bare-name process-start bug): cmd.exe by its absolute path (`_win_sys_exe`), and the command runs
+# with
 # NoDefaultCurrentDirectoryInExePath set, so cmd's OWN search for a bare program in `cmdline`
 # (`git tag …` from `cyrius publish`) skips the current directory as /bin/sh does — measured on
 # cass: a planted `.\git.exe`-shaped program ran without it and "is not recognized" with it. An

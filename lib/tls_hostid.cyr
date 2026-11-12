@@ -8,9 +8,9 @@
 # (dNSName SANs only), -1 a ':'-bearing host that is no literal, or one starting with '.'
 # (no identity at all). `_tn_sni_len` asks it whether the host goes out as SNI (a DNS name only; 6.6.14).
 # Builtins only (load8 / store8), no includes. The `_tn_` names are the native stack's,
-# kept so its callers and tests did not move. CHANGELOG [6.6.13] (CVE-63, CVE-59).
+# kept so its callers and tests did not move. CHANGELOG [6.6.13] (CYRIUS-2026-0018, CYRIUS-2026-0015).
 
-# Hex digit value (0-15) or -1. CVE-18: used by the IPv6 literal parser.
+# Hex digit value (0-15) or -1. CYRIUS-2026-0003: used by the IPv6 literal parser.
 fn _tn_hexval(c): i64 {
     if (c >= 0x30) { if (c <= 0x39) { return c - 0x30; } }       # 0-9
     if (c >= 0x61) { if (c <= 0x66) { return c - 0x61 + 10; } }  # a-f
@@ -18,12 +18,12 @@ fn _tn_hexval(c): i64 {
     return 0 - 1;
 }
 
-# CVE-18 (v6.1.36): parse an IPv4 dotted-decimal literal (`host`/`host_len`)
+# CYRIUS-2026-0003 (v6.1.36): parse an IPv4 dotted-decimal literal (`host`/`host_len`)
 # into 4 network-order bytes at `out`. Returns 4 on success, 0 if not a
 # well-formed IPv4 literal. Used for iPAddress-SAN matching of IP connects.
 # The rule is net_parse_ipv4's (lib/net.cyr), leading zeros refused: a host the
 # resolver sends to DNS as a name must not verify as an address.
-# CHANGELOG [6.6.13] (CVE-63).
+# CHANGELOG [6.6.13] (CYRIUS-2026-0018).
 fn _tn_parse_ipv4(host, host_len, out): i64 {
     var octet = 0;
     var digits = 0;
@@ -61,7 +61,7 @@ fn _tn_parse_ipv4(host, host_len, out): i64 {
 # group, a trailing ':' and a 5-digit "00001" are refused. With `allow_v4`
 # the run may END in a dotted quad (form 3, "::ffff:1.2.3.4"), parsed by the
 # strict _tn_parse_ipv4 into the next 4 bytes. Returns the bytes written, or
-# -1. CHANGELOG [6.6.13] (CVE-63).
+# -1. CHANGELOG [6.6.13] (CYRIUS-2026-0018).
 fn _tn_ipv6_groups(s, slen, out, max_bytes, allow_v4): i64 {
     # A '.' after the last ':' marks a dotted-quad tail; the hex groups end there.
     var last_colon = 0 - 1;
@@ -113,11 +113,11 @@ fn _tn_ipv6_groups(s, slen, out, max_bytes, allow_v4): i64 {
     return written + 2;
 }
 
-# CVE-18: parse an IPv6 literal into 16 bytes at `out`, per RFC 4291 §2.2:
+# CYRIUS-2026-0003: parse an IPv6 literal into 16 bytes at `out`, per RFC 4291 §2.2:
 # eight groups, or fewer around ONE "::" that stands for at least one zero
 # group, the last 32 bits optionally a dotted quad ("::ffff:1.2.3.4").
 # Returns 16 on success, 0 otherwise. Brackets and zone ids ("[::1]",
-# "fe80::1%eth0") are not literals here. CHANGELOG [6.6.13] (CVE-63).
+# "fe80::1%eth0") are not literals here. CHANGELOG [6.6.13] (CYRIUS-2026-0018).
 fn _tn_parse_ipv6(host, host_len, out): i64 {
     var z = 0;
     while (z < 16) { store8(out + z, 0); z = z + 1; }
@@ -161,13 +161,13 @@ fn _tn_parse_ipv6(host, host_len, out): i64 {
     return 16;
 }
 
-# CVE-18: classify `host`, parsing an IP literal into `out` (16 bytes).
+# CYRIUS-2026-0003: classify `host`, parsing an IP literal into `out` (16 bytes).
 # Returns 4 / 16 for an IPv4 / IPv6 literal, 0 for a DNS name, and -1 for a
 # host that holds a ':' but is no well-formed IPv6 literal ("[::1]",
 # "fe80::1%eth0", "1:2:3:4:5:6:7:8:"). No DNS name holds a ':', so a -1 host
 # has no reference identity and matches nothing. CHANGELOG [6.6.13]
-# (CVE-63).
-# 6.6.14 (CVE-67): a host that starts with '.' is -1 too. No DNS name does, and
+# (CYRIUS-2026-0018).
+# 6.6.14 (CYRIUS-2026-0022): a host that starts with '.' is -1 too. No DNS name does, and
 # OpenSSL's X509_check_host reads one as a SUBDOMAIN pattern (".example.com"
 # matched a certificate for any name under example.com) — so the libssl binder
 # would have bound it to every subdomain while native bound it to nothing.

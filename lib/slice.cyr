@@ -19,6 +19,10 @@
 # call site emits a call to the helper matching s's element
 # width (1/2/4/8/16). On bounds violation, helpers print
 # `slice bounds violation\n` to stderr and exit 134.
+# 6.7.8: an [i8] / [i16] / [i32] element is read through
+# `_slice_idx_addr` (below) and loaded SIGN-extended by the
+# compiler, as a typed array's / a field's is; the getters
+# below zero-extend (u8 / u16 / u32).
 
 include "lib/syscalls.cyr"
 # 6.6.9: slice_copy_bytes / slice_eq_bytes call memcpy / memeq (string.cyr); this file included
@@ -198,7 +202,8 @@ fn _slice_bounds_trap(): i64 {
     return 0;
 }
 
-# Width-1: u8 / i8 elements. Returns zero-extended byte value.
+# Width-1: u8 elements. Returns zero-extended byte value (an [i8]
+# read goes through _slice_idx_addr, sign-extended — 6.7.8).
 fn _slice_idx_get_1(s_addr, idx): i64 {
     var len = load64(s_addr + 8);
     if (idx < 0) { _slice_bounds_trap(); }
@@ -206,7 +211,7 @@ fn _slice_idx_get_1(s_addr, idx): i64 {
     return load8(load64(s_addr) + idx);
 }
 
-# Width-2: u16 / i16 elements.
+# Width-2: u16 elements (an [i16] read: _slice_idx_addr, 6.7.8).
 fn _slice_idx_get_2(s_addr, idx): i64 {
     var len = load64(s_addr + 8);
     if (idx < 0) { _slice_bounds_trap(); }
@@ -214,7 +219,7 @@ fn _slice_idx_get_2(s_addr, idx): i64 {
     return load16(load64(s_addr) + idx * 2);
 }
 
-# Width-4: u32 / i32 elements.
+# Width-4: u32 elements (an [i32] read: _slice_idx_addr, 6.7.8).
 fn _slice_idx_get_4(s_addr, idx): i64 {
     var len = load64(s_addr + 8);
     if (idx < 0) { _slice_bounds_trap(); }
@@ -238,6 +243,17 @@ fn _slice_idx_get_16(s_addr, idx): i64 {
     if (idx < 0) { _slice_bounds_trap(); }
     if (idx >= len) { _slice_bounds_trap(); }
     return load64(s_addr) + idx * 16;
+}
+
+# 6.7.8 (C2-6a): the ADDRESS of element `idx` of a slice whose elements are `w` bytes (1, 2, 4 or
+# 8), checked as the getters check a read. `s[i] = v`, `s[i] OP= v` and a for step store through
+# it (the compiler emits the call), so a slice write is bounds-checked in every mode, as a read is;
+# an [i8] / [i16] / [i32] read loads through it too, sign-extended (6.7.8, C2-6c).
+fn _slice_idx_addr(s_addr, idx, w): i64 {
+    var len = load64(s_addr + 8);
+    if (idx < 0) { _slice_bounds_trap(); }
+    if (idx >= len) { _slice_bounds_trap(); }
+    return load64(s_addr) + idx * w;
 }
 
 # Unchecked variants — same shape, no bounds check. Caller's

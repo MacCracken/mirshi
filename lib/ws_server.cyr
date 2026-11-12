@@ -160,7 +160,7 @@ fn _wss_recv_exact(fd, buf, n): i64 {
 # Writes the opcode to *opcode_out.
 # Returns the payload length, or 0 - 1 on socket error / close / a frame that breaks a bound.
 #
-# ⚠ 6.6.10 (the CVE-53 sweep). The header, extended-length and mask reads took ONE read each
+# ⚠ 6.6.10 (the CYRIUS-2026-0011 sweep). The header, extended-length and mask reads took ONE read each
 # and treated a short one as a dead connection, so a healthy client whose frame arrived split
 # across segments was dropped; they are now exact. A 64-bit length with any of its top 32 bits
 # set (RFC 6455 §5.2: the MSB must be 0) composed to a NEGATIVE len that passed both

@@ -131,7 +131,7 @@ fn pam_unix_authenticate(user, password): i64 {
     # the kernel auto-reaps the helper and waitpid fails ECHILD with the buffer untouched;
     # decoding that stale stack word read "exit 0" = PAM_AUTH_OK for a WRONG password. A
     # verdict nobody observed fails CLOSED. EINTR (a handler without SA_RESTART) is retried.
-    # CVE-80, CHANGELOG [6.6.20]
+    # CYRIUS-2026-0029, CHANGELOG [6.6.20]
     var status_buf[4];
     var w = sys_waitpid(pid, &status_buf, 0);
     while (w == 0 - 4) { w = sys_waitpid(pid, &status_buf, 0); }

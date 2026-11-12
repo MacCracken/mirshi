@@ -108,7 +108,7 @@ var TLS_CTX_OFF_ALPN_SEL      = 440; # ALPN: ptr to [u8 len][proto] the peer sel
 var TLS_CTX_OFF_SERVER_INTERS = 448; # client: ptr to [count][interm0 ptr]... the server's
 # intermediate certs in TLS (leaf→root) order, or 0. SET by the cert-chain parser;
 # READ (reversed) by verify_chain. (.78 trust-store + intermediate-chain walk)
-# v6.1.36 (CVE-30): the current application-traffic secrets, retained so a
+# v6.1.36 (the TLS post-handshake false-EOF bug): the current application-traffic secrets, retained so a
 # post-handshake KeyUpdate (RFC 8446 §7.2) can derive secret_{N+1}. SET by
 # install_app_keys; rotated in place by _tn_rotate_recv_keys/_tn_rotate_send_keys.
 var TLS_CTX_OFF_SRV_APP_SECRET = 456; # server application-traffic secret ptr
@@ -135,7 +135,7 @@ var TLS_CTX_OFF_CA_SKIPPED     = 536; # blocks the last trust-root install could
 var TLS_CTX_OFF_DEADLINE       = 544; # absolute clock_now_ns() deadline for every read and write; 0 = none
 var TLS_CTX_OFF_CCS_STATE      = 552; # bit0: the peer's CCS was read; bit1: our TLS 1.2 CCS was sent
 # CHANGELOG [6.6.13]
-# 6.6.14 (CVE-64):
+# 6.6.14 (CYRIUS-2026-0019):
 var TLS_CTX_OFF_CLIENT_SIG_SCHEME = 560; # 1.2 client: the SignatureScheme our CertificateVerify uses; 0 = answer a
 #                                          CertificateRequest with an empty Certificate (_tn_12_parse_cert_request)
 var TLS_CTX_OFF_HS_DONE = 568;           # server: 1 once the handshake COMPLETED (_tn_server_connected), never
@@ -377,7 +377,7 @@ fn tls_native_server_transition(ctx, event): i64 {
 
 # The server's handshake completed (1.3: the client's Finished verified; 1.2: ours sent after it):
 # CONNECTED, and TLS_CTX_OFF_HS_DONE latched. Returns TLS_OK.
-# WHY a latch (6.6.14, CVE-64): the server's client-identity getters (_tn_peer_leaf) must answer for
+# WHY a latch (6.6.14, CYRIUS-2026-0019): the server's client-identity getters (_tn_peer_leaf) must answer for
 # a completed handshake and never for one that failed after the certificate verified. The ctx state
 # cannot tell those apart — any later read or write error (a client gone without close_notify) also
 # drives it to ERROR, and libssl keeps the identity then. CHANGELOG [6.6.14]

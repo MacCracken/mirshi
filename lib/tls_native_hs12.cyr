@@ -47,10 +47,13 @@ fn tls_native_record_aad_12(seq8, ct, version, length, aad_out13): i64 {
 # Seal `plain` (real content type `ct`) into a TLS 1.2 AEAD record at
 # `out`. `iv` is the GCM 4-byte salt or the ChaCha 12-byte IV per the
 # cipher. Increments `seq8`. Returns the total record length, or a
-# negative TLS_ERR_*.
+# negative TLS_ERR_*. A negative `plain_len` is TLS_ERR_INVALID_PARAM before anything is
+# written — ChaCha20 with -16 returned a 5-byte "record" and moved `seq8` (CHANGELOG [6.7.6],
+# as tls_native_record_seal does).
 fn tls_native_record_seal_12(cipher, key, iv, seq8, ct, plain, plain_len, out, out_max): i64 {
     var tag_len = tls_native_cipher_tag_len(cipher);
     if (tag_len < 0) { return TLS_ERR_CIPHER_NOT_SUPPORTED; }
+    if (plain_len < 0) { return TLS_ERR_INVALID_PARAM; }
     var is_gcm = _tn_cipher_is_gcm(cipher);
     var explicit_len = 0;
     if (is_gcm != 0) { explicit_len = 8; }
@@ -66,7 +69,7 @@ fn tls_native_record_seal_12(cipher, key, iv, seq8, ct, plain, plain_len, out, o
     if (total > out_max) { return TLS_ERR_BUFFER_FULL; }
     var aad[13];
     tls_native_record_aad_12(seq8, ct, 0x0303, plain_len, &aad);
-    var nonce[12];
+    var nonce[_TLS_AEAD_NONCE_LEN];
     if (is_gcm != 0) {
         tls_native_aead_nonce_12_gcm(iv, seq8, &nonce);
     } else {
@@ -111,7 +114,7 @@ fn tls_native_record_open_12(cipher, key, iv, seq8, record, record_len, out, out
     if (pt_len > TLS_RECORD_MAX_PLAINTEXT) { return TLS_ERR_RECORD_OVERFLOW; }
     if (pt_len > out_max) { return TLS_ERR_BUFFER_FULL; }
     var body = record + TLS_RECORD_HEADER_LEN;
-    var nonce[12];
+    var nonce[_TLS_AEAD_NONCE_LEN];
     if (is_gcm != 0) {
         tls_native_aead_nonce_12_gcm(iv, body, &nonce);
         body = body + 8;
@@ -141,8 +144,11 @@ fn tls_native_record_open_12(cipher, key, iv, seq8, record, record_len, out, out
 # See CHANGELOG [6.0.72]/[6.0.73].
 
 var TLS12_MASTER_SECRET_LEN = 48;       # RFC 5246 §8.1 (fixed 48 bytes)
-var TLS12_VERIFY_DATA_LEN   = 12;       # RFC 5246 §7.4.9 (default 12)
-var TLS12_RANDOM_LEN        = 32;       # client/server Random (RFC 5246 §7.4.1.2)
+const _TLS12_VERIFY_DATA_LEN = 12;      # RFC 5246 §7.4.9 (default 12)
+var TLS12_VERIFY_DATA_LEN   = _TLS12_VERIFY_DATA_LEN;
+const _TLS12_RANDOM_LEN     = 32;       # client/server Random (RFC 5246 §7.4.1.2)
+var TLS12_RANDOM_LEN        = _TLS12_RANDOM_LEN;
+const _TLS12_SEED_LEN       = 2 * _TLS12_RANDOM_LEN;   # the PRF seed: one Random after the other
 
 # TLS 1.2 "fixed_iv_length" per ciphersuite — distinct from the 1.3
 # 12-byte IV: AES-GCM uses a 4-byte implicit salt (the 8-byte explicit
@@ -183,11 +189,11 @@ fn tls_native_12_prf(cipher, sec, secret_len, label, label_len, seed, seed_len, 
 #                     client_random ‖ server_random)[0..48]  (RFC 5246 §8.1).
 # `client_random` / `server_random` are 32 bytes each; `out48` gets 48 bytes.
 fn tls_native_12_master_secret(cipher, pre_master, pm_len, client_random, server_random, out48): i64 {
-    var seed[64];
+    var seed[_TLS12_SEED_LEN];
     memcpy(&seed,                     client_random, TLS12_RANDOM_LEN);
     memcpy(&seed + TLS12_RANDOM_LEN,  server_random, TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, pre_master, pm_len, "master secret", 13,
-      &seed, 64, out48, TLS12_MASTER_SECRET_LEN);
+      &seed, _TLS12_SEED_LEN, out48, TLS12_MASTER_SECRET_LEN);
 }
 
 # Extended Master Secret variant (RFC 7627 §4): when EMS is negotiated,
@@ -207,11 +213,11 @@ fn tls_native_12_master_secret_ems(cipher, pre_master, pm_len, session_hash, sh_
 # NOTE the random order is REVERSED vs master_secret (server first here).
 # Caller sizes `out` via tls_native_12_key_block_len.
 fn tls_native_12_key_block(cipher, master48, client_random, server_random, out, out_len): i64 {
-    var seed[64];
+    var seed[_TLS12_SEED_LEN];
     memcpy(&seed,                     server_random, TLS12_RANDOM_LEN);
     memcpy(&seed + TLS12_RANDOM_LEN,  client_random, TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, master48, TLS12_MASTER_SECRET_LEN, "key expansion", 13,
-      &seed, 64, out, out_len);
+      &seed, _TLS12_SEED_LEN, out, out_len);
 }
 
 # Bytes of key_block an AEAD suite needs: 2*key_len + 2*iv_len (no MAC
@@ -789,7 +795,7 @@ fn tls_native_12_parse_client_key_exchange(msg, msg_len, peer_pub_out32): i64 {
 }
 
 # ----------------------------------------------------------------
-# TLS 1.2 client authentication (6.6.14, CVE-64)
+# TLS 1.2 client authentication (6.6.14, CYRIUS-2026-0019)
 # ----------------------------------------------------------------
 # RFC 5246 §7.4.4 / §7.4.6 / §7.4.8. A server whose verify mode is not TLS_VERIFY_NONE sends a
 # CertificateRequest between its ServerKeyExchange and ServerHelloDone; the client answers with a
@@ -1106,7 +1112,7 @@ fn tls_native_12_derive_keys(ctx, premaster, pm_len): i64 {
         # verify_data needs stays intact.
         var ts = load64(ctx + TLS_CTX_OFF_TRANSCRIPT);
         if (ts == 0) { return TLS_ERR_PROTOCOL; }
-        var shbuf[48];
+        var shbuf[_TLS_MAX_DIGEST_LEN];
         var sh_len = tls_native_transcript_digest(ts, &shbuf);
         if (sh_len < 0) { return TLS_ERR_INTERNAL; }
         if (tls_native_12_master_secret_ems(identity, premaster, pm_len, &shbuf, sh_len, master) != TLS_OK) {
@@ -1208,7 +1214,7 @@ fn tls_native_12_verify_finished(ctx, msg, msg_len, label): i64 {
     if (hh == 0) { return TLS_ERR_OOM; }
     var hh_len = tls_native_transcript_digest(ts, hh);
     if (hh_len < 0) { return TLS_ERR_INTERNAL; }
-    var expected[12];
+    var expected[_TLS12_VERIFY_DATA_LEN];
     if (tls_native_12_verify_data(identity, master, label, 15, hh, hh_len, &expected) != TLS_OK) {
         return TLS_ERR_INTERNAL;
     }
@@ -1417,7 +1423,7 @@ fn _tn_12_key_curve(ctx): i64 {
 # Server: build the coalesced flight ServerHello ‖ Certificate ‖
 # ServerKeyExchange [‖ CertificateRequest] ‖ ServerHelloDone into `out`, feeding each raw
 # handshake message into the transcript. The CertificateRequest is sent when the ctx's verify
-# mode is not TLS_VERIFY_NONE (6.6.14, CVE-64: it never was). Requires the transcript
+# mode is not TLS_VERIFY_NONE (6.6.14, CYRIUS-2026-0019: it never was). Requires the transcript
 # initialized + the ClientHello already fed, plus CIPHER, SERVER_RANDOM,
 # EPH_PUB, and loaded creds. Returns the total length or a negative
 # TLS_ERR_*.
@@ -1575,7 +1581,7 @@ fn tls_native_connect_12(ctx, sock_fd): i64 {
     var pm = load64(ctx + TLS_CTX_OFF_SHARED);
     # Our flight before the CCS, as handshake messages in `hm`: [Certificate,] ClientKeyExchange
     # [, CertificateVerify] (RFC 5246 §7.3). The Certificate answers a CertificateRequest
-    # (6.6.14, CVE-64): ours when _tn_12_parse_cert_request chose a scheme, else an empty one.
+    # (6.6.14, CYRIUS-2026-0019): ours when _tn_12_parse_cert_request chose a scheme, else an empty one.
     var creq = load64(ctx + TLS_CTX_OFF_CERT_REQUESTED);
     var cscheme = load64(ctx + TLS_CTX_OFF_CLIENT_SIG_SCHEME);
     var hcap = 512;
@@ -1658,7 +1664,7 @@ fn tls_native_connect_12(ctx, sock_fd): i64 {
     var vr = tls_native_12_verify_finished(ctx, sfin, sfinlen, "server finished");
     if (vr != TLS_OK) { return _tn_ctx_fail(ctx, vr); }
     store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_CONNECTED);
-    var cvr = _tn_connect_verify(ctx);   # CVE-18: fail-closed chain + hostname
+    var cvr = _tn_connect_verify(ctx);   # CYRIUS-2026-0003: fail-closed chain + hostname
     if (cvr != TLS_OK) { return cvr; }
     return TLS_OK;
 }
@@ -1726,7 +1732,7 @@ fn _tn_12_server_hs(ctx, sock_fd, ch_msg, ch_len): i64 {
     if (inbuf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
     # The client's flight before its CCS — [Certificate,] ClientKeyExchange [, CertificateVerify]
     # (RFC 5246 §7.3) — read one whole message at a time, however the client split its records.
-    # The Certificate and CertificateVerify come only when we asked (6.6.14, CVE-64): the three
+    # The Certificate and CertificateVerify come only when we asked (6.6.14, CYRIUS-2026-0019): the three
     # messages are bounded at 16 KiB (the 1.3 server reads a client Certificate of at most 8 KiB),
     # which keeps an mTLS 1.2 handshake inside the 128 KiB arena an mTLS 1.3 one fits; without
     # client auth the flight is the 37-byte ClientKeyExchange alone.
@@ -1978,8 +1984,10 @@ fn tls_native_set_verify(ctx, mode): i64 {
 # CurrentUser ROOT store, 6.6.14).
 # CA_ROOT holds a trust-anchor SET: a ptr to [count][root0 ptr]...[rootN-1 ptr].
 # (.78: was a single root; now a set so system bundles + multi-root PEM work.)
-# TLS_CA_MAX_ROOTS now bounds only tls_native_set_client_cert's leaf decode; a trust bundle's
-# chain scratch is sized from its own block count (6.6.13, see _tn_ca_parse_set).
+# TLS_CA_MAX_ROOTS bounds nothing: a trust bundle's chain scratch is sized from its own block count
+# (6.6.13, _tn_ca_parse_set) and so is a client certificate's leaf decode (6.7.9,
+# tls_native_set_client_cert). The public name is kept, so a program that assigns it still
+# compiles; retiring it is a removed-symbol decision. CHANGELOG [6.7.9]
 var TLS_CA_MAX_ROOTS = 300;
 
 # Parse a trust bundle into a root set [count][root ptrs...] — the layout verify_chain reads.
@@ -2093,7 +2101,7 @@ fn tls_native_ca_skipped(ctx): i64 {
 # trust anchors. Tries the standard bundle locations across distros + macOS
 # (the path is NOT the same everywhere: Debian/Ubuntu use
 # /etc/ssl/certs/ca-certificates.crt, RHEL/Fedora /etc/pki/..., macOS/Arch
-# /etc/ssl/cert.pem). Windows reads none of them (drive-relative there — CVE-65) and
+# /etc/ssl/cert.pem). Windows reads none of them (drive-relative there — CYRIUS-2026-0020) and
 # exports its CurrentUser ROOT store as the bundle instead (_tn_ca_read_win, 6.6.14).
 # Returns TLS_OK, TLS_ERR_IO if no bundle is readable, or a parse error.
 # v6.5.36 — the bundle is read and allocated ONCE per process, not per call.
@@ -2140,12 +2148,12 @@ var _tn_ca_sys_skipped = 0;  # blocks of the bundle the set could not use       
 # not in the bundle, counted into `_tn_ca_sys_skipped`. Always 0 elsewhere.
 # Written by the claim holder only, in _tn_ca_read_win. CHANGELOG [6.6.14]
 var _tn_ca_sys_refused = 0;
-# ⛔ CVE-77 — THE STORE'S PURPOSE IS THE CHAIN'S PURPOSE. The set above is the system roots
+# ⛔ CYRIUS-2026-0027 — THE STORE'S PURPOSE IS THE CHAIN'S PURPOSE. The set above is the system roots
 # trusted for SERVER authentication, which a CLIENT ctx anchors a server chain to. A SERVER ctx
 # anchors CLIENT chains (mTLS, _TN_PURPOSE_CLIENT), and Windows records per root which purposes
 # its root program trusts it for (CERT_ENHKEY_USAGE_PROP_ID): tls_native_set_ca_system gave an
 # mTLS server the serverAuth export, so a root Windows trusts for server authentication only
-# anchored client identities — the trust-store half of CVE-75, which enforces a CA CERTIFICATE's
+# anchored client identities — the trust-store half of CYRIUS-2026-0026, which enforces a CA CERTIFICATE's
 # own extendedKeyUsage. Windows now exports a second set for a server ctx, filtered for
 # clientAuth by the same rules (_tn_w_policy), cached and published exactly like the first. A
 # POSIX bundle carries no per-root purpose (it is the distro's serverAuth export), so both roles
@@ -2227,7 +2235,7 @@ fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, purpose): i64 {
 # the ctx's allocator. Records the set's skipped count for tls_native_ca_skipped. A bundle with no
 # usable root is TLS_ERR_CERT_INVALID every time (the ctx keeps any set it had), as
 # tls_native_set_ca_bundle answers it. A SERVER ctx (it verifies client chains) gets, on Windows,
-# the roots the store trusts for client authentication (CVE-77, above); a client ctx, and
+# the roots the store trusts for client authentication (CYRIUS-2026-0027, above); a client ctx, and
 # every ctx elsewhere, the roots trusted for server authentication.
 fn tls_native_set_ca_system(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
@@ -2262,11 +2270,11 @@ fn _tn_ca_install(ctx, len, set, skipped): i64 {
 # when no candidate is readable (the caller caches that). Called only by the claim holder. `refused`
 # receives the roots the store refused (Windows; 0 elsewhere), `purpose` the TlsChainPurpose the
 # roots must be trusted for — a POSIX bundle has no per-root purpose, so it is read the same for both.
-# ⛔ CVE-65 (6.6.14) — NEVER THE POSIX PATHS ON WINDOWS. There a rooted path is DRIVE-RELATIVE:
+# ⛔ CYRIUS-2026-0020 (6.6.14) — NEVER THE POSIX PATHS ON WINDOWS. There a rooted path is DRIVE-RELATIVE:
 # "/etc/ssl/cert.pem" is C:\etc\ssl\cert.pem, and any authenticated user may create folders at the
 # root of the system drive, so one local user could plant trust anchors every native TLS client on
 # the box then trusted (measured on cass: a planted cert.pem installed as the only root). Windows
-# reads its own store instead (_tn_ca_read_win) — CVE-54 / CVE-57's class. CHANGELOG [6.6.14]
+# reads its own store instead (_tn_ca_read_win) — CYRIUS-2026-0012 / CYRIUS-2026-0014's class. CHANGELOG [6.6.14]
 fn _tn_ca_read(buf, cap, refused, purpose): i64 {
     store64(refused, 0);
     #ifdef CYRIUS_TARGET_WIN
@@ -2302,7 +2310,7 @@ fn _tn_ca_read(buf, cap, refused, purpose): i64 {
 }
 
 #ifdef CYRIUS_TARGET_WIN
-# ⛔ CVE-65 (6.6.14) — THE WINDOWS SYSTEM STORE. Before it Windows had no system roots at all (the
+# ⛔ CYRIUS-2026-0020 (6.6.14) — THE WINDOWS SYSTEM STORE. Before it Windows had no system roots at all (the
 # POSIX paths were its only source), so every verifying native connect there failed.
 #
 # WHICH STORE: CurrentUser\ROOT, opened read-only. It is the store the current-user chain engine
@@ -2313,7 +2321,7 @@ fn _tn_ca_read(buf, cap, refused, purpose): i64 {
 # WHICH ROOTS: the ones the root's own properties and the Disallowed store say Windows trusts for TLS
 # server authentication — the policy only ever REMOVES roots, and anything it cannot judge is refused.
 # (A server ctx's set asks the same of CLIENT authentication — every "serverAuth" below reads
-# "clientAuth" for it; CVE-77 at `_tn_ca_cl_state`.)
+# "clientAuth" for it; CYRIUS-2026-0027 at `_tn_ca_cl_state`.)
 #   - a root whose root-program purposes (CERT_ENHKEY_USAGE_PROP_ID) leave out serverAuth is not a
 #     TLS anchor (cass: 6, e.g. Thawte Timestamping CA) — the analogue of the Mozilla trust bits the
 #     POSIX bundles are already filtered by;
@@ -2611,7 +2619,7 @@ fn _tn_ca_read_win(buf, cap, refused, purpose): i64 {
 # v6.2.8: mTLS client-auth — install the CLIENT's own certificate so it can
 # present it when a server sends a CertificateRequest. The wire Certificate
 # message sends raw DER (`_tn_build_certificate` reads CERT_CHAIN), so a PEM
-# input (is_der==0) is decoded to its leaf DER via `pem_decode_certs` first;
+# input (is_der==0) is decoded to its leaf DER via `pem_decode_certs_into` first;
 # DER input (is_der==1) is stored verbatim. Parses the leaf via `_tn_load_cert`.
 # Pair with `tls_native_set_client_key`; CREDS_LOADED is set once both halves
 # are in. CLIENT role only. Returns TLS_OK / negative TLS_ERR_*. See issue
@@ -2624,12 +2632,20 @@ fn tls_native_set_client_cert(ctx, cert, cert_len, is_der): i64 {
     var der = cert;
     var dlen = cert_len;
     if (is_der == 0) {
-        # PEM → first (leaf) DER cert.
-        var chain = _tn_alloc(ctx, TLS_CA_MAX_ROOTS * 16);
+        # PEM → first (leaf) DER cert. ⛔ The chain table is sized from the input's own block
+        # count, as _tn_ca_parse_set's is, never a fixed cap: TLS_CA_MAX_ROOTS (300) cost 4,800 B
+        # for one block and refused a well-formed leaf once 300 more blocks followed it. The
+        # strict decode walks non-overlapping BEGIN markers only, never more than
+        # pem_count_cert_blocks' greedy count, so it cannot run out of entries. It stays STRICT:
+        # a bad first block must fail, not hand back the next certificate (CHANGELOG [6.6.14]).
+        # CHANGELOG [6.7.9]
+        var blocks = pem_count_cert_blocks(cert, cert_len);
+        if (blocks < 1) { return TLS_ERR_CERT_INVALID; }
+        var chain = _tn_alloc(ctx, blocks * 16);
         if (chain == 0) { return TLS_ERR_OOM; }
         var pool = _tn_alloc(ctx, cert_len);          # DER <= 3/4 of its base64
         if (pool == 0) { return TLS_ERR_OOM; }
-        var n = pem_decode_certs_into(cert, cert_len, chain, TLS_CA_MAX_ROOTS, pool, cert_len);
+        var n = pem_decode_certs_into(cert, cert_len, chain, blocks, pool, cert_len);
         if (n < 1) { return TLS_ERR_CERT_INVALID; }
         der = load64(chain);
         dlen = load64(chain + 8);
@@ -2660,12 +2676,12 @@ fn tls_native_set_client_key(ctx, key, key_len): i64 {
     return TLS_OK;
 }
 
-# CVE-17 (v6.1.36): a CA that signs the next link down must, if it carries a
+# CYRIUS-2026-0002 (v6.1.36): a CA that signs the next link down must, if it carries a
 # keyUsage extension, assert keyCertSign (0x04); and its pathLenConstraint (if
 # set, != -1) must permit `below` intermediate CAs beneath it toward the leaf.
 # `below` is the path-build depth at which this CA signs (0 = it directly signs
 # the leaf). Uses the sigil 3.7.12 keyUsage/pathLen fields. Returns 1 if OK.
-# ⛔ 6.6.16 (CVE-75) — WHY `purpose`: a CA's extendedKeyUsage confines what it may vouch
+# ⛔ 6.6.16 (CYRIUS-2026-0026) — WHY `purpose`: a CA's extendedKeyUsage confines what it may vouch
 # for, and this never looked at it. A CA limited to clientAuth / codeSigning / S/MIME could issue
 # a leaf the native client took as a TLS server, and a serverAuth-only CA in an mTLS server's
 # trust set could issue a client identity; OpenSSL refuses both. The check sits HERE, inside the
@@ -2828,7 +2844,7 @@ fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
 # terminates any cross-sign cycle. See
 # docs/development/issues/archived/2026-06-09-native-tls-handshake-gap-public-servers.md,
 # CHANGELOG [6.1.19].
-# ⛔ 6.6.14 (CVE-64) — WHY. This was the client's verifier only, and the server checked a client
+# ⛔ 6.6.14 (CYRIUS-2026-0019) — WHY. This was the client's verifier only, and the server checked a client
 # certificate's POSSESSION (its CertificateVerify) and never its chain: any self-signed leaf was
 # accepted as an identity by a server that asked for verification. CHANGELOG [6.6.14]
 fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
@@ -2836,7 +2852,7 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
     if (leaf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     if (rootset == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     if (_x509_in_window(leaf, now_unix) == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
-    # CVE-17 (v6.1.36): the leaf must permit the TLS identity it is used as.
+    # CYRIUS-2026-0002 (v6.1.36): the leaf must permit the TLS identity it is used as.
     if (_tn_leaf_purpose_ok(leaf, purpose) != 1) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     var ni = 0;
     if (inters != 0) { ni = load64(inters); }
@@ -2852,7 +2868,7 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                 if (_x509_in_window(R, now_unix) == 1) {
                     if (x509_cert_is_ca(R) == 1) {
                         if (_x509_verify_link(cur, R) == 1) {
-                            # CVE-17: the anchoring root must assert keyCertSign
+                            # CYRIUS-2026-0002: the anchoring root must assert keyCertSign
                             # (if it has keyUsage) + honor pathLen for `depth`;
                             # 6.6.16: and its EKU must permit `purpose`.
                             if (_tn_ca_signer_ok(R, depth, purpose) == 1) { return TLS_OK; }
@@ -2872,7 +2888,7 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                     if (x509_cert_is_ca(P) == 1) {
                         if (_x509_in_window(P, now_unix) == 1) {
                             if (_x509_verify_link(cur, P) == 1) {
-                                # CVE-17: signing intermediate must assert
+                                # CYRIUS-2026-0002: signing intermediate must assert
                                 # keyCertSign + honor pathLen for `depth`;
                                 # 6.6.16: and its EKU must permit `purpose`.
                                 if (_tn_ca_signer_ok(P, depth, purpose) == 1) { nextp = P; ii = ni; }

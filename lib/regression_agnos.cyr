@@ -33,7 +33,7 @@
 # PATH search, no shell); an EMPTY envp runs the child with the kernel's default environment
 # (agnos cannot say "no environment"); a death by a ring-3 fault reads as exit code 128 + vector
 # (a #PF is 142) with [1] = 0, because that is the status the kernel reports; and an argv or env
-# over the #43 limits (16 entries, 1024 bytes) is refused, never truncated.
+# over the #43 limits (16 entries; 1024 bytes, SPAWN_ARGV_MAX / _SPAWN_ENV_MAX) is refused, never truncated.
 # KERNEL FLOOR: 1.57.7 (a real wait status, kill_tree; an older kernel is killed pid-alone), and
 # 1.57.9 for the stdin-feeding pipe_to_bin verbs (sys_write_nb). An agnos older than 1.57.6
 # answers -1 to every #43: nothing runs and each verb reports its failure value.
@@ -83,16 +83,17 @@ fn _rga_job_init(j): i64 {
 # The #43 argv blob for `bin [arg]` into `b` (SPAWN_ARGV_MAX bytes). Length, or -1 (a null or
 # empty path, or it does not fit).
 fn _rga_argv(b, bin, arg): i64 {
-    var off = _agnos_blob_put(b, 0, SPAWN_ARGV_MAX, bin);
+    var off = _agnos_blob_put(b, 0, _SPAWN_ARGV_MAX, bin);
     if (off < 2) { return 0 - 1; }
-    if (arg != 0) { off = _agnos_blob_put(b, off, SPAWN_ARGV_MAX, arg); }
+    if (arg != 0) { off = _agnos_blob_put(b, off, _SPAWN_ARGV_MAX, arg); }
     return off;
 }
 
-# The env blob for the POSIX `envp` array into `e` (1024 bytes). Length (0 = the kernel's default
-# env, for a null or empty envp), or -1 (more than 16 entries, over 1024 bytes, or not KEY=VALUE).
+# The env blob for the POSIX `envp` array into `e` (_SPAWN_ENV_MAX bytes). Length (0 = the kernel's
+# default env, for a null or empty envp), or -1 (more than 16 entries, over _SPAWN_ENV_MAX bytes, or
+# not KEY=VALUE).
 fn _rga_env(e, envp): i64 {
-    return _agnos_blob_ptrs(e, 0, 1024, envp, 0, 1);
+    return _agnos_blob_ptrs(e, 0, _SPAWN_ENV_MAX, envp, 0, 1);
 }
 
 # Close every pipe end a failed setup opened (`p` holds up to three pipes, 16 bytes each, with
@@ -266,8 +267,8 @@ fn _rga_code(reaped, st): i64 {
 # Run `bin [arg]` with every output DISCARDED (drained, never closed on the child) and no stdin;
 # the exit-code verbs' shared body.
 fn _rga_run_discard(bin, arg, envp, timeout_ms): i64 {
-    var b[1024];
-    var e[1024];
+    var b[_SPAWN_ARGV_MAX];
+    var e[_SPAWN_ENV_MAX];
     var j[88];
     _rga_job_init(&j);
     if (_rga_spawn(&j, &b, _rga_argv(&b, bin, arg), &e, _rga_env(&e, envp), 0, 1) < 0) { return 0 - 1; }
@@ -282,8 +283,8 @@ fn _rga_run_discard(bin, arg, envp, timeout_ms): i64 {
 fn _rga_run_capture(bin, arg, buf, buflen, envp, status_out, merge): i64 {
     store64(status_out, 0 - 1);
     store64(status_out + 8, 0);
-    var b[1024];
-    var e[1024];
+    var b[_SPAWN_ARGV_MAX];
+    var e[_SPAWN_ENV_MAX];
     var j[88];
     _rga_job_init(&j);
     if (_rga_spawn(&j, &b, _rga_argv(&b, bin, arg), &e, _rga_env(&e, envp), 0, merge) < 0) { return 0; }
@@ -310,8 +311,8 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     }
     var src_fd = 0 - 1;
     if (src_path != 0) { src_fd = file_open(src_path, 0, 0); }
-    var b[1024];
-    var e[1024];
+    var b[_SPAWN_ARGV_MAX];
+    var e[_SPAWN_ENV_MAX];
     var j[88];
     _rga_job_init(&j);
     if (_rga_spawn(&j, &b, _rga_argv(&b, bin_path, 0), &e, _rga_env(&e, envp), 1, 0) < 0) {

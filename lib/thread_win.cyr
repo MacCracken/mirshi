@@ -157,8 +157,8 @@ fn _chan_wb(ch): i64 { return load64(ch) + load64(ch + 8) * 8; }
 
 # The pool of idle wait ports, under its own SRWLOCK (SRWLOCK_INIT is all zero, so the zeroed
 # global needs no InitializeSRWLock). It is never taken while a channel's lock is held.
-var _chan_wp_cap = 64;          # the slot count of _chan_wp_keep
-var _chan_wp_keep: i64[64];
+const _chan_wp_cap = 64;        # the slot count of _chan_wp_keep, which it sizes
+var _chan_wp_keep: i64[_chan_wp_cap];
 var _chan_wp_n = 0;
 var _chan_wp_lock = 0;
 

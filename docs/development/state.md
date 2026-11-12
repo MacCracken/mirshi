@@ -5,6 +5,11 @@
 
 ## Version
 
+**1.12.0** — 2026-11-12. **Toolchain `6.6.20` → `6.7.9`, with `lib/` re-vendored to the 6.7.9 bundle**
+(`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle; `cyrius.lock` regenerated).
+No mirshi source change. The 6.7.9 agnos stdlib issues no new agnos syscall numbers, so the coverage matrix
+is unchanged. Build warning-free; `cyrius test` 329/0; all 27 `scripts/it/*` gates and `docker/smoke.sh`
+green at the new pin.
 **1.11.4** — 2026-11-12. **Toolchain `6.6.2` → `6.6.20`, with `lib/` re-vendored to the 6.6.20 bundle**
 (`cyrius lib sync --full`: 113 `.cyr` files, all byte-identical to the bundle, sha256-locked in the new
 `cyrius.lock`). The one source change: mirshi's local `sys_memfd_create` is gone, because cyrius 6.6.5's
@@ -139,7 +144,7 @@ group-stop / child-hang, ADRs 0006-0008); 0.5.0 = M4 seccomp-notify feasibility 
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.20` (in `cyrius.cyml [package].cyrius`); `lib/` is the full 6.6.20 snapshot,
+- **Cyrius pin**: `6.7.9` (in `cyrius.cyml [package].cyrius`); `lib/` is the full 6.7.9 snapshot,
   sha256-locked in `cyrius.lock`
 
 ## Source

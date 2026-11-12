@@ -1,15 +1,23 @@
-# trait.cyr — trait system for Cyrius
+# trait.cyr — run-time trait objects (vtable dispatch) for Cyrius
 # Usage: include "lib/trait.cyr"
 # Includes its own definers (6.6.9): alloc.cyr, fnptr.cyr, fmt.cyr, str.cyr.
 #
-# Traits are implemented as vtables — heap-allocated arrays of function pointers.
-# Each type that implements a trait creates a vtable with the trait's methods.
-# Objects carry a pointer to their vtable alongside their data.
+# A vtable is a heap-allocated array of function pointers, one per method slot. A value that
+# implements a trait is paired with its type's vtable, and trait_call0 / trait_call1 dispatch
+# through the slot at RUN time. This is a library pattern: manual, and nothing checks that a
+# vtable has the slots a caller uses.
 #
-# This is manual dispatch — no compiler magic. The compiler syntax for
-# `impl Trait for Type` can be added later as sugar over this pattern.
+# A "trait object" here is: { vtable_ptr: i64, data_ptr: i64 } = 16 bytes
 #
-# A "trait object" is: { vtable_ptr: i64, data_ptr: i64 } = 16 bytes
+# ⚠ It is NOT the language's traits. Since 6.7.0 cyrius has `trait Show { ... }` and
+# `impl Show for Point { ... }` (docs/adr/007-traits.md): checked method sets with STATIC
+# dispatch (ADR-007 §7) — so `impl` is not, and will not become, sugar over this file. (This
+# header said it would until 6.7.6.) Compiler-checked run-time dispatch shipped in 6.7.8 as
+# `dyn`: `o: dyn Show`, a 16-byte { data, vtable } struct whose vtable the compiler builds and
+# verifies from `impl Show for T` (docs/guides/cyrius-guide.md, "Trait objects: `dyn`"). This
+# file stays as it is (the user's decision, 2026-10-10): an unchecked library pattern, nothing
+# deprecated or removed. Note the order is the reverse of this file's { vtable, data }; the two
+# do not interconvert.
 
 # 6.6.9: vtables are alloc'd and dispatched through fncall*, and the Display impls call fmt_int
 # and str_from / str_print — none of which this file included. CHANGELOG [6.6.9]

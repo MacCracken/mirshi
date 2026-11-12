@@ -4,6 +4,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-11-12
+
+### Changed
+
+- **Toolchain `6.6.20` → `6.7.9`.** `lib/` was re-vendored to match (`cyrius lib sync --full`):
+  66 of the 106 top-level files changed, plus `lib/unicode/normalize.cyr`. The bundle adds no
+  files and removes none. All 113 `.cyr` files are byte-identical to the 6.7.9 bundle, and
+  `cyrius.lock` was regenerated to their new hashes. No mirshi source change was needed.
+- **The agnos ABI mirshi translates is unchanged by the bump.** `lib/syscalls_x86_64_agnos.cyr`,
+  the stdlib that agnos programs built with 6.7.9 run on, issues no new agnos syscall numbers.
+  `SPAWN_ARGV_MAX` / `SPAWN_ENV_MAX` now only report the kernel's limits; the buffers are sized
+  from consts (`_SPAWN_ARGV_MAX` / `_SPAWN_ENV_MAX`, 1024). The new agnos peers `sys_ppoll`,
+  `sys_ioctl` and `sys_fstatat` return -38 in-process and never trap. So `spawn_path#43`
+  (argv and env blobs) and the rest of the coverage matrix need no new arms.
+- **Checked against cyrius's `ecosystem-migration.md` for 6.7.0–6.7.9.** None of its items changes
+  a mirshi result. Two come near:
+  - 6.7.9 adds `SYS_PPOLL = 271` to the x86_64 Linux stdlib. mirshi already defines the same
+    constant (`src/dispatch.cyr:293`), and a duplicate with an equal value compiles silently, like
+    mirshi's other local syscall numbers.
+  - The exec-family child no longer inherits ignored SIGPIPE/SIGXFSZ or the blocked signal mask.
+    This doesn't reach mirshi, which forks and execs raw (`sys_fork` + `sys_execve` /
+    `sys_execveat`) and never uses `run` / `spawn` / `exec_*`.
+
+### Tests
+
+- Re-verified at the new pin: `cyrius build` (warning-free); `cyrius test` (329/0 in
+  `tests/mirshi.tcyr`, 2/0 in `src/test.cyr`); all 27 `scripts/it/*` CI gates, with no skips;
+  `docker/smoke.sh`, including the 4-container fan-out.
+
 ## [1.11.4] - 2026-11-12
 
 ### Changed

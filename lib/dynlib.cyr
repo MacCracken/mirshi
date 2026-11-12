@@ -387,12 +387,14 @@ fn _estimate_nsyms(symtab_vaddr, strtab_vaddr): i64 {
 }
 
 # ================================================================
-# Loaded-library registry (up to 16 libs)
+# Loaded-library registry (up to _DYNLIB_MAX = 16 libs)
 # ================================================================
 # Tracks all loaded libraries by name hash to avoid duplicates and
 # enable cross-library symbol resolution during relocation.
 
-var _dynlib_registry[256];  # 16 entries × 16 bytes (hash + handle)
+# 6.7.9: was a bare top-level `var _dynlib_registry[256]` — 256 SLOTS (2,048 B) for 256 B.
+const _DYNLIB_MAX = 16;
+var _dynlib_registry: i64[_DYNLIB_MAX * 2];  # _DYNLIB_MAX entries × 16 bytes (hash + handle)
 var _dynlib_reg_count = 0;
 
 # Simple hash of a library basename for dedup
@@ -422,7 +424,7 @@ fn _dynlib_find_loaded(name): i64 {
 
 # Register a loaded library
 fn _dynlib_register(name, handle): i64 {
-    if (_dynlib_reg_count >= 16) { return 0; }
+    if (_dynlib_reg_count >= _DYNLIB_MAX) { return 0; }
     var h = _dynlib_namehash(name);
     store64(&_dynlib_registry + _dynlib_reg_count * 16, h);
     store64(&_dynlib_registry + _dynlib_reg_count * 16 + 8, handle);

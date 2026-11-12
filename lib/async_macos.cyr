@@ -55,8 +55,12 @@ var TASK_SIZE = 64;
 # Darwin kevent struct (64-bit): { ident@0 u64, filter@8 i16, flags@10 u16, fflags@12 u32,
 # data@16 i64, udata@24 ptr } = 32 bytes. Filters are int16, stored as their u16 pattern:
 # EVFILT_READ -1 = 0xFFFF, EVFILT_WRITE -2 = 0xFFFE, EVFILT_PROC -5 = 0xFFFB,
-# EVFILT_TIMER -7 = 0xFFF9 (xnu bsd/sys/event.h).
-var KEV_SIZE = 32;
+# EVFILT_TIMER -7 = 0xFFF9 (xnu bsd/sys/event.h). The const sizes every kevent buffer here (6.7.6)
+# and strides it (6.7.9: the poll walked its const-sized batch by the writable var); the public
+# var keeps the API. _KEV_BATCH is how many events one poll collects.
+const _KEV_SIZE = 32;
+var KEV_SIZE = _KEV_SIZE;
+const _KEV_BATCH = 8;
 var _KEVF_READ = 65535;
 var _KEVF_WRITE = 65534;
 var _KEVF_PROC = 65531;
@@ -122,7 +126,7 @@ fn async_spawn(rt, fp, arg): i64 {
 # than reported as an EV_ERROR event, which is why every registration in this file goes through
 # here instead of riding a waiting call.
 fn _async_kev_change(kq, ident, filter, flags, fflags, data): i64 {
-    var ch[32];
+    var ch[_KEV_SIZE];
     store64(&ch, ident);
     store16(&ch + 8, filter);
     store16(&ch + 10, flags);
@@ -225,21 +229,21 @@ fn _async_step(rt): i64 {
     return active;
 }
 
-# Collect up to 8 events from the runtime's kqueue — blocking until one arrives when `block` is
+# Collect up to _KEV_BATCH events from the runtime's kqueue — blocking until one arrives when `block` is
 # -1, returning at once when it is 0 — and wake whoever fired. kqueue reports ONE event per
 # (ident, filter), so the directions of one fd, a timer and a pid arrive as distinct events.
 # Returns the number of events taken.
 fn _async_kev_poll(rt, block): i64 {
-    var evb[256];                   # 8 events x 32 B
+    var evb[_KEV_BATCH * _KEV_SIZE];
     var ts[16];
     store64(&ts, 0);
     store64(&ts + 8, 0);
     var tsp = &ts;
     if (block < 0) { tsp = 0; }
-    var nr = sys_kevent(load64(rt), 0, 0, &evb, 8, tsp);
+    var nr = sys_kevent(load64(rt), 0, 0, &evb, _KEV_BATCH, tsp);
     var ei = 0;
     while (ei < nr) {
-        var eo = ei * KEV_SIZE;
+        var eo = ei * _KEV_SIZE;
         _async_kev_wake(rt, load64(&evb + eo), _async_kev_bit(load16(&evb + eo + 8)));
         ei = ei + 1;
     }
@@ -523,18 +527,23 @@ fn async_spawn_process(rt, path, argv, envp): i64 {
 # finishes the kill: it parks on a periodic 10 ms EVFILT_TIMER (ident = its ctx, owned so a
 # retire deletes it) and takes one non-blocking look (`_proc_kill_step`) per tick until nothing
 # is left or the grace has run out, then KILLs and reaps (`_proc_kill_finish`). lib/async.cyr
-# carries the epoll twin. ctx (72 B) = { kill state @0 (40 B, lib/process.cyr), status @40,
-# started ms @48, rt @56, spare @64 }.
+# carries the epoll twin. ctx (_AKM_SIZE B) = lib/process.cyr's kill state (_PROC_KILL_STATE B)
+# @0, then four words named FROM that size, so a kill state that grows moves them rather than
+# overlapping them (6.7.9).
 #ifndef CYRIUS_TARGET_WIN
+const _AKM_STATUS = _PROC_KILL_STATE;        # the reaped child's wait status
+const _AKM_STARTED = _PROC_KILL_STATE + 8;   # clock_now_ms() at the TERM
+const _AKM_RT = _PROC_KILL_STATE + 16;       # the runtime
+const _AKM_SIZE = _PROC_KILL_STATE + 32;     # one spare word after rt
 fn _async_kill_task(ctx): i64 {
-    var rt = load64(ctx + 56);
-    if (_proc_kill_step(ctx, ctx + 40) == 0) {
-        if (clock_now_ms() - load64(ctx + 48) < _PROC_GRACE_MS) {
+    var rt = load64(ctx + _AKM_RT);
+    if (_proc_kill_step(ctx, ctx + _AKM_STATUS) == 0) {
+        if (clock_now_ms() - load64(ctx + _AKM_STARTED) < _PROC_GRACE_MS) {
             _async_kev_park(rt, ctx, _KEV_TIMER);
             return 0;
         }
     }
-    _proc_kill_finish(ctx, ctx + 40);
+    _proc_kill_finish(ctx, ctx + _AKM_STATUS);
     _async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_DELETE, 0, 0);
     var cur = load64(rt + 40);
     if (cur != 0) { store64(cur + 48, 0 - 1); }    # the timer is gone: nothing for a retire
@@ -550,14 +559,14 @@ fn _async_process_end(rt, pctx): i64 {
     var pid = load64(pctx + 32);
     if (pid <= 0) { return 0; }
     store64(pctx, 2);
-    var ctx = alloc_via(load64(rt + 32), 72);
+    var ctx = alloc_via(load64(rt + 32), _AKM_SIZE);
     if (ctx == 0) {
         var sb[8];
         proc_kill_tree(pid, &sb);
         return 0;
     }
-    store64(ctx + 48, clock_now_ms());
-    store64(ctx + 56, rt);
+    store64(ctx + _AKM_STARTED, clock_now_ms());
+    store64(ctx + _AKM_RT, rt);
     _proc_kill_begin(ctx, pid, 1);
     var kt = 0;
     if (_async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_ADD, 0, 10) >= 0) {
@@ -565,7 +574,7 @@ fn _async_process_end(rt, pctx): i64 {
         if (kt == 0) { _async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_DELETE, 0, 0); }
         else { store64(kt + 48, ctx); }             # a retire of the kill task deletes the timer
     }
-    if (kt == 0) { _proc_kill_wait(ctx, ctx + 40, 0); }   # no task: finish it here, blocking
+    if (kt == 0) { _proc_kill_wait(ctx, ctx + _AKM_STATUS, 0); }   # no task: finish it here, blocking
     return kt;
 }
 #endif
@@ -767,7 +776,7 @@ fn async_timeout(fp, arg, ms): i64 {
     sys_close(wfd);
     var nr = _async_kev_change(kq, rfd, _KEVF_READ, _EV_ADD, 0, 0);
     if (nr >= 0) {
-        var ev[32];
+        var ev[_KEV_SIZE];
         var ts[16];
         store64(&ts, ms / 1000);
         store64(&ts + 8, (ms % 1000) * 1000000);

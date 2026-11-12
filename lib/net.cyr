@@ -312,7 +312,7 @@ fn _net_os_send(fd, buf, len): i64 {
     return n;
     #endif
     #ifndef CYRIUS_TARGET_WIN
-    return _fd_write_nosigpipe(fd, buf, len);      # never SIGPIPE on a socket (CVE-74)
+    return _fd_write_nosigpipe(fd, buf, len);      # never SIGPIPE on a socket (CYRIUS-2026-0025)
     #endif
 }
 
@@ -587,6 +587,28 @@ fn sock_set_send_timeout(fd, secs, usecs): i64 {
     #endif
 }
 
+# Set (`on` != 0) or clear (`on` == 0) TCP_NODELAY on TCP socket `fd`: 0 or -errno. Set, a small
+# write leaves at once instead of waiting for the ACK of the previous segment — the ~40 ms
+# Nagle / delayed-ACK stall a request-response protocol (a CDP round trip, an RPC) pays per
+# exchange. IPPROTO_TCP = 6 and TCP_NODELAY = 1 on Linux, Darwin and Winsock alike.
+# ⛔ WHY this and not `sys_setsockopt(fd, 6, 1, &one, 4)`: on Windows the raw wrapper is a -38
+# decline (its callers pass Linux option numbers and close with CloseHandle — see the block in
+# lib/syscalls_windows.cyr), so that call never set NODELAY there; this one takes ws2_32
+# setsockopt, as sock_reuse and the timeouts do. CHANGELOG [6.7.9]
+fn sock_set_nodelay(fd, on): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # AGNOS has no TCP options (and no setsockopt: Linux #54 is agnos udp_unbind) — declines with
+    # -38 (ENOSYS), as its sys_setsockopt does, rather than report a mode it never set.
+    return 0 - 38;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var v[8];
+    store64(&v, 0);
+    if (on != 0) { store32(&v, 1); }               # an int: a wide `on` is 1, never truncated to 0
+    return _net_os_setopt(fd, 6, 1, &v, 4);        # IPPROTO_TCP, TCP_NODELAY
+    #endif
+}
+
 # Bind socket to address:port. Returns Result(0). On AGNOS the server path
 # (bind/listen/accept) wires onto the kernel sock_listen#56 / sock_accept#57
 # band (agnos 1.45.5/.6) via the listen↔fd adapter in the syscall peer: bind
@@ -598,7 +620,7 @@ fn sock_bind(fd, addr, port) : Result {
     # AND the address class for sock_listen to issue with. 127/8 → a LOOPBACK-only
     # listener; 0.0.0.0 or this host's address → ANY; any other address → Err(99)
     # (EADDRNOTAVAIL — this host does not have it). A bad port → Err(22) (EINVAL).
-    # ⛔ CVE-48 (v6.6.7): `addr` used to be IGNORED, so a 127.0.0.1 server listened
+    # ⛔ CYRIUS-2026-0008 (v6.6.7): `addr` used to be IGNORED, so a 127.0.0.1 server listened
     # on the network. On an agnos kernel older than 1.57.7 the loopback class is
     # refused at sock_listen — the server does not start, which is the safe answer.
     var ip = _agnos_bswap32(addr);
@@ -624,7 +646,7 @@ fn sock_listen(fd, backlog) : Result {
     # advisory on AGNOS — the kernel's 8-conn-slot table caps it. v6.2.22.
     var r = _agnos_listen_start(fd);
     # port in use / kernel conn table full / unbound — or a LOOPBACK bind on an agnos
-    # older than 1.57.7, which has no address classes: refused, never widened (CVE-48).
+    # older than 1.57.7, which has no address classes: refused, never widened (CYRIUS-2026-0008).
     if (r < 0) { return Err(1); }
     return Ok(0);
     #endif
@@ -1313,7 +1335,7 @@ fn _net_conf_scan(path, want): i64 {
 # attacker forge the answer (the Kaminsky class). /dev/urandom if getrandom fails (POSIX only);
 # -1 when neither yields 2 bytes, and the caller fails the lookup.
 # ⛔ NEVER add a weak fallback (clock, stack address, pid): a predictable TXID is worse than a
-# failed lookup, which is exactly what CVE-19 closed. CHANGELOG [6.6.9]
+# failed lookup, which is exactly what the entropy-fallback hardening item closed. CHANGELOG [6.6.9]
 fn _net_dns_id(): i64 {
     var b[8];
     store64(&b, 0);

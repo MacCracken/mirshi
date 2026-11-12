@@ -97,8 +97,10 @@ include "lib/atomic.cyr"
 # costs nothing until poison mode is on. CHANGELOG [6.6.18]
 include "lib/poison.cyr"
 
-# Size classes: 16 32 64 128 256 512 1024 2048 4096
-var _fl_heads[72];
+# Size classes: 16 32 64 128 256 512 1024 2048 4096 — one list head (an i64) per class. 6.7.9: the
+# table was a bare top-level `var _fl_heads[72]`, which is 72 SLOTS (576 B) for 9 heads.
+const _FL_NCLASSES = 9;
+var _fl_heads: i64[_FL_NCLASSES];
 var _fl_init = 0;
 
 # Arena for small allocations (64KB chunks via mmap)
@@ -120,7 +122,7 @@ var _fl_lock = 0;
 #
 # ⚠ NO `atomic_fence()` here, unlike alloc.cyr's twin — and that is a correction,
 # not an omission. `atomic_cas` carries ACQUIRE-RELEASE ordering on BOTH arches
-# since CVE-28/v6.1.38 (x86 `lock cmpxchg` is seq-cst; aarch64 uses ldaxr/stlxr),
+# since the aarch64 atomics-barrier bug/v6.1.38 (x86 `lock cmpxchg` is seq-cst; aarch64 uses ldaxr/stlxr),
 # so an acquire fence after a winning CAS is pure cost. alloc.cyr:59 still calls it
 # "a cheap near-no-op": measured on this hardware, `atomic_fence()` is ~22 ns — an
 # out-of-line call emitting `mfence`, about 2× the whole CAS, and 83 % of the cost
@@ -160,7 +162,7 @@ fn _fl_lock_release(): i64 {
 fn _fl_init_locked(): i64 {
     if (_fl_init == 1) { return 0; }
     var i = 0;
-    while (i < 9) {
+    while (i < _FL_NCLASSES) {
         store64(&_fl_heads + i * 8, 0);
         i = i + 1;
     }
