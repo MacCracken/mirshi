@@ -37,7 +37,7 @@ enum MirshiNetSys {
     IPPROTO_ICMP = 1;            # unprivileged ping socket: socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
     ICMP_ECHO = 8;               # ICMP type: echo request (the ping-socket kernel demands type==8, code==0)
     ICMP_HDR_LEN = 8;            # sizeof(struct icmphdr) — the minimum a ping socket will send
-    ICMP_TIMEOUT_S = 3;          # bound the supervisor echo-reply wait to agnos's ~3s budget
+    ICMP_TIMEOUT_MS = 3000;      # icmp_echo#55's echo-reply wait: the kernel's ~3 s budget (#100's default)
     POLLIN = 1;                  # ppoll event: the echo reply is readable
     POLLERR = 8;                 # v1.7.0 epoll_wait: a socket error also counts as "ready"
     POLLHUP = 16;                # v1.7.0 epoll_wait: peer hangup also counts as "ready"
@@ -557,7 +557,9 @@ fn _mono_ms(): i64 {
 # hold; ADR 0012), sends one echo request, and bounded-ppoll(POLLIN)s for the reply, measuring the
 # monotonic-clock delta. dst_ip is the agnos kernel-ip4 form. Fail-closed to -1 on ANY error
 # (socket denied by net.ipv4.ping_group_range, send failure, timeout, spurious wake).
-fn _net_icmp(pid, regs): i64 {
+# 1.13.0: the reply wait is `ms` — ICMP_TIMEOUT_MS for #55, and for icmp_echo_ex#100(dst_ip, timeout_ms)
+# the caller's, as the kernel clamps it (icmp_ex_timeout_ms: <= 0 is the 3 s default, at most 60 s).
+fn _net_icmp_t(pid, regs, ms): i64 {
     var dst_ip = decode_arg(regs, 0);
     if (net_egress_ok(dst_ip, _net_entries, _net_count) != 1) { return _net_emu(pid, regs, 0 - 1); }
     var fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
@@ -578,8 +580,8 @@ fn _net_icmp(pid, regs): i64 {
     store32(sb + 16, fd);                        # pollfd.fd
     store16(sb + 20, POLLIN);                    # pollfd.events (offset 4) = POLLIN
     store16(sb + 22, 0);                         # pollfd.revents (offset 6)
-    store64(sb + 24, ICMP_TIMEOUT_S);            # timespec.tv_sec
-    store64(sb + 32, 0);                         # timespec.tv_nsec
+    store64(sb + 24, ms / 1000);                 # timespec.tv_sec
+    store64(sb + 32, (ms % 1000) * 1000000);     # timespec.tv_nsec
     var pr = syscall(SYS_PPOLL, sb + 16, 1, sb + 24, 0, 0);
     if (pr <= 0) { syscall(HOST_CLOSE, fd); return _net_emu(pid, regs, 0 - 1); }   # timeout / down
     # Any datagram readable on this fresh, private ping socket IS our reply: the kernel delivers
@@ -591,6 +593,21 @@ fn _net_icmp(pid, regs): i64 {
     if (got < 0) { return _net_emu(pid, regs, 0 - 1); }   # spurious wake, no datagram -> no reply
     if (rtt < 0) { rtt = 0; }                    # monotonic never rewinds; clamp as a guard
     return _net_emu(pid, regs, rtt);
+}
+
+# sock_peer#106(conn_id) -> (peer_ip << 16) | peer_port / -1 (1.13.0). The remote end of a connection the
+# caller owns — its own table's SLOT_CONN, so a listener, a UDP socket, a free slot and a stranger's id are
+# all -1, as the kernel's tcp_auth + tcp_peer_own answer. ip in the kernel-ip4 form, port in host order
+# (the _net_udp_recv conversion); a live peer is always >= 0x10000.
+fn _net_sock_peer(pid, regs): i64 {
+    var fd = _net_fd_conn(decode_arg(regs, 0));
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var sb = _net_scratch_buf();
+    store32(sb + 48, SOCKADDR_IN_SIZE);                  # addrlen (in/out)
+    if (syscall(SYS_GETPEERNAME, fd, sb, sb + 48) != 0) { return _net_emu(pid, regs, 0 - 1); }
+    var ip = net_ip4_to_inaddr(load32(sb + 4)) & 0xFFFFFFFF;
+    var port = net_htons(load16(sb + 2)) & 0xFFFF;
+    return _net_emu(pid, regs, (ip << 16) | port);
 }
 
 # --- net_config#61 (v1.3.0): a supervisor EMULATE getter that reads the REAL container-netns

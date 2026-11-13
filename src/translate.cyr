@@ -148,6 +148,29 @@ fn spawn_line_tokens(buf, len): i64 {
     return n;
 }
 
+# readdir#81 / readdir_at#101 (1.13.0): how many bytes of an `nl`-byte name a 64-byte record keeps — the
+# kernel's rd_name_keep: all of it up to 62 bytes, else 62 backed off over at most 3 UTF-8 continuation
+# bytes so a multi-byte character is never split. The record then carries RD_CUT. Pure.
+fn rd_name_keep(name, nl): i64 {
+    if (nl <= 62) { return nl; }
+    var n = 62;
+    var back = 0;
+    while (back < 3) {
+        if ((load8(name + n) & 0xC0) != 0x80) { return n; }
+        n = n - 1;
+        back = back + 1;
+    }
+    return n;
+}
+
+# icmp_echo_ex#100's timeout (1.13.0): the kernel clamps the caller's ms to 0..60000, and 0 is the default
+# 3 s. Pure.
+fn icmp_ex_timeout_ms(t): i64 {
+    if (t > 60000) { return 60000; }
+    if (t <= 0) { return 3000; }
+    return t;
+}
+
 fn sanitize_rootrel(buf): i64 {
     # (1.12.3) `..` is kept: every confined path now resolves through openat2 RESOLVE_IN_ROOT,
     # which clamps `..` at the root as the kernel does, instead of being refused here.

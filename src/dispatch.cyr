@@ -43,6 +43,21 @@ fn translate_dispatch(pid, regs): i64 {
     if (nr == 110) { return _do_console_mode(pid, regs); }
     if (nr == 111) { return _do_fd_kind(pid, regs); }
 
+    # 1.13.0 — the agnos ABI re-sync's cheap band (src/band_resync.cyr; lstat#102 is with stat#33 below, and
+    # icmp_echo_ex#100 / sock_peer#106 in the net block). ⚠ Each number is a different Linux call (36
+    # getitimer, 44 sendto, 81 fchdir, 99 sysinfo, 101 ptrace, 103 syslog, 104 getgid, 107 geteuid, 108
+    # getegid, 115 getgroups): answered or renumbered here, never passed through.
+    if (nr == 36) { return _do_klug(pid, regs); }              # klug -> 0 (no agnos log) / -1
+    if (nr == 44) { return _net_emu(pid, regs, 0); }           # sched_yield -> 0
+    if (nr == 108) { return _do_sched_yield_to(pid, regs); }   # sched_yield_to -> 0 / -1
+    if (nr == 81) { return _do_readdir(pid, regs); }           # readdir -> records / -1 / -2 / -4
+    if (nr == 101) { return _do_readdir_at(pid, regs); }       # readdir_at -> records, the cursor kept
+    if (nr == 99) { return _do_proclist(pid, regs); }          # proclist -> records / -1
+    if (nr == 103) { return _do_statfs(pid, regs); }           # statfs -> 0 / -1
+    if (nr == 104) { return _do_mountlist(pid, regs); }        # mountlist -> 1 / -1
+    if (nr == 107) { return _net_emu(pid, regs, 0 - 1); }      # spawn_limits -> -1 (not supported yet: 1.13.2)
+    if (nr == 115) { return _do_fsync(pid, regs); }            # fsync -> Linux fsync (74) in the child / -1
+
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert
     # to ms, skip the kernel syscall, stash the result. No fault surface.
@@ -168,6 +183,7 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 32) { return _cf_two(pid, regs, SYS_LINKAT); }                   # link
         if (nr == 63) { return _m2_fail(pid, regs); }                             # symlink: --root deferred (raw target isn't a confinable path; needs a custom symlinkat)
         if (nr == 33) { return _cf_stat(pid, regs); }                             # stat
+        if (nr == 102) { return _cf_stat_how(pid, regs, O_NOFOLLOW); }            # lstat (1.13.0): the final link itself
         if (nr == 70) { return _cf_readlink(pid, regs); }                         # readlink (readlinkat, no-follow)
     }
 
@@ -187,20 +203,10 @@ fn translate_dispatch(pid, regs): i64 {
     if (nr == 31) { return _m2_two_path(pid, regs, 82); }   # rename
     if (nr == 32) { return _m2_two_path(pid, regs, 86); }   # link (HARDLINK, never symlink)
     if (nr == 63) { return _m2_two_path(pid, regs, 88); }   # symlink -> Linux symlink(88); target is a literal string, linkpath a real path — same (path,len,path,len) shape as link#32
-    if (nr == 33) {
-        # stat(path,pathlen,statbuf48) -> Linux stat(path, statbuf144); the exit
-        # stop repacks the 144 B Linux struct into the saved agnos 48 B statbuf.
-        var sps = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
-          load64(regs + REG_RSP) - RED_ZONE);
-        if (sps < 0) { return _m2_fail(pid, regs); }
-        _m2_scratch = (sps - 144) & (0 - 8);     # 144 B Linux statbuf, below the path
-        _m2_out_ptr = decode_arg(regs, 2);       # the agnos 48 B statbuf (for the exit repack)
-        store64(regs + REG_RDI, sps);
-        store64(regs + REG_RSI, _m2_scratch);
-        store64(regs + REG_ORIG_RAX, 4);
-        pt(PTRACE_SETREGS, pid, 0, regs);
-        return STRAT_EXECUTE;
-    }
+    # stat(path,pathlen,statbuf48) -> Linux stat(path, statbuf144); the exit stop repacks the 144 B Linux
+    # struct into the saved agnos 48 B statbuf. lstat#102 (1.13.0) -> Linux lstat (6), the same repack.
+    if (nr == 33) { return _m2_stat_enter(pid, regs, 4); }
+    if (nr == 102) { return _m2_stat_enter(pid, regs, SYS_LSTAT); }
     if (nr == 70) {
         # readlink(path,pathlen,buf,buflen) -> Linux readlink(path, buf, bufsize)#89.
         # The kernel writes the link target straight into the child's buf (arg2), so —
@@ -274,7 +280,9 @@ fn translate_dispatch(pid, regs): i64 {
         if (nr == 52) { return _net_udp_send(pid, regs); }     # udp_send -> bytes / 0 / -1
         if (nr == 53) { return _net_udp_recv(pid, regs); }     # udp_recv -> bytes / 0 none / -1
         if (nr == 54) { return _net_udp_unbind(pid, regs); }   # udp_unbind -> 0 / -1
-        if (nr == 55) { return _net_icmp(pid, regs); }         # icmp_echo -> RTT ms (>=0) / -1
+        if (nr == 55) { return _net_icmp_t(pid, regs, ICMP_TIMEOUT_MS); }   # icmp_echo -> RTT ms (>=0) / -1
+        if (nr == 100) { return _net_icmp_t(pid, regs, icmp_ex_timeout_ms(decode_arg(regs, 1))); }   # icmp_echo_ex (1.13.0)
+        if (nr == 106) { return _net_sock_peer(pid, regs); }   # sock_peer -> (ip<<16)|port / -1 (1.13.0)
         if (nr == 56) { return _net_listen(pid, regs); }       # sock_listen -> listen_id / -1
         if (nr == 57) { return _net_accept(pid, regs); }       # sock_accept -> conn_id / -1
         if (nr == 61) { return _net_config(pid, regs); }       # net_config -> packed ip / 0 / -1

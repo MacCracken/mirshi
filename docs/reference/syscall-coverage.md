@@ -66,14 +66,14 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 33 | stat | EXECUTE | `stat` (4) ¹ | path staged; Linux 144 B → agnos 48 B repack at exit |
 | 34 | uname | EMULATE ⁶ | — | info getters (v1.8.0): synthesized agnos-native 64 B struct (4×16 = sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `len<64`→−1 |
 | 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1. **v1.11.3:** the kernel's length tiers — writes exactly 40 / 104 (+per-core user/kernel ticks at +40, host `/proc/stat`) / 200 (+BLK-tag sectors at +104, zero) / 208 (+`sched_kicks` at +200, zero) bytes |
-| 36 | klug | ENOSYS | — | the kernel log ring (dmesg). Not handled yet — the 1.13.0 re-sync |
+| 36 | klug | EMULATE ⁹ | — | **v1.13.0:** 0 bytes — mirshi keeps no agnos kernel log, and the host's (dmesg) is never read; `len` < 0 → −1. ⚠ Linux #36 is `getitimer` |
 | 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path |
-| 38–39 | fbinfo / blit | ENOSYS | — | the framebuffer pair. A hardware band: permanent ENOSYS or a headless emulation is an open decision ([roadmap](../development/roadmap.md) 1.x) |
+| 38–39 | fbinfo / blit | ENOSYS | — | the framebuffer pair, left out of the 1.13 re-sync on purpose: a hardware band, so permanent ENOSYS or a headless emulation is an open decision ([roadmap](../development/roadmap.md) 1.x). `winsize#60` is the graphics surface mirshi answers |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; 0 → 0, **negative → −1** (v1.12.3, the kernel); cap 1 h |
 | 42 | kbscan | EMULATE | — | **v1.11.0:** the raw Set-1 scancode drain, synthesized from mirshi's stdin (the tty armed raw + non-blocking on the first call; a pipe works too) — cyim's per-key channel |
 | 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) **v1.12.3:** `a2 = len | flags` decoded — `SPAWN_F_ARGV` (bit 16, a NUL-separated argv blob, 2..1024 B, 1..16 entries) and `SPAWN_F_CLEANFD` (bit 17); −2 table full, −6 bad arguments or more than 16 tokens; under `--root` the path resolves inside the root. |
-| 44 | sched_yield | ENOSYS | — | not handled yet — the 1.13.0 re-sync |
+| 44 | sched_yield | EMULATE ⁹ | — | **v1.13.0:** 0 (the ptrace stop is already a scheduling point). ⚠ Linux #44 is `sendto` |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs **v1.12.3:** a length ≤ 0 → 0 and the flags are ignored, as on the kernel (EMULATE for that case). |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
 | 47 | sock_connect | EMULATE ² | — | net band client (v1.1.0): conn_id slot table + `--net-allow` egress **v1.12.3:** port 1..65535, else −1. |
@@ -94,19 +94,33 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
 | 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
 
+| 81 | readdir | EMULATE ⁹ ¹ | — | **v1.13.0:** `(path, buf, max)` → records. The path is a NUL-terminated string in a 256-byte window (all of it readable and a NUL inside, else −1); then `max` ≤ 0 → 0, > 16777216 → −1; not found (the empty path included) → −2, not a directory → −4. 64-byte records: the name (≤ 62 bytes, cut on a UTF-8 boundary) + NUL, zero-filled, byte 63 = `RD_DIR` 1 \| `RD_CUT` 2; `.`/`..` skipped; always from the top. The supervisor opens and walks the directory (`getdents64`; a `DT_UNKNOWN` entry is asked with `newfstatat` no-follow). ⚠ Linux #81 is `fchdir` |
 | 95 | uptime_us | EMULATE | — | **v1.11.3:** `CLOCK_MONOTONIC` in the supervisor → µs, the same epoch as `uptime_ms#40` (never −1: the host clock always works). ⚠ Linux #95 is `umask` — the skip keeps it from running in the child |
+| 99 | proclist | EMULATE ⁹ | — | **v1.13.0:** `(buf, max)` → records; `max` < 1 or > 16777216 → −1. One 64-byte record per process in mirshi's table, in table order: +0 pid, +8 state (2 the caller, 1 another live one, 6 parked in `waitpid#4`/`execwait#37`, 7 exited and unreaped), +16 ppid, +24 the 32-byte NUL-padded name (the basename of the target / of `#37`/`#43`'s path; empty for `spawn#3`), +56 0. ⚠ Linux #99 is `sysinfo` |
+| 100 | icmp_echo_ex | EMULATE ² | — | **v1.13.0:** `icmp_echo#55` with the caller's reply wait: `timeout_ms` ≤ 0 → the 3 s default, clamped to 60 s. ⚠ Linux #100 is `times` |
+| 101 | readdir_at | EMULATE ⁹ ¹ | — | **v1.13.0:** `#81` with a cursor (`a4` = r10, an i64 read and written): after the `max` checks the cursor must be readable (−1); `*cursor` < 0 → 0, untouched. A spent budget parks the cursor on the record not taken; the end of the directory stores −1. The cursor is the Linux `d_off` cookie (opaque; `lseek` to it when > 0), so `#81`'s byte-offset rules and −5 do not apply. ⚠ Linux #101 is `ptrace` |
+| 102 | lstat | EXECUTE ¹ | `lstat` (6) | **v1.13.0:** `stat#33` without following the final symlink — the same staging and 144 → 48 B repack. ⚠ Linux #102 is `getuid` |
+| 103 | statfs | EMULATE ⁹ ¹ | — | **v1.13.0:** `(path, pathlen, buf)` → 0 / −1. The path is read as `stat`'s is (1..4096 bytes, no interior NUL) and must resolve. 32 bytes = 4 × u64: bsize (Linux `f_frsize`, or `f_bsize` when 0), blocks, bfree, bavail — Linux `statfs` on the path, or `fstatfs` on it opened inside the root. ⚠ Linux #103 is `syslog` |
+| 104 | mountlist | EMULATE ⁹ | — | **v1.13.0:** `(buf, max)` → 1; `max` < 1 or > 13421772 → −1. One 80-byte record: backend 1 (ext2), prefixlen 1, `"/"` NUL-padded to 64. The host's mount table is never read. ⚠ Linux #104 is `getgid` |
+| 106 | sock_peer | EMULATE ² | — | **v1.13.0:** `conn_id` → `(peer_ip << 16) \| peer_port` (kernel-ip4 form, host-order port) for one of the caller's live connections (`getpeername`); a listener, a UDP socket, a free slot or a failed `getpeername` → −1. ⚠ Linux #106 is `setgid` |
+| 107 | spawn_limits | EMULATE ⁹ | — | **v1.13.0:** −1, the kernel's "not supported" answer, until mirshi enforces the caps (the process band, [roadmap](../development/roadmap.md) 1.13.2). ⚠ Linux #107 is `geteuid` |
+| 108 | sched_yield_to | EMULATE ⁹ | — | **v1.13.0:** 0 for self, a live direct child or the live direct parent (the kernel's `yt_auth_ok`); anything else → −1. ⚠ Linux #108 is `getegid` |
 | 109 | sock_send_dl | EMULATE ² ⁸ | — | **v1.12.1 (agnos 1.57.13):** `sock_send#48` with a caller ceiling. Conn checked first (−1 even for len ≤ 0), len ≤ 0 → 0; `timeout_us` 0 = exactly #48, < 0 = one non-blocking attempt, > 0 = wait ≤ min(ceiling, 8 s) for space; an expired wait → **0** (committed count), not −1. ⚠ Linux #109 is `setpgid` |
 | 110 | console_mode | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** `(set, clear)` → the console's previous flags / −1. `CM_NOECHO` hides echo on the host tty and **dies with its holder**, `CM_FLUSH` = `tcflush(TCIFLUSH)`, `CM_NOSERIAL` per process (reported only). Unknown bits → −1 with nothing changed. ⚠ Linux #110 is `getppid` |
 | 111 | fd_kind | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** fd → `FdKind` (1 CONSOLE … 10 DEVICE) / −1. Emulated event fds by slot; a real fd via `pidfd_getfd` + `fstat` + `TCGETS` in the supervisor; fd < 0, ≥ 32 or closed → −1. ⚠ Linux #111 is `getpgrp` |
+| 115 | fsync | EXECUTE ⁹ | `fsync` (74) | **v1.13.0:** fd < 0 or ≥ 32 → −1 without a call; otherwise Linux `fsync` on the child's fd, its errors → −1 (a pipe or a terminal is EINVAL there, as the kernel refuses what is not a file or a directory). ⚠ Linux #115 is `getgroups` |
 
-**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3) and the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
+**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3), the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸), and the 1.13.0 re-sync band `#81` / `#99`–`#104` / `#106`–`#108` / `#115` (footnote ⁹). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
 ¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md), amended v1.12.3):
 `open#7` runs in the child as `openat2(ROOTFD, path, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`. Since v1.12.3
 `mkdir` / `rmdir` / `unlink` / `rename` / `link` / `stat` / `readlink` run **in the supervisor**: each resolves
 its parent directory with the same `openat2` flags on a supervisor-held root fd, then calls `mkdirat` /
-`unlinkat` / `renameat2` / `linkat` / `readlinkat` on that fd (`stat`: `openat2(O_PATH)` + `fstat`). `..`
-clamps at the root, as on the kernel. The fd-based ops (`read`/`write`/`lseek`/`close`/`getdents`) ride
+`unlinkat` / `renameat2` / `linkat` / `readlinkat` on that fd (`stat`: `openat2(O_PATH)` + `fstat`; v1.13.0
+`lstat#102` the same with `O_NOFOLLOW`, so a final symlink is described, not followed). `..`
+clamps at the root, as on the kernel. The v1.13.0 supervisor-side path calls resolve the same way:
+`readdir#81` / `readdir_at#101` open the directory with `openat2(O_DIRECTORY, RESOLVE_IN_ROOT |
+RESOLVE_NO_MAGICLINKS)`, and `statfs#103` `fstatfs`es the path opened inside the root. The fd-based ops (`read`/`write`/`lseek`/`close`/`getdents`) ride
 fds from a confined `open`, and the child holds no other fd: it starts with 0–2 and ROOTFD only. Without
 `--root`, the peers in the table above apply (transparent pass-through).
 
@@ -118,6 +132,8 @@ the child never holds a socket fd. (`icmp_echo#55` takes no slot — it opens a 
 unprivileged `SOCK_DGRAM`+`IPPROTO_ICMP` ping socket, round-trips one echo under a bounded ~3s
 `ppoll`, and closes it.) Enabled by `--net` / `--net-allow` (egress default-deny) /
 `--net-listen-any` (ingress loopback-default). **Without `--net` they return ENOSYS** (agnos `-1`).
+v1.13.0 adds `icmp_echo_ex#100` (#55 with the caller's reply wait) and `sock_peer#106` (the peer of a
+caller-owned connection, from `getpeername` on its slot's socket), under the same `--net` rule.
 The net band is now **complete** — no net-band number remains ENOSYS (see the
 [roadmap net band arc](../development/roadmap.md)).
 
@@ -227,6 +243,26 @@ and a stray `ENOSYS agnos#N` line. All three are **supervisor-EMULATE**, with no
 
 See [ADR 0018](../adr/0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md).
 
+⁹ **The 1.13.0 re-sync band.** Thirteen agnos numbers that fell to ENOSYS up to v1.12.3, each checked against
+its kernel arm at agnos `aef48206` (1.57.19). Every one is a **different Linux call**, so each is answered in the
+supervisor or renumbered — never passed through. The handlers are in `src/band_resync.cyr` (the net pair in
+`src/band_net.cyr`, `lstat` beside `stat` in `src/band_fs.cyr`). The child-seccomp delta is `lstat` (6) and
+`fsync` (74); everything else runs in the supervisor.
+- **`readdir#81` / `readdir_at#101`** open the directory in the supervisor (from mirshi's working directory —
+  the child's, since mirshi has no `chdir` yet — or inside the root) and walk it with `getdents64`. The kernel
+  validates the whole `max × 64`-byte buffer up front; mirshi writes the records it produces and answers −1 at
+  the first it cannot write. `readdir_at`'s cursor is the host's `d_off` cookie, not ext2's byte offset: a
+  caller treats it as opaque (0 starts, −1 ends), as the stdlib does, and a cookie the directory refuses to
+  seek to reads as one past the end (0, cursor −1).
+- **`proclist#99`** lists mirshi's own processes only — there is no kmain, idle or kernel thread to show — and
+  `+56` is 0 ("neither cpu ticks nor rss present"): mirshi tracks neither.
+- **`mountlist#104`** reports one ext2 root, and **`klug#36`** an empty log: the host's mount table and kernel
+  log are never read.
+- **`spawn_limits#107`** answers −1 until the caps are enforced (1.13.2); the cyrius stdlib treats −1 as
+  "this kernel cannot cap a child".
+- **`sched_yield#44` / `sched_yield_to#108`** do not yield the host CPU: the child is already stopped in ptrace.
+  `#108`'s authority is the kernel's: self, a live direct child, or the live direct parent.
+
 ## The runnable surface (v1)
 
 - **M1 — process + console**: `exit#0`, `write#1`, `read#5`, `getpid#2`, `mmap#27`/`munmap#28`,
@@ -242,8 +278,10 @@ extensions, as were the **info-getters + advisory-locks band** (`getuid#15`/`una
 v1.8.0 — footnote ⁶) and **tty sizing** (`winsize#60`, v1.9.0 — footnote ⁷). **Direction 1 is now
 feature-complete**: every *defined, non-kernel-only* agnos syscall is handled. The only remaining ENOSYS rows
 are the agnos-**kernel**-only ops (`mount#11`/`umount#24`/`reboot#13`/`write_boot_checkpoint#26` — permanent by
-design). #36 / #38–39 / #44 and the agnos numbers past #63 that mirshi does not handle yet are the
-[roadmap](../development/roadmap.md)'s 1.13 re-sync. The exec-band re-sync landed **#37 execwait + #43 spawn_path + #62 exec_redirect + #63 symlink**. What remains on the [roadmap](../development/roadmap.md) is
+design). `fbinfo#38` / `blit#39` and the hardware bands are an open 1.x decision; the agnos numbers past #63
+that mirshi does not handle yet (`#71–74`, `#96–98`, `#112–113`, …) are the [roadmap](../development/roadmap.md)'s
+1.13.x re-sync, whose cheap band landed in v1.13.0 (`#36`, `#44`, `#81`, `#99`–`#104`, `#106`–`#108`, `#115` —
+footnote ⁹). The exec-band re-sync landed **#37 execwait + #43 spawn_path + #62 exec_redirect + #63 symlink**. What remains on the [roadmap](../development/roadmap.md) is
 the **v2.0.0 direction-2 "swallow"** (Linux binaries on the agnos kernel).
 
 ## Known gaps (carried forward, documented not fixed)

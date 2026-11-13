@@ -1,0 +1,323 @@
+# band_resync.cyr — 1.13.0: the cheap half of the agnos ABI re-sync (included in order by src/intercept.cyr,
+# after src/band_console.cyr and before src/dispatch.cyr, which wires the arms).
+#
+# Eleven agnos calls that fell to ENOSYS up to 1.12.3, answered here against the kernel at agnos aef48206
+# (1.57.19, kernel/core/syscall.cyr). The two net ones (icmp_echo_ex#100, sock_peer#106) live in
+# src/band_net.cyr, and lstat#102 in src/band_fs.cyr beside stat#33. ⚠ Every one of these numbers is a
+# DIFFERENT Linux call (36 getitimer, 44 sendto, 81 fchdir, 99 sysinfo, 101 ptrace, 103 syslog,
+# 104 getgid, 107 geteuid, 108 getegid, 115 getgroups), so each is answered here or renumbered — never
+# passed through.
+#
+#   klug#36(buf, len)            EMULATE. mirshi keeps no agnos kernel log, and the host's (dmesg) is
+#                                never read: 0 bytes, or -1 for len < 0.
+#   sched_yield#44()             EMULATE 0. The ptrace stop is already a scheduling point.
+#   sched_yield_to#108(pid)      EMULATE 0 for self, a live direct child or the live direct parent (the
+#                                kernel's yt_auth_ok), else -1.
+#   readdir#81 / readdir_at#101  EMULATE, supervisor-side: the directory is opened in the supervisor
+#                                (openat2 RESOLVE_IN_ROOT under --root, as open#7 resolves) and walked
+#                                with getdents64 into the kernel's 64-byte {name, flags} records.
+#   proclist#99(buf, max)        EMULATE: one record per process in mirshi's table.
+#   statfs#103(path, len, buf)   EMULATE: Linux statfs / fstatfs, packed to the kernel's 4 x u64.
+#   mountlist#104(buf, max)      EMULATE: one mount, "/" (ext2). The host's mount table is never read.
+#   spawn_limits#107(mem, cpu)   EMULATE -1, the kernel's "not supported" answer, until the process band
+#                                enforces the caps (roadmap 1.13.2).
+#   fsync#115(fd)                -1 for fd outside [0, 32), else renumbered to Linux fsync (74) and
+#                                EXECUTED in the child; its errors map to -1.
+# ============================================================================
+
+enum MirshiResync {
+    RS_ARRAY_MAX_64 = 16777216;     # the kernel's is_user_array(buf, max, 64) bound: 0x40000000 / 64 records
+    RS_ARRAY_MAX_80 = 13421772;     # ... and for mountlist's 80-byte records: 0x40000000 / 80
+    RD_PATH_WIN = 256;              # readdir's path is a NUL-terminated string in a 256-byte window
+    RD_REC = 64;                    # one readdir record: name (<= 62 bytes) + NUL, byte 63 = flags
+    RD_DIR = 1;                     # record flag: a directory
+    RD_CUT = 2;                     # record flag: the name was cut to fit
+    RD_DENTS_CAP = 4096;            # one getdents64 batch
+    RS_AT_FDCWD = 0 - 100;          # Linux AT_FDCWD
+    RS_AT_SYMLINK_NOFOLLOW = 0x100; # Linux AT_SYMLINK_NOFOLLOW (newfstatat)
+    RS_DT_UNKNOWN = 0;              # getdents64 d_type: the filesystem does not say
+    RS_DT_DIR = 4;                  # getdents64 d_type: a directory
+    RS_ELOOP = 40;                  # Linux ELOOP (a symlink loop, or a magic link refused): nothing found
+    RS_ENAMETOOLONG = 36;           # Linux ENAMETOOLONG: nothing found
+    ML_REC = 80;                    # one mountlist record
+    ML_FS_EXT2 = 1;                 # FsBackend ext2
+    SF_REC = 32;                    # statfs's frozen record: bsize / blocks / bfree / bavail
+    # the band scratch: one getdents64 batch | one record | a Linux stat / statfs | the cursor word
+    RS_OFF_REC = 4096;
+    RS_OFF_STAT = 4176;
+    RS_OFF_WORD = 4320;
+    RS_SCRATCH = 4336;
+}
+
+# The band's supervisor scratch, lazy-alloc-once (ADR 0008 — never per call). One call in flight.
+var _rs_buf = 0;
+fn _rs_scratch(): i64 {
+    if (_rs_buf == 0) { _rs_buf = alloc(RS_SCRATCH); }
+    return _rs_buf;
+}
+
+# klug#36(buf, len) -> 0 / -1.
+fn _do_klug(pid, regs): i64 {
+    if (decode_arg(regs, 1) < 0) { return _net_emu(pid, regs, 0 - 1); }   # the kernel's is_user_range refuses len < 0
+    return _net_emu(pid, regs, 0);
+}
+
+# sched_yield_to#108(pid) -> 0 / -1. The caller is _cur_rec (set by the loop at this enter stop).
+fn _do_sched_yield_to(pid, regs): i64 {
+    if (_child_yield_ok(_cur_rec, decode_arg(regs, 0)) == 1) { return _net_emu(pid, regs, 0); }
+    return _net_emu(pid, regs, 0 - 1);
+}
+
+# proclist#99(buf, max) -> records written / -1. One 64-byte record per non-FREE child record, in table
+# order (_child_pl_fill). max is checked as the kernel checks it (< 1, or more records than the user
+# window holds); a record that cannot be written into the caller's buffer is -1.
+fn _do_proclist(pid, regs): i64 {
+    var buf = decode_arg(regs, 0);
+    var max = decode_arg(regs, 1);
+    if (max < 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (max > RS_ARRAY_MAX_64) { return _net_emu(pid, regs, 0 - 1); }
+    var rec = _rs_scratch() + RS_OFF_REC;
+    var tbl = _child_tbl();
+    var n = 0;
+    var i = 0;
+    while (i < MAX_CHILDREN) {
+        if (n >= max) { break; }
+        var b = tbl + i * CHILD_REC_SIZE;
+        if (load64(b + C_STATE) != CS_FREE) {
+            _child_pl_fill(rec, b, _cur_rec);
+            if (pvm_write(pid, buf + n * PL_REC_SIZE, rec, PL_REC_SIZE) != PL_REC_SIZE) { return _net_emu(pid, regs, 0 - 1); }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return _net_emu(pid, regs, n);
+}
+
+# mountlist#104(buf, max) -> 1 / -1. The agnos guest sees one volume, "/" (the root, which is the host
+# directory --root names, or mirshi's own view of the filesystem), reported as the kernel's ext2 root.
+fn _do_mountlist(pid, regs): i64 {
+    var max = decode_arg(regs, 1);
+    if (max < 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (max > RS_ARRAY_MAX_80) { return _net_emu(pid, regs, 0 - 1); }
+    var rec = _rs_scratch() + RS_OFF_REC;
+    var k = 0;
+    while (k < ML_REC) { store64(rec + k, 0); k = k + 8; }
+    store64(rec + 0, ML_FS_EXT2);                 # backend
+    store64(rec + 8, 1);                          # prefixlen
+    store8(rec + 16, 47);                         # "/", NUL-padded to 64
+    if (pvm_write(pid, decode_arg(regs, 0), rec, ML_REC) != ML_REC) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 1);
+}
+
+# statfs#103(path, pathlen, buf) -> 0 / -1. The path must resolve (the kernel's rule on every backend):
+# Linux statfs on it unconfined; under --root the path is opened inside the root (openat2 O_PATH) and
+# fstatfs'd, so the answer is the filesystem holding the confined file. The record is 4 x u64: bsize
+# (Linux f_frsize — the unit f_blocks counts in — or f_bsize when the filesystem leaves it 0), blocks,
+# bfree, bavail.
+fn _do_statfs(pid, regs): i64 {
+    _m2_init();
+    if (_m2_read_path(pid, decode_arg(regs, 0), decode_arg(regs, 1), _m2_pathbuf) < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var s = _rs_scratch();
+    var lf = s + RS_OFF_STAT;                     # struct statfs (120 B)
+    var r = 0 - 1;
+    if (_confine_active == 1) {
+        sanitize_rootrel(_m2_pathbuf);
+        var fd = _cf_open_in_root(_m2_pathbuf, 0);
+        if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+        r = syscall(SYS_FSTATFS, fd, lf);
+        syscall(HOST_CLOSE, fd);
+    } else {
+        r = syscall(SYS_STATFS, _m2_pathbuf, lf);
+    }
+    if (r != 0) { return _net_emu(pid, regs, 0 - 1); }
+    var out = s + RS_OFF_REC;
+    var bs = load64(lf + 72);                     # f_frsize
+    if (bs == 0) { bs = load64(lf + 8); }         # f_bsize
+    store64(out + 0, bs);
+    store64(out + 8, load64(lf + 16));            # f_blocks
+    store64(out + 16, load64(lf + 24));           # f_bfree
+    store64(out + 24, load64(lf + 32));           # f_bavail
+    if (pvm_write(pid, decode_arg(regs, 2), out, SF_REC) != SF_REC) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
+# fsync#115(fd) -> 0 / -1. The kernel's fd table has 32 entries, so anything outside [0, 32) — ROOTFD and
+# mirshi's emulated ids among them — is -1 without a call. Otherwise Linux fsync runs in the child on the
+# child's own fd; a pipe or a terminal answers EINVAL there, -1 here, as the kernel refuses a fd that is
+# not a file or a directory.
+fn _do_fsync(pid, regs): i64 {
+    var fd = decode_arg(regs, 0);
+    if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
+    if (fd >= FDK_FD_MAX) { return _net_emu(pid, regs, 0 - 1); }
+    store64(regs + REG_ORIG_RAX, SYS_FSYNC);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# --- readdir#81 / readdir_at#101 ---------------------------------------------------------------------------
+
+# Read readdir's path — a NUL-terminated string in a 256-byte window — into _m2_pathbuf: its length (0 for
+# the empty string), or -1 when the window is not all readable or holds no NUL (the kernel's sc_cpath_take).
+fn _rd_read_cpath(pid, ptr): i64 {
+    _m2_init();
+    if (pvm_read(pid, ptr, _m2_pathbuf, RD_PATH_WIN) != RD_PATH_WIN) { return 0 - 1; }
+    var n = 0;
+    while (n < RD_PATH_WIN) {
+        if (load8(_m2_pathbuf + n) == 0) { return n; }
+        n = n + 1;
+    }
+    return 0 - 1;
+}
+
+# open the path in _m2_pathbuf with `flags`: inside the root under --root (openat2, the kernel's clamped
+# resolution, as open#7), else from the supervisor's working directory (the child's: mirshi has no chdir).
+fn _rd_openat(flags): i64 {
+    if (_confine_active == 1) {
+        var hb = _how_buf_get();
+        store64(hb + 0, flags);
+        store64(hb + 8, 0);
+        store64(hb + 16, OPEN_RESOLVE);
+        return syscall(SYS_OPENAT2, _sup_rootfd, _m2_pathbuf, hb, OPEN_HOW_SIZE);
+    }
+    return syscall(SYS_OPENAT, RS_AT_FDCWD, _m2_pathbuf, flags, 0);
+}
+
+# Open the directory named by the `pl`-byte path in _m2_pathbuf for a listing: a supervisor fd, or the
+# kernel's -2 (nothing there; the empty path included) / -4 (it is not a directory) / -1.
+fn _rd_open(pl): i64 {
+    if (pl == 0) { return 0 - 2; }
+    if (_confine_active == 1) { sanitize_rootrel(_m2_pathbuf); }
+    var fd = _rd_openat(O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) { return fd; }
+    if (fd == (0 - ENOTDIR)) {
+        # ENOTDIR is both "the final component is a file" (-4) and "a middle component is" (-2): the
+        # path resolves without O_DIRECTORY only in the first case.
+        var f2 = _rd_openat(O_PATH | O_CLOEXEC);
+        if (f2 >= 0) { syscall(HOST_CLOSE, f2); return 0 - 4; }
+        return 0 - 2;
+    }
+    if (fd == (0 - ENOENT)) { return 0 - 2; }
+    if (fd == (0 - RS_ELOOP)) { return 0 - 2; }
+    if (fd == (0 - RS_ENAMETOOLONG)) { return 0 - 2; }
+    return 0 - 1;
+}
+
+# Store `v` into the caller's cursor at `cur`: 0, or -1 when it cannot be written.
+fn _rd_cursor_put(pid, cur, v): i64 {
+    var w = _rs_scratch() + RS_OFF_WORD;
+    store64(w, v);
+    if (pvm_write(pid, cur, w, 8) != 8) { return 0 - 1; }
+    return 0;
+}
+
+# 1 when the getdents64 entry `name` (in the open directory `dfd`, of d_type `dt`) is a directory. A
+# filesystem that leaves d_type unknown is asked directly, without following a final symlink — a symlink
+# is never RD_DIR, as on the kernel (EXT2_FT_SYMLINK).
+fn _rd_is_dir(dfd, name, dt): i64 {
+    if (dt == RS_DT_DIR) { return 1; }
+    if (dt != RS_DT_UNKNOWN) { return 0; }
+    var st = _rs_scratch() + RS_OFF_STAT;
+    if (syscall(SYS_NEWFSTATAT, dfd, name, st, RS_AT_SYMLINK_NOFOLLOW) != 0) { return 0; }
+    if ((load32(st + 24) & 0xF000) == 0x4000) { return 1; }
+    return 0;
+}
+
+# The shared #81 / #101 walk over the open directory `dfd`, from its current position `pos` (0 = the top):
+# up to `max` 64-byte records into the caller's `buf`, "." and ".." skipped. With `cur` != 0 (readdir_at)
+# the caller's cursor is kept the kernel's way: BEFORE a record is taken, a spent budget parks the cursor
+# on that record — the previous record's d_off, or `pos` — and returns; walking off the end stores -1. The
+# cursor is the Linux d_off cookie, opaque to the caller. Returns the count, or -1 when a record or the
+# cursor cannot be written into the caller's memory.
+fn _rd_walk(pid, dfd, buf, max, cur, pos): i64 {
+    var s = _rs_scratch();
+    var rec = s + RS_OFF_REC;
+    var count = 0;
+    while (1 == 1) {
+        var n = syscall(SYS_GETDENTS64, dfd, s, RD_DENTS_CAP);
+        if (n <= 0) {
+            # 0 = exhausted (-1); an error mid-walk keeps the position, as the kernel does on a failed read
+            if (cur != 0) {
+                var cv = pos;
+                if (n == 0) { cv = 0 - 1; }
+                if (_rd_cursor_put(pid, cur, cv) < 0) { return 0 - 1; }
+            }
+            return count;
+        }
+        var off = 0;
+        while (off < n) {
+            if (count >= max) {
+                if (cur != 0) { if (_rd_cursor_put(pid, cur, pos) < 0) { return 0 - 1; } }
+                return count;
+            }
+            var d = s + off;
+            var reclen = load16(d + 16) & 0xFFFF;
+            if (reclen < 20) { off = n; } else {     # never on a sane host; stop the batch, don't spin
+                var name = d + 19;
+                var nl = 0;
+                while (nl < reclen - 19) { if (load8(name + nl) == 0) { break; } nl = nl + 1; }
+                var skip = 0;
+                if (nl == 1) { if (load8(name) == 46) { skip = 1; } }
+                if (nl == 2) { if (load8(name) == 46) { if (load8(name + 1) == 46) { skip = 1; } } }
+                if (skip == 0) {
+                    var z = 0;
+                    while (z < RD_REC) { store64(rec + z, 0); z = z + 8; }
+                    var keep = rd_name_keep(name, nl);
+                    var k = 0;
+                    while (k < keep) { store8(rec + k, load8(name + k)); k = k + 1; }
+                    var fl = 0;
+                    if (_rd_is_dir(dfd, name, load8(d + 18) & 0xFF) == 1) { fl = RD_DIR; }
+                    if (keep < nl) { fl = fl | RD_CUT; }
+                    store8(rec + 63, fl);
+                    if (pvm_write(pid, buf + count * RD_REC, rec, RD_REC) != RD_REC) { return 0 - 1; }
+                    count = count + 1;
+                }
+                pos = load64(d + 8);                  # d_off: where the record after this one starts
+                off = off + reclen;
+            }
+        }
+    }
+    return count;
+}
+
+# readdir#81(path, buf, max) -> records / -1 / -2 (not found) / -4 (not a directory). Always from the top.
+fn _do_readdir(pid, regs): i64 {
+    var pl = _rd_read_cpath(pid, decode_arg(regs, 0));
+    if (pl < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var max = decode_arg(regs, 2);
+    if (max <= 0) { return _net_emu(pid, regs, 0); }
+    if (max > RS_ARRAY_MAX_64) { return _net_emu(pid, regs, 0 - 1); }
+    var dfd = _rd_open(pl);
+    if (dfd < 0) { return _net_emu(pid, regs, dfd); }
+    var r = _rd_walk(pid, dfd, decode_arg(regs, 1), max, 0, 0);
+    syscall(HOST_CLOSE, dfd);
+    return _net_emu(pid, regs, r);
+}
+
+# readdir_at#101(path, buf, max, &cursor) -> records / -1 / -2 / -4, the cursor read and written. *cursor
+# 0 starts at the top; -1 (any negative) is an exhausted listing: 0, the cursor left alone. A cursor the
+# directory refuses to seek to answers as one past the end (0, cursor -1). Never -5: the kernel's
+# misaligned-offset answer has no meaning for an opaque cookie.
+fn _do_readdir_at(pid, regs): i64 {
+    var pl = _rd_read_cpath(pid, decode_arg(regs, 0));
+    if (pl < 0) { return _net_emu(pid, regs, 0 - 1); }
+    var max = decode_arg(regs, 2);
+    if (max <= 0) { return _net_emu(pid, regs, 0); }
+    if (max > RS_ARRAY_MAX_64) { return _net_emu(pid, regs, 0 - 1); }
+    var cur = decode_arg(regs, 3);
+    var w = _rs_scratch() + RS_OFF_WORD;
+    if (pvm_read(pid, cur, w, 8) != 8) { return _net_emu(pid, regs, 0 - 1); }
+    var start = load64(w);
+    if (start < 0) { return _net_emu(pid, regs, 0); }
+    var dfd = _rd_open(pl);
+    if (dfd < 0) { return _net_emu(pid, regs, dfd); }
+    if (start > 0) {
+        if (syscall(SYS_LSEEK, dfd, start, 0) < 0) {             # SEEK_SET to the cookie
+            syscall(HOST_CLOSE, dfd);
+            if (_rd_cursor_put(pid, cur, 0 - 1) < 0) { return _net_emu(pid, regs, 0 - 1); }
+            return _net_emu(pid, regs, 0);
+        }
+    }
+    var r = _rd_walk(pid, dfd, decode_arg(regs, 1), max, cur, start);
+    syscall(HOST_CLOSE, dfd);
+    return _net_emu(pid, regs, r);
+}

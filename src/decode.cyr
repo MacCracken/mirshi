@@ -98,8 +98,10 @@ fn agnos_nr_name(nr): cstring {
     if (nr == 33) { return "stat"; }
     if (nr == 34) { return "uname"; }
     if (nr == 35) { return "sysinfo"; }
+    if (nr == 36) { return "klug"; }
     if (nr == 40) { return "uptime_ms"; }
     if (nr == 41) { return "sleep_ms"; }
+    if (nr == 44) { return "sched_yield"; }
     if (nr == 45) { return "getrandom"; }
     if (nr == 46) { return "time_unix"; }
     if (nr == 47) { return "sock_connect"; }
@@ -118,10 +120,21 @@ fn agnos_nr_name(nr): cstring {
     if (nr == 60) { return "winsize"; }
     if (nr == 61) { return "net_config"; }
     if (nr == 70) { return "readlink"; }
+    if (nr == 81) { return "readdir"; }
     if (nr == 95) { return "uptime_us"; }
+    if (nr == 99) { return "proclist"; }
+    if (nr == 100) { return "icmp_echo_ex"; }
+    if (nr == 101) { return "readdir_at"; }
+    if (nr == 102) { return "lstat"; }
+    if (nr == 103) { return "statfs"; }
+    if (nr == 104) { return "mountlist"; }
+    if (nr == 106) { return "sock_peer"; }
+    if (nr == 107) { return "spawn_limits"; }
+    if (nr == 108) { return "sched_yield_to"; }
     if (nr == 109) { return "sock_send_dl"; }
     if (nr == 110) { return "console_mode"; }
     if (nr == 111) { return "fd_kind"; }
+    if (nr == 115) { return "fsync"; }
     return "unknown";
 }
 
@@ -164,8 +177,10 @@ fn agnos_argc(nr): i64 {
     if (nr == 33) { return 3; }   # stat(path, pathlen, statbuf)
     if (nr == 34) { return 2; }   # uname(buf, len)
     if (nr == 35) { return 2; }   # sysinfo(buf, len)
+    if (nr == 36) { return 2; }   # klug(buf, len)
     if (nr == 40) { return 0; }   # uptime_ms()
     if (nr == 41) { return 1; }   # sleep_ms(ms)
+    if (nr == 44) { return 0; }   # sched_yield()
     if (nr == 45) { return 3; }   # getrandom(buf, len, flags)
     if (nr == 46) { return 0; }   # time_unix()
     if (nr == 47) { return 3; }   # sock_connect(dst_ip, dst_port, src_port)
@@ -184,10 +199,21 @@ fn agnos_argc(nr): i64 {
     if (nr == 60) { return 0; }   # winsize()
     if (nr == 61) { return 1; }   # net_config(field)
     if (nr == 70) { return 4; }   # readlink(path, pathlen, buf, buflen)  -- a4=r10
+    if (nr == 81) { return 3; }   # readdir(path, buf, max)
     if (nr == 95) { return 0; }   # uptime_us()
+    if (nr == 99) { return 2; }   # proclist(buf, max)
+    if (nr == 100) { return 2; }  # icmp_echo_ex(dst_ip, timeout_ms)
+    if (nr == 101) { return 4; }  # readdir_at(path, buf, max, &cursor)  -- a4=r10
+    if (nr == 102) { return 3; }  # lstat(path, pathlen, statbuf)
+    if (nr == 103) { return 3; }  # statfs(path, pathlen, buf)
+    if (nr == 104) { return 2; }  # mountlist(buf, max)
+    if (nr == 106) { return 1; }  # sock_peer(conn_id)
+    if (nr == 107) { return 2; }  # spawn_limits(mem_pages, cpu_ms)
+    if (nr == 108) { return 1; }  # sched_yield_to(pid)
     if (nr == 109) { return 4; }  # sock_send_dl(conn_id, buf, len, timeout_us)  -- a4=r10
     if (nr == 110) { return 2; }  # console_mode(set, clear)
     if (nr == 111) { return 1; }  # fd_kind(fd)
+    if (nr == 115) { return 1; }  # fsync(fd)
     return 0;
 }
 
@@ -215,12 +241,19 @@ fn agnos_ptrmask(nr): i64 {
     if (nr == 33) { return 5; }   # stat: path (arg0) + statbuf (arg2)
     if (nr == 34) { return 1; }   # uname: buf (arg0)
     if (nr == 35) { return 1; }   # sysinfo: buf (arg0)
+    if (nr == 36) { return 1; }   # klug: buf (arg0)
     if (nr == 45) { return 1; }   # getrandom: buf (arg0)
     if (nr == 48) { return 2; }   # sock_send: buf (arg1)
     if (nr == 49) { return 2; }   # sock_recv: buf (arg1)
     if (nr == 52) { return 4; }   # udp_send: buf (arg2)
     if (nr == 53) { return 10; }  # udp_recv: buf (arg1) + addr_out (arg3)
     if (nr == 70) { return 5; }   # readlink: path (arg0) + buf (arg2)
+    if (nr == 81) { return 3; }   # readdir: path (arg0) + buf (arg1)
+    if (nr == 99) { return 1; }   # proclist: buf (arg0)
+    if (nr == 101) { return 11; } # readdir_at: path (arg0) + buf (arg1) + &cursor (arg3)
+    if (nr == 102) { return 5; }  # lstat: path (arg0) + statbuf (arg2)
+    if (nr == 103) { return 5; }  # statfs: path (arg0) + buf (arg2)
+    if (nr == 104) { return 1; }  # mountlist: buf (arg0)
     if (nr == 109) { return 2; }  # sock_send_dl: buf (arg1)
     return 0;
 }

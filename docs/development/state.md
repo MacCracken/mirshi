@@ -5,6 +5,18 @@
 
 ## Version
 
+**1.13.0** — 2026-11-12. **The agnos ABI re-sync, the cheap band** ([ADR 0019](../adr/0019-abi-resync-cheap-band-supervisor-side.md)):
+thirteen numbers that fell to ENOSYS now answer as the kernel at agnos `aef48206` (1.57.19) does.
+- **Filesystem:** `readdir#81` / `readdir_at#101` (supervisor-side `getdents64` into the kernel's 64-byte
+  records; the cursor is the host's opaque `d_off` cookie), `lstat#102`, `statfs#103`, `mountlist#104` (one
+  ext2 `"/"`), `fsync#115` (Linux `fsync` in the child).
+- **Processes:** `proclist#99` (mirshi's record table; records now carry a 32-byte name), `sched_yield#44`,
+  `sched_yield_to#108` (the kernel's authority rule), `spawn_limits#107` (-1 until 1.13.2).
+- **The log:** `klug#36` answers 0 bytes.
+- **Net (`--net`):** `icmp_echo_ex#100` (#55 with the caller's timeout) and `sock_peer#106`.
+- Under `--root` the path calls resolve inside the root. The child-seccomp delta is `lstat` (6) and `fsync` (74).
+
+`cyrius test` 533/0; 32 `scripts/it/*` gates (new: `resync.sh`) and `docker/smoke.sh` green.
 **1.12.3** — 2026-11-12. **The P(-1) sweep** ([audit](../audit/2026-11-12-audit.md)): four parallel reviews against the
 kernel at agnos `aef48206`, and their repairs.
 - **Hardening:**
@@ -224,7 +236,10 @@ trap-log mode.
   helper) and the band files, included in this order by `src/intercept.cyr`:
   - `src/band_fs.cyr`: the fs handlers, the supervisor-side confined ops, the exit-stop repacks;
   - `src/band_net.cyr`, `src/band_signals.cyr`, `src/band_iomux.cyr`, `src/band_info.cyr`;
-  - `src/band_kbscan.cyr`, `src/band_fdkind.cyr`, `src/band_console.cyr`.
+  - `src/band_kbscan.cyr`, `src/band_fdkind.cyr`, `src/band_console.cyr`;
+  - `src/band_resync.cyr` (1.13.0): klug, sched_yield / sched_yield_to, readdir / readdir_at, proclist,
+    statfs, mountlist, spawn_limits, fsync (`lstat` sits with `stat` in `band_fs.cyr`, `icmp_echo_ex` /
+    `sock_peer` in `band_net.cyr`).
 - `src/seccomp.cyr` — M3 bounding seccomp: a classic-BPF allowlist of the
   translation's output syscalls, installed on the child (default-on in run mode).
 - `src/limits.cyr` — 0.6.0 host-resource bounds: kernel-enforced child rlimits
@@ -298,7 +313,8 @@ paths in the child red zone + repack output structs at the exit stop
   0–61's disposition) + the pure net helpers/egress policy (1.1.0) + net_config parsers (1.3.0) +
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
-  **440 assertions**, hermetic)
+  the 1.13.0 re-sync helpers (`resync-1.13.0`: `rd_name_keep`, `icmp_ex_timeout_ms`, the process name, the
+  proclist record, the yield authority); **533 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -394,6 +410,13 @@ paths in the child red zone + repack output structs at the exit stop
   - The probe, length and dead-conn order.
   - A 250 ms ceiling answering 0 on time against a peer that stops reading.
   - The stdlib's own socket write delivering with no ENOSYS line.
+- `scripts/it/resync.sh` — 1.13.0 re-sync gate (after edges):
+  - Unconfined: every answer and record layout of klug / sched_yield / readdir / readdir_at / proclist /
+    sched_yield_to / lstat / statfs / mountlist / spawn_limits / fsync, with a spawned child seen in
+    `proclist` and by `sched_yield_to` from both sides; no ENOSYS line.
+  - Under `--root`: `..`, an absolute symlink and an escape link clamped for the listings, `lstat` / `stat`
+    and `statfs`.
+  - Under `--net`: `sock_peer`, and `icmp_echo_ex` (SKIPs without unprivileged ICMP).
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 

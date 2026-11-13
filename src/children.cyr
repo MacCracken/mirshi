@@ -19,8 +19,8 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
     # that flipping spawn#3 to EMULATE reopens (deliberately NOT
     # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 184;       # 23 x i64 fields (v1.7.0 grew it by 3: epoll / timerfd / pipe tables;
-    # 1.12.1 by 1: the console_mode#110 CM_NOSERIAL cell)
+    CHILD_REC_SIZE = 216;       # 23 x i64 fields + a 32-byte name (v1.7.0 grew it by 3: epoll / timerfd /
+    # pipe tables; 1.12.1 by 1: the CM_NOSERIAL cell; 1.13.0 by the name)
     # --- v1.6.0 signalfd#18 constants ---
     SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
     # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
@@ -63,11 +63,18 @@ enum MirshiChild {
     # keeps it in the process's slot (proc_con_noser), so it dies with the
     # process and a spawned child starts without it. mirshi has no serial
     # mirror, so the bit changes no output — it is only reported back.
+    C_NAME = 184;              # 1.13.0: the program's basename (<= 31 bytes + NUL, NUL-padded to 32), for proclist#99
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
     CS_BLOCKED = 2;            # parked in waitpid#4 (left stopped at its enter-stop)
     CS_EXITED = 3;             # exited; exit_code retained until reaped
+    # --- 1.13.0 proclist#99: the kernel's record `state` values (agnos-userland-abi §4.9) ---
+    PL_STATE_READY = 1;        # a live process that is not the caller
+    PL_STATE_RUNNING = 2;      # the caller itself (the one process on a CPU while it asks)
+    PL_STATE_BLOCKED = 6;      # blocked in a kernel wait (mirshi: parked in waitpid#4 / execwait#37)
+    PL_STATE_ZOMBIE = 7;       # exited, not yet reaped by its parent
+    PL_REC_SIZE = 64;          # one proclist record
     SPAWN_ELF_MAX = 8388608;   # 8 MB spawn#3 ELF read cap — matches lib/process_agnos.cyr's
     # _AGNOS_ELF_MAX (the agnos-side spawn helper's own read buffer)
     # --- v1.7.0 I/O-multiplexing (epoll #19-21 / timerfd #22-23 / pipe #25) ---
@@ -108,6 +115,69 @@ fn _spawn_size_ok(size): i64 {
     if (size <= 0) { return 0; }
     if (size > SPAWN_ELF_MAX) { return 0; }
     return 1;
+}
+
+# Record `path`'s basename as the process name (1.13.0, proclist#99): the bytes after the last '/', at most
+# 31, NUL-padded to 32 — what the kernel's ELF loader records. Pure over the record.
+fn _child_set_name(rec, path): i64 {
+    var z = 0;
+    while (z < 32) { store64(rec + C_NAME + z, 0); z = z + 8; }
+    if (path == 0) { return 0; }
+    var base = path;
+    var p = path;
+    while (load8(p) != 0) {
+        if (load8(p) == 47) { base = p + 1; }
+        p = p + 1;
+    }
+    var i = 0;
+    while (i < 31) {
+        var c = load8(base + i);
+        if (c == 0) { return 0; }
+        store8(rec + C_NAME + i, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# proclist#99's `state` for record `b` (1.13.0): 2 for the caller, 1 for another live process, 6 for one
+# parked in waitpid#4 / execwait#37, 7 for an exited, unreaped one; 0 for a FREE slot (not listed). Pure.
+fn _child_pl_state(b, caller): i64 {
+    var st = load64(b + C_STATE);
+    if (st == CS_FREE) { return 0; }
+    if (b == caller) { return PL_STATE_RUNNING; }
+    if (st == CS_BLOCKED) { return PL_STATE_BLOCKED; }
+    if (st == CS_EXITED) { return PL_STATE_ZOMBIE; }
+    return PL_STATE_READY;
+}
+
+# Fill the 64-byte proclist#99 record at `rec` from child record `b` (1.13.0): +0 pid, +8 state, +16 ppid,
+# +24 the 32-byte NUL-padded name, +56 0 (the kernel's "neither cpu ticks nor rss present"). Pure.
+fn _child_pl_fill(rec, b, caller): i64 {
+    store64(rec + 0, load64(b + C_AGNOS_PID));
+    store64(rec + 8, _child_pl_state(b, caller));
+    store64(rec + 16, load64(b + C_PARENT));
+    var k = 0;
+    while (k < 32) { store64(rec + 24 + k, load64(b + C_NAME + k)); k = k + 8; }
+    store64(rec + 56, 0);
+    return 0;
+}
+
+# sched_yield_to#108's authority (1.13.0, the kernel's yt_auth_ok): 1 when the caller (record `caller`) may
+# name agnos pid `t` — itself, a live (RUNNING / BLOCKED) direct child, or its live direct parent — else 0.
+# pid 0 and the root's parent (0) have no record, so they are refused. Pure over the table.
+fn _child_yield_ok(caller, t): i64 {
+    var me = load64(caller + C_AGNOS_PID);
+    if (t == me) { return 1; }
+    var r = _child_find_by_agnos(t);
+    if (r == 0) { return 0; }
+    var st = load64(r + C_STATE);
+    var live = 0;
+    if (st == CS_RUNNING) { live = 1; }
+    if (st == CS_BLOCKED) { live = 1; }
+    if (live == 0) { return 0; }
+    if (load64(r + C_PARENT) == me) { return 1; }
+    if (load64(caller + C_PARENT) == t) { return 1; }
+    return 0;
 }
 
 # Number of records in use (not FREE) — the live-process count spawn#3 checks BEFORE forking a new
@@ -309,6 +379,8 @@ fn _child_alloc(hpid, parent_apid): i64 {
             # 1.12.3: the slot keeps its net / signalfd / epoll / timerfd tables. _child_release emptied
             # them when the previous holder died, so they are reused instead of allocated again.
             store64(b + C_CON_NOSER, 0);        # 1.12.1: a new process starts without CM_NOSERIAL
+            var nz = 0;
+            while (nz < 32) { store64(b + C_NAME + nz, 0); nz = nz + 8; }   # 1.13.0: no name until one is set
             return b;
         }
         i = i + 1;

@@ -4,6 +4,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-12
+
+The agnos ABI re-sync, the cheap band: thirteen agnos numbers that fell to `ENOSYS` (-1 and a stderr line)
+now answer as the kernel at agnos `aef48206` (1.57.19) does. Every one is a different Linux call, so each
+is emulated in the supervisor or renumbered, never passed through
+([ADR 0019](docs/adr/0019-abi-resync-cheap-band-supervisor-side.md)).
+
+### Added
+
+- **Directory listings** (`src/band_resync.cyr`), supervisor-side:
+  - `readdir#81(path, buf, max)` reads the NUL-terminated path from its 256-byte window (all of it
+    readable, a NUL inside, else -1), then answers 0 for `max` <= 0, -1 above 16777216, -2 when nothing
+    is there (the empty path included) and -4 for a non-directory.
+  - It writes the kernel's 64-byte records: the name cut to at most 62 bytes on a UTF-8 boundary
+    (`rd_name_keep`), a NUL, zeros, and byte 63 = `RD_DIR` | `RD_CUT`. `.` and `..` are skipped; a
+    `DT_UNKNOWN` entry is asked with `newfstatat` (no-follow), so a symlink is never `RD_DIR`.
+  - `readdir_at#101(path, buf, max, &cursor)` resumes from the cursor: a spent budget parks it on the
+    record not taken, the end stores -1, a negative cursor is a no-op. The cursor is the host's `d_off`
+    cookie, opaque to the caller; -5 is never answered.
+  - Under `--root` the directory opens with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` on the
+    supervisor's root anchor, so `..`, absolute symlinks and escape links stay inside the root.
+- **`lstat#102`**: `stat#33` without following the final symlink — Linux `lstat` (6) unconfined, the
+  confined `stat` with `O_NOFOLLOW` under `--root`. The `stat` path is now shared (`_m2_stat_enter`,
+  `_cf_stat_how`).
+- **`statfs#103`**: the kernel's 32-byte record (bsize from `f_frsize`, else `f_bsize`; blocks; bfree;
+  bavail) from Linux `statfs`, or `fstatfs` on the path opened inside the root. The path is read as
+  `stat`'s is (`_m2_read_path`, split out of `_cf_read_path`).
+- **`mountlist#104`**: one 80-byte record, ext2 `"/"`. The host's mount table is never read.
+- **`proclist#99`**: one 64-byte record per process in mirshi's table (pid, state 2/1/6/7, ppid, the name,
+  0 at +56). Child records gain a 32-byte name (`C_NAME`, `CHILD_REC_SIZE` 216): the basename of the
+  target, and of `execwait#37` / `spawn_path#43`'s path.
+- **`sched_yield#44`** (0) and **`sched_yield_to#108`** (0 for self, a live direct child or the live
+  direct parent, else -1 — the kernel's `yt_auth_ok`).
+- **`klug#36`** (0 bytes: mirshi keeps no agnos log; -1 for `len` < 0) and **`spawn_limits#107`** (-1, the
+  kernel's "not supported", until the process band enforces the caps in 1.13.2).
+- **`fsync#115`**: -1 for fd outside [0, 32), otherwise Linux `fsync` (74) in the child.
+- **Net band** (`src/band_net.cyr`, under `--net`): `icmp_echo_ex#100(dst_ip, timeout_ms)` is `icmp_echo#55`
+  with the caller's wait (`icmp_ex_timeout_ms`: <= 0 is the 3 s default, at most 60 s; `_net_icmp` became
+  `_net_icmp_t`), and `sock_peer#106(conn_id)` answers `(peer_ip << 16) | peer_port` for one of the
+  caller's live connections (`getpeername`), else -1.
+- The child seccomp allowlist gains `lstat` (6) and `fsync` (74).
+- Names, arities and pointer masks for the thirteen numbers in `src/decode.cyr`.
+
+### Tests
+
+- `cyrius test` 533/0: the new names and shapes, `agnos_to_linux_nr` = -1 for all thirteen, `rd_name_keep`
+  (the 62-byte cut never splits a 2-, 3- or 4-byte character), `icmp_ex_timeout_ms`, `_child_set_name`, the
+  proclist record (`_child_pl_state` / `_child_pl_fill`) and the yield authority (`_child_yield_ok`).
+- New gate `scripts/it/resync.sh` (in CI): agnos fixtures with raw syscall numbers check every answer and
+  record layout above, a spawned child seen in `proclist` and by `sched_yield_to` from both sides, the
+  same calls under `--root`, and the net pair under `--net` (the ICMP part SKIPs without unprivileged
+  ping); no `ENOSYS` line for any of them.
+
 ## [1.12.3] - 2026-11-12
 
 The P(-1) sweep: a whole-tree review against the agnos kernel at `aef48206` (1.57.19), with its repairs.

@@ -43,15 +43,22 @@ fn _m2_two_path(pid, regs, lnr): i64 {
 var _sup_rootfd = 0 - 1;        # the supervisor's own O_PATH root anchor (opened in intercept_run)
 var _cf_path2 = 0;              # second path buffer for rename / link (PATH_MAX + 8)
 
-# Read the agnos path (ptr, len) from the child into `buf` and make it root-relative (sanitize_rootrel).
-# 0, or -1 for len < 1, len > PATH_MAX, an unreadable pointer, an interior NUL (the kernel looks up all
-# `len` bytes, where Linux would stop at the NUL), or a `..` component.
-fn _cf_read_path(pid, ptr, len, buf): i64 {
+# Read the agnos path (ptr, len) from the child into `buf`, NUL-terminated, as the kernel's path ingress
+# takes it: 0, or -1 for len < 1, len > PATH_MAX, an unreadable pointer, or an interior NUL (the kernel
+# looks up all `len` bytes, where Linux would stop at the NUL). 1.13.0: split out of _cf_read_path for the
+# supervisor-side calls that also run unconfined (statfs#103).
+fn _m2_read_path(pid, ptr, len, buf): i64 {
     if (len < 1) { return 0 - 1; }
     if (len > PATH_MAX) { return 0 - 1; }
     if (pvm_read(pid, ptr, buf, len) != len) { return 0 - 1; }
     if (path_has_nul(buf, len) == 1) { return 0 - 1; }
     store8(buf + len, 0);
+    return 0;
+}
+
+# _m2_read_path, then made root-relative (sanitize_rootrel) for a confined op.
+fn _cf_read_path(pid, ptr, len, buf): i64 {
+    if (_m2_read_path(pid, ptr, len, buf) < 0) { return 0 - 1; }
     if (sanitize_rootrel(buf) < 0) { return 0 - 1; }
     return 0;
 }
@@ -135,10 +142,13 @@ fn _cf_two(pid, regs, atnr): i64 {
 
 # stat#33(path, pathlen, statbuf48): stat follows the final symlink, so the whole path is resolved in
 # the root (openat2 O_PATH), fstat'd, repacked to the agnos 48 B struct and written to the caller.
-fn _cf_stat(pid, regs): i64 {
+# lstat#102 (1.13.0) is the same call with `flags` = O_NOFOLLOW: O_PATH | O_NOFOLLOW opens a final
+# symlink itself, so the fstat describes the link (mid-path symlinks still resolve, inside the root).
+fn _cf_stat(pid, regs): i64 { return _cf_stat_how(pid, regs, 0); }
+fn _cf_stat_how(pid, regs, flags): i64 {
     _m2_init();
     if (_cf_read_path(pid, decode_arg(regs, 0), decode_arg(regs, 1), _m2_pathbuf) < 0) { return _net_emu(pid, regs, 0 - 1); }
-    var fd = _cf_open_in_root(_m2_pathbuf, 0);
+    var fd = _cf_open_in_root(_m2_pathbuf, flags);
     if (fd < 0) { return _net_emu(pid, regs, 0 - 1); }
     var r = syscall(SYS_FSTAT, fd, _m2_linbuf);
     syscall(HOST_CLOSE, fd);
@@ -168,7 +178,23 @@ fn _cf_readlink(pid, regs): i64 {
     return _net_emu(pid, regs, n);
 }
 
-# EXIT-stop: stat#33 — the kernel wrote a Linux 144 B struct into the red-zone
+# ENTER-stop, unconfined: stat#33(path, pathlen, statbuf48) -> Linux stat(path, statbuf144), or lstat#102
+# (1.13.0) -> Linux lstat (6), the same with the final symlink not followed. `lnr` is the Linux number.
+# The exit stop (_m2_stat_exit) repacks the 144 B Linux struct into the saved agnos 48 B statbuf.
+fn _m2_stat_enter(pid, regs, lnr): i64 {
+    var sps = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+      load64(regs + REG_RSP) - RED_ZONE);
+    if (sps < 0) { return _m2_fail(pid, regs); }
+    _m2_scratch = (sps - 144) & (0 - 8);     # 144 B Linux statbuf, below the path
+    _m2_out_ptr = decode_arg(regs, 2);       # the agnos 48 B statbuf (for the exit repack)
+    store64(regs + REG_RDI, sps);
+    store64(regs + REG_RSI, _m2_scratch);
+    store64(regs + REG_ORIG_RAX, lnr);
+    pt(PTRACE_SETREGS, pid, 0, regs);
+    return STRAT_EXECUTE;
+}
+
+# EXIT-stop: stat#33 / lstat#102 — the kernel wrote a Linux 144 B struct into the red-zone
 # scratch; pull it out, repack to the agnos 48 B layout, write into the child's
 # saved statbuf. Returns the agnos return (0 ok / -1 on stat error or short copy).
 fn _m2_stat_exit(pid, lret): i64 {
@@ -213,6 +239,7 @@ fn _m2_pipe_exit(pid, lret): i64 {
 # repack; everything else just maps the Linux return to the agnos convention.
 fn fs_exit_return(pid, agnos_nr, lret): i64 {
     if (agnos_nr == 33) { return _m2_stat_exit(pid, lret); }
+    if (agnos_nr == 102) { return _m2_stat_exit(pid, lret); }    # 1.13.0 lstat: the same 48 B repack
     if (agnos_nr == 29) { return _m2_getdents_exit(pid, lret); }
     if (agnos_nr == 25) { return _m2_pipe_exit(pid, lret); }
     return linux_ret_to_agnos(agnos_nr, lret);

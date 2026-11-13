@@ -80,6 +80,8 @@ fn _bound_allowlist(buf): i64 {
     # (dispatch.cyr _cf_*), so mkdirat/unlinkat/renameat2/linkat/newfstatat/readlinkat left this list,
     # and so did getpid (39): getpid#2 has been EMULATE since v1.5.0.
     n = _allow(buf, n, 89);     # readlink    (readlink#70 unconfined)
+    n = _allow(buf, n, 6);      # lstat       (1.13.0: lstat#102 unconfined)
+    n = _allow(buf, n, 74);     # fsync       (1.13.0: fsync#115 runs execute-in-child)
     # The child's own exec/teardown (NOT rewritten by mirshi — they run before the
     # PTRACE_SYSCALL loop / on the execve-failure path):
     n = _allow(buf, n, 59);     # execve  (the initial image load)
@@ -98,7 +100,7 @@ fn _bound_allowlist(buf): i64 {
 fn apply_child_bound(): i64 {
     sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    var allow = alloc(8 * 64);   # headroom: na=34 now; grows with the translation set
+    var allow = alloc(8 * 64);   # headroom: na=28 now (1.13.0); grows with the translation set
     if (allow == 0) { return 0 - 1; }                   # fail-closed: caller aborts the child
     var na = _bound_allowlist(allow);
 

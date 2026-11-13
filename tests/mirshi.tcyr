@@ -29,8 +29,20 @@ fn main() {
     assert_streq(agnos_nr_name(109), "sock_send_dl", "nr 109 = sock_send_dl (NOT Linux setpgid)");
     assert_streq(agnos_nr_name(110), "console_mode", "nr 110 = console_mode (NOT Linux getppid)");
     assert_streq(agnos_nr_name(111), "fd_kind", "nr 111 = fd_kind (NOT Linux getpgrp)");
-    assert_streq(agnos_nr_name(36), "unknown", "nr 36 (klug) = unknown (not handled yet)");
-    assert_streq(agnos_nr_name(99), "unknown", "nr 99 = unknown (out of surface)");
+    assert_streq(agnos_nr_name(36), "klug", "nr 36 = klug (1.13.0; NOT Linux getitimer)");
+    assert_streq(agnos_nr_name(44), "sched_yield", "nr 44 = sched_yield (1.13.0; NOT Linux sendto)");
+    assert_streq(agnos_nr_name(81), "readdir", "nr 81 = readdir (1.13.0; NOT Linux fchdir)");
+    assert_streq(agnos_nr_name(99), "proclist", "nr 99 = proclist (1.13.0; NOT Linux sysinfo)");
+    assert_streq(agnos_nr_name(100), "icmp_echo_ex", "nr 100 = icmp_echo_ex (1.13.0; NOT Linux times)");
+    assert_streq(agnos_nr_name(101), "readdir_at", "nr 101 = readdir_at (1.13.0; NOT Linux ptrace)");
+    assert_streq(agnos_nr_name(102), "lstat", "nr 102 = lstat (1.13.0; NOT Linux getuid)");
+    assert_streq(agnos_nr_name(103), "statfs", "nr 103 = statfs (1.13.0; NOT Linux syslog)");
+    assert_streq(agnos_nr_name(104), "mountlist", "nr 104 = mountlist (1.13.0; NOT Linux getgid)");
+    assert_streq(agnos_nr_name(106), "sock_peer", "nr 106 = sock_peer (1.13.0; NOT Linux setgid)");
+    assert_streq(agnos_nr_name(107), "spawn_limits", "nr 107 = spawn_limits (1.13.0; NOT Linux geteuid)");
+    assert_streq(agnos_nr_name(108), "sched_yield_to", "nr 108 = sched_yield_to (1.13.0; NOT Linux getegid)");
+    assert_streq(agnos_nr_name(115), "fsync", "nr 115 = fsync (1.13.0; NOT Linux getgroups)");
+    assert_streq(agnos_nr_name(105), "unknown", "nr 105 = unknown (out of surface)");
 
     # --- register extraction from a synthetic user_regs_struct -------------
     # Catches the two classic ptrace bugs: reading rax (not orig_rax) for the
@@ -64,6 +76,32 @@ fn main() {
     assert_eq(agnos_ptrmask(1), 2, "write buf is arg1");
     assert_eq(agnos_ptrmask(33), 5, "stat path+statbuf are arg0+arg2");
     assert_eq(agnos_ptrmask(2), 0, "getpid has no pointer args");
+    # 1.13.0 — the re-sync band's shapes
+    assert_eq(agnos_argc(36), 2, "klug arity 2");
+    assert_eq(agnos_argc(44), 0, "sched_yield arity 0");
+    assert_eq(agnos_argc(81), 3, "readdir arity 3");
+    assert_eq(agnos_argc(99), 2, "proclist arity 2");
+    assert_eq(agnos_argc(100), 2, "icmp_echo_ex arity 2");
+    assert_eq(agnos_argc(101), 4, "readdir_at arity 4 (&cursor a4=r10)");
+    assert_eq(agnos_argc(102), 3, "lstat arity 3");
+    assert_eq(agnos_argc(103), 3, "statfs arity 3");
+    assert_eq(agnos_argc(104), 2, "mountlist arity 2");
+    assert_eq(agnos_argc(106), 1, "sock_peer arity 1");
+    assert_eq(agnos_argc(107), 2, "spawn_limits arity 2");
+    assert_eq(agnos_argc(108), 1, "sched_yield_to arity 1");
+    assert_eq(agnos_argc(115), 1, "fsync arity 1");
+    assert_eq(agnos_ptrmask(36), 1, "klug buf is arg0");
+    assert_eq(agnos_ptrmask(81), 3, "readdir path+buf are arg0+arg1");
+    assert_eq(agnos_ptrmask(99), 1, "proclist buf is arg0");
+    assert_eq(agnos_ptrmask(101), 11, "readdir_at path+buf+cursor are arg0+arg1+arg3");
+    assert_eq(agnos_ptrmask(102), 5, "lstat path+statbuf are arg0+arg2");
+    assert_eq(agnos_ptrmask(103), 5, "statfs path+buf are arg0+arg2");
+    assert_eq(agnos_ptrmask(104), 1, "mountlist buf is arg0");
+    assert_eq(agnos_ptrmask(100), 0, "icmp_echo_ex has no pointer args");
+    assert_eq(agnos_ptrmask(106), 0, "sock_peer has no pointer args");
+    assert_eq(agnos_ptrmask(107), 0, "spawn_limits has no pointer args");
+    assert_eq(agnos_ptrmask(108), 0, "sched_yield_to has no pointer args");
+    assert_eq(agnos_ptrmask(115), 0, "fsync has no pointer args");
 
     # --- full event formatting (the same lines the golden IT asserts) ------
     test_group("format");
@@ -74,8 +112,10 @@ fn main() {
     assert_streq(line, "write#1(1, <ptr>, 2)", "format write (buf hermetic)");
     format_event(line, 0, 0, 0, 0, 0);
     assert_streq(line, "exit#0(0)", "format exit");
-    format_event(line, 99, 0, 0, 0, 0);
-    assert_streq(line, "unknown#99()", "format unknown number");
+    format_event(line, 1000, 0, 0, 0, 0);
+    assert_streq(line, "unknown#1000()", "format unknown number");
+    format_event(line, 101, 0x3000, 0x4000, 8, 0x5000);
+    assert_streq(line, "readdir_at#101(<ptr>, <ptr>, 8, <ptr>)", "format readdir_at (a4 pointer hermetic)");
 
     # --- M1 pure translation contract -------------------------------------
     # agnos# -> Linux# remap (the direct-pass / execute-in-child family).
@@ -90,7 +130,7 @@ fn main() {
     assert_eq(agnos_to_linux_nr(46), 201, "time_unix 46->201");
     assert_eq(agnos_to_linux_nr(40), 0 - 1, "uptime_ms 40 -> no peer (emulated)");
     assert_eq(agnos_to_linux_nr(41), 0 - 1, "sleep_ms 41 -> no peer (emulated)");
-    assert_eq(agnos_to_linux_nr(99), 0 - 1, "unknown 99 -> no peer");
+    assert_eq(agnos_to_linux_nr(99), 0 - 1, "proclist 99 -> no peer (1.13.0: EMULATE at the dispatcher; Linux #99 is sysinfo)");
 
     # mmap 2 MB round-up (the load-bearing arithmetic — off by a granule = segfault).
     test_group("xlat-mmap-round");
@@ -223,13 +263,13 @@ fn main() {
     assert_eq(agnos_to_linux_nr(26), 0 - 1, "write_boot_checkpoint#26 -> ENOSYS");
     assert_eq(agnos_to_linux_nr(34), 0 - 1, "uname#34 -> no peer (v1.8.0: EMULATE, agnos-native struct)");
     assert_eq(agnos_to_linux_nr(35), 0 - 1, "sysinfo#35 -> no peer (v1.8.0: EMULATE, agnos-native struct)");
-    assert_eq(agnos_to_linux_nr(36), 0 - 1, "klug#36 -> ENOSYS (not handled yet: the 1.13.0 re-sync)");
+    assert_eq(agnos_to_linux_nr(36), 0 - 1, "klug#36 -> no peer (1.13.0: EMULATE 0, no agnos log; Linux #36 is getitimer)");
     assert_eq(agnos_to_linux_nr(37), 0 - 1, "execwait#37 -> no peer (v1.10.0: EMULATE at the loop level, spawn-from-path + park)");
     assert_eq(agnos_to_linux_nr(38), 0 - 1, "fbinfo#38 -> ENOSYS (a hardware band: the 1.x decision)");
     assert_eq(agnos_to_linux_nr(39), 0 - 1, "blit#39 -> ENOSYS (a hardware band: the 1.x decision)");
     assert_eq(agnos_to_linux_nr(42), 0 - 1, "kbscan#42 -> no peer (v1.11.0: EMULATE at the dispatcher)");
     assert_eq(agnos_to_linux_nr(43), 0 - 1, "spawn_path#43 -> no peer (v1.10.1: EMULATE at the loop level, spawn-from-path async)");
-    assert_eq(agnos_to_linux_nr(44), 0 - 1, "sched_yield#44 -> ENOSYS (not handled yet: the 1.13.0 re-sync)");
+    assert_eq(agnos_to_linux_nr(44), 0 - 1, "sched_yield#44 -> no peer (1.13.0: EMULATE 0; Linux #44 is sendto)");
     assert_eq(agnos_to_linux_nr(47), 0 - 1, "sock_connect#47 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(48), 0 - 1, "sock_send#48 -> ENOSYS (net band)");
     assert_eq(agnos_to_linux_nr(49), 0 - 1, "sock_recv#49 -> ENOSYS (net band)");
@@ -250,6 +290,17 @@ fn main() {
     assert_eq(agnos_to_linux_nr(110), 0 - 1, "console_mode#110 -> no peer (v1.12.1: EMULATE; Linux #110 is getppid)");
     assert_eq(agnos_to_linux_nr(111), 0 - 1, "fd_kind#111 -> no peer (v1.12.1: EMULATE; Linux #111 is getpgrp)");
     assert_eq(agnos_to_linux_nr(1000), 0 - 1, "far out-of-range -> ENOSYS");
+    # 1.13.0: every re-sync number is a different Linux call, so none is a pass-through renumber
+    assert_eq(agnos_to_linux_nr(81), 0 - 1, "readdir#81 -> no peer (supervisor-side; Linux #81 is fchdir)");
+    assert_eq(agnos_to_linux_nr(100), 0 - 1, "icmp_echo_ex#100 -> no peer (net band; Linux #100 is times)");
+    assert_eq(agnos_to_linux_nr(101), 0 - 1, "readdir_at#101 -> no peer (supervisor-side; Linux #101 is ptrace)");
+    assert_eq(agnos_to_linux_nr(102), 0 - 1, "lstat#102 -> no peer (staged to Linux lstat 6 at the dispatcher)");
+    assert_eq(agnos_to_linux_nr(103), 0 - 1, "statfs#103 -> no peer (supervisor-side; Linux #103 is syslog)");
+    assert_eq(agnos_to_linux_nr(104), 0 - 1, "mountlist#104 -> no peer (EMULATE; Linux #104 is getgid)");
+    assert_eq(agnos_to_linux_nr(106), 0 - 1, "sock_peer#106 -> no peer (net band; Linux #106 is setgid)");
+    assert_eq(agnos_to_linux_nr(107), 0 - 1, "spawn_limits#107 -> no peer (EMULATE -1; Linux #107 is geteuid)");
+    assert_eq(agnos_to_linux_nr(108), 0 - 1, "sched_yield_to#108 -> no peer (EMULATE; Linux #108 is getegid)");
+    assert_eq(agnos_to_linux_nr(115), 0 - 1, "fsync#115 -> no peer (renumbered to 74 at the dispatcher after the fd check)");
 
     # --- 1.12.3 edge helpers ---
     test_group("edges-1.12.3");
@@ -669,12 +720,92 @@ fn main() {
     assert_eq(cm_noser_next(0, CM_NOSERIAL, CM_NOSERIAL), 1, "set wins over clear");
     assert_eq(cm_noser_next(1, CM_NOECHO, 0), 1, "other bits leave it alone");
     # the per-process cell lives in the child record and starts clear in every new process
-    assert_eq(C_CON_NOSER + 8, CHILD_REC_SIZE, "C_CON_NOSER is the record's last field");
+    assert_eq(C_CON_NOSER + 8, C_NAME, "the name follows C_CON_NOSER (1.13.0)");
+    assert_eq(C_NAME + 32, CHILD_REC_SIZE, "the 32-byte name is the record's last field");
     _child_reset();
     var cmt = _child_tbl();
     store64(cmt + C_CON_NOSER, 1);                  # a stale cell in a FREE slot
     var cmr = _child_alloc(4242, 0);
     assert_eq(load64(cmr + C_CON_NOSER), 0, "_child_alloc clears CM_NOSERIAL");
+    _child_reset();
+
+    test_group("resync-1.13.0");
+    # rd_name_keep: the kernel's 62-byte name cut, never splitting a UTF-8 character
+    var rn = alloc(80);
+    var ri = 0;
+    while (ri < 80) { store8(rn + ri, 97); ri = ri + 1; }
+    assert_eq(rd_name_keep(rn, 0), 0, "an empty name keeps 0");
+    assert_eq(rd_name_keep(rn, 62), 62, "62 bytes fit whole");
+    assert_eq(rd_name_keep(rn, 63), 62, "63 ASCII bytes cut to 62");
+    assert_eq(rd_name_keep(rn, 255), 62, "255 ASCII bytes cut to 62");
+    store8(rn + 61, 0xC3); store8(rn + 62, 0xA9);   # a 2-byte character across the cut (bytes 61..62)
+    assert_eq(rd_name_keep(rn, 70), 61, "a 2-byte character at the cut is dropped whole");
+    store8(rn + 60, 0xE2); store8(rn + 61, 0x82); store8(rn + 62, 0xAC);   # a 3-byte character at 60..62
+    assert_eq(rd_name_keep(rn, 70), 60, "a 3-byte character at the cut is dropped whole");
+    store8(rn + 59, 0xF0); store8(rn + 60, 0x9F); store8(rn + 61, 0x98); store8(rn + 62, 0x80);
+    assert_eq(rd_name_keep(rn, 70), 59, "a 4-byte character at the cut is dropped whole (3 continuations)");
+    store8(rn + 62, 0x41);
+    assert_eq(rd_name_keep(rn, 70), 62, "an ASCII byte at the cut keeps 62");
+    # icmp_echo_ex's timeout: <= 0 is the 3 s default, clamped to 60 s
+    assert_eq(icmp_ex_timeout_ms(0), 3000, "0 -> the 3 s default");
+    assert_eq(icmp_ex_timeout_ms(0 - 5), 3000, "< 0 -> the 3 s default");
+    assert_eq(icmp_ex_timeout_ms(1), 1, "1 ms is kept");
+    assert_eq(icmp_ex_timeout_ms(250), 250, "250 ms is kept");
+    assert_eq(icmp_ex_timeout_ms(60000), 60000, "exactly 60 s");
+    assert_eq(icmp_ex_timeout_ms(60001), 60000, "> 60 s -> 60 s");
+    # the process name (proclist#99): the basename, at most 31 bytes, NUL-padded to 32
+    _child_reset();
+    var nr0 = _child_alloc(5001, 0);
+    assert_eq(load64(nr0 + C_NAME), 0, "a new record has no name");
+    _child_set_name(nr0, "/usr/bin/agnsh");
+    assert_streq(nr0 + C_NAME, "agnsh", "the basename after the last /");
+    _child_set_name(nr0, "plain");
+    assert_streq(nr0 + C_NAME, "plain", "no / -> the whole path");
+    assert_eq(load8(nr0 + C_NAME + 5), 0, "...and the rest is NUL");
+    _child_set_name(nr0, "/d/abcdefghijklmnopqrstuvwxyz0123456789");
+    assert_eq(strlen(nr0 + C_NAME), 31, "a long name is cut to 31 bytes");
+    assert_eq(load8(nr0 + C_NAME + 31), 0, "...leaving the NUL");
+    _child_set_name(nr0, "/a/b/");
+    assert_eq(load8(nr0 + C_NAME), 0, "a trailing / -> an empty name");
+    _child_set_name(nr0, 0);
+    assert_eq(load64(nr0 + C_NAME + 24), 0, "no path -> an empty name");
+    # proclist#99 records: state per caller / RUNNING / BLOCKED / EXITED, ppid, name, +56 = 0
+    _child_reset();
+    var pr1 = _child_alloc(5101, 0);                 # agnos pid 1 (the caller)
+    var pr2 = _child_alloc(5102, 1);                 # pid 2, a child of 1
+    var pr3 = _child_alloc(5103, 1);                 # pid 3, parked
+    var pr4 = _child_alloc(5104, 2);                 # pid 4, exited
+    store64(pr3 + C_STATE, CS_BLOCKED);
+    store64(pr4 + C_STATE, CS_EXITED);
+    _child_set_name(pr2, "/bin/kriya");
+    assert_eq(_child_pl_state(pr1, pr1), 2, "the caller is 2 (running)");
+    assert_eq(_child_pl_state(pr2, pr1), 1, "another live process is 1 (ready)");
+    assert_eq(_child_pl_state(pr3, pr1), 6, "a parked waiter is 6 (blocked)");
+    assert_eq(_child_pl_state(pr4, pr1), 7, "an unreaped exited one is 7 (zombie)");
+    assert_eq(_child_pl_state(pr3, pr3), 2, "a caller is 2 even in a parked state");
+    var prec = alloc(64);
+    var pz = 0;
+    while (pz < 64) { store64(prec + pz, 0 - 1); pz = pz + 8; }
+    _child_pl_fill(prec, pr2, pr1);
+    assert_eq(load64(prec + 0), 2, "+0 pid");
+    assert_eq(load64(prec + 8), 1, "+8 state");
+    assert_eq(load64(prec + 16), 1, "+16 ppid");
+    assert_streq(prec + 24, "kriya", "+24 name");
+    assert_eq(load8(prec + 24 + 31), 0, "the name field is NUL-padded");
+    assert_eq(load64(prec + 56), 0, "+56 = 0 (neither cpu ticks nor rss)");
+    # sched_yield_to#108's authority: self, a live direct child, the live direct parent
+    assert_eq(_child_yield_ok(pr1, 1), 1, "self -> ok");
+    assert_eq(_child_yield_ok(pr1, 2), 1, "a running direct child -> ok");
+    assert_eq(_child_yield_ok(pr1, 3), 1, "a blocked direct child -> ok");
+    assert_eq(_child_yield_ok(pr2, 1), 1, "the direct parent -> ok");
+    assert_eq(_child_yield_ok(pr2, 4), 0, "an exited child -> refused");
+    assert_eq(_child_yield_ok(pr1, 4), 0, "a grandchild -> refused");
+    assert_eq(_child_yield_ok(pr2, 3), 0, "a sibling -> refused");
+    assert_eq(_child_yield_ok(pr1, 0), 0, "pid 0 (the root's parent) -> refused");
+    assert_eq(_child_yield_ok(pr1, 99), 0, "an unknown pid -> refused");
+    assert_eq(_child_yield_ok(pr1, 0 - 1), 0, "a negative pid -> refused");
+    store64(pr1 + C_STATE, CS_EXITED);
+    assert_eq(_child_yield_ok(pr2, 1), 0, "an exited parent -> refused");
     _child_reset();
 
     test_group("send-dl");

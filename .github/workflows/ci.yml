@@ -285,6 +285,14 @@ jobs:
         # zero lengths, fd ranges, an interior NUL, a too-small buffer) answer as the agnos kernel does.
         run: bash scripts/it/edges.sh
 
+      - name: agnos ABI re-sync — the cheap band (v1.13.0)
+        # v1.13.0: 13 agnos calls that fell to ENOSYS. klug / sched_yield / sched_yield_to / readdir / readdir_at /
+        # proclist / lstat / statfs / mountlist / spawn_limits / fsync answer as the kernel does (records, flags,
+        # the readdir_at cursor protocol, a spawned child in proclist), unconfined and under --root (`..` and
+        # links clamped); sock_peer + icmp_echo_ex under --net (the ICMP part SKIPs without unprivileged ping).
+        # python3 for the net part; same-uid ptrace requirement.
+        run: bash scripts/it/resync.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,
