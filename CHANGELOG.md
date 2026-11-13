@@ -4,6 +4,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-11-12
+
+The process environment (agnos 1.57.18): a working directory per process, the kernel's init env, and what a
+spawned child is born with, each checked against the kernel at agnos `aef48206`
+([ADR 0020](docs/adr/0020-process-environment-lexical-cwd-init-env-inherited-fds.md)).
+
+### Added
+
+- **`chdir#112` / `getcwd#113`** (`src/band_cwd.cyr`). The cwd is a per-process string (`C_CWD_LEN` + a
+  4 KiB slot per record). `chdir` stores the cleaned absolute path when it names a directory (a final
+  symlink counts and its own path is kept; inside the root under `--root`); -1 changes nothing. `getcwd`
+  never cuts: a cap below length + 1 is -1 with nothing written.
+- **Relative paths resolve from the caller's cwd**, joined and cleaned lexically as the kernel's
+  `path_clean_join` does (ported to `src/translate.cyr`), at every path ingress: the staged executed calls
+  (`stage_path`), the supervisor-side ones (`_m2_read_path`, readdir's window, the confined `_cf_*` ops)
+  and the program path of `execwait#37` / `spawn_path#43` (at most 255 bytes resolved, else -6).
+  `symlink#63`'s target stays text.
+- **The init env.** The root child and a #37 / #43 child get `HOME=/` and `PWD=<the creator's cwd>`; a
+  #37 / #43 env blob (a3 / a4, validated as `sc_env_blob_ok` does) replaces it, and its first valid `PWD=`
+  seeds the child's cwd. A bad blob falls back to the default, or is -6 in #43's flagged forms. The root
+  child starts in mirshi's own working directory, or at `/` under `--root`.
+
+### Changed
+
+- **A spawned child inherits its creator's fd table** (fds 0..31, via `pidfd_getfd`), for spawn#3, #37 and
+  #43, as on the kernel. Since 1.12.3 children had started with mirshi's fds 0–2 only. `SPAWN_F_CLEANFD`
+  (#43) now keeps 0–2 plus the redirect sources.
+- **`exec_redirect#62` is the kernel's per-process set**: op 0 replaces it, `REDIR_ADD` (0x100 | src) adds or
+  re-points a pair (max 4), `REDIR_CLEAR` (0x200) empties it; src/dst outside [0, 32) and other ops are -1.
+  The pairs apply in arm order (`2>&1`), and every #37 / #43 return clears the set, a failed one included.
+  It was one global pair, consumed only by a successful spawn.
+- **Exec failures are the caller's answer**, learned from a per-spawn status pipe: #43 answers -4 (missing,
+  unreadable or not executable) or -5 (not an image Linux will load), #37 and spawn#3 -1. They used to
+  answer a pid whose `waitpid` was -1. A fork failure in #37 / #43 is -3.
+- `SPAWN_E_*` live in one enum (`src/translate.cyr`); `CHILD_REC_SIZE` is 296.
+
+### Tests
+
+- `cyrius test` 616/0: `path_clean_join`, `env_blob_ok`, `env_first_pwd`, `env_pwd_fits`, `spawn_exec_code`,
+  the cwd slots, the redirect set (`_child_redir_op`), names and shapes for #112 / #113.
+- New gate `scripts/it/procenv.sh` (in CI): the root child's cwd and env, `chdir` / `getcwd`, every
+  relative path call, the #43 env and cwd rules, the exec-failure codes, fd inheritance (CLEANFD, a
+  redirect source, spawn#3), the redirect set in arm order and its consumption, and the same under
+  `--root`.
+
 ## [1.13.0] - 2026-11-12
 
 The agnos ABI re-sync, the cheap band: thirteen agnos numbers that fell to `ENOSYS` (-1 and a stderr line)

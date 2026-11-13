@@ -171,6 +171,130 @@ fn icmp_ex_timeout_ms(t): i64 {
     return t;
 }
 
+# --- 1.13.1: the process environment (agnos 1.57.18 — the working directory, the init env) ---
+enum MirshiProcEnv {
+    CWD_MAX = 4095;             # the kernel's bound on a cwd and on any resolved path (Linux PATH_MAX - the NUL)
+    CWD_SLOT = 4096;            # one cwd string + its NUL
+    ENV_BLOB_MAX = 1024;        # a #37 / #43 env blob: bytes, NULs included
+    ENV_ENTRIES_MAX = 16;       # ...and entries
+    SPAWN_PATH_MAX = 255;       # the loader's cap on a RESOLVED program path (vfs_sec_name_ok)
+    INIT_STR_REGION = 3584;     # the init stack's argv + envp string region (ELF_INIT_STR .. ELF_STACK_SIZE)
+    SPAWN_E_OTHER = 1;          # the #43 failure codes, answered negated (the kernel's SPAWN_E_*)
+    SPAWN_E_NOPROC = 2;         # (1.12.3) the process table is full
+    SPAWN_E_NOMEM = 3;
+    SPAWN_E_NOENT = 4;
+    SPAWN_E_NOEXEC = 5;
+    SPAWN_E_ARGS = 6;           # (1.12.3) bad a2 / path / argv / (flagged forms) env
+}
+
+# The kernel's path_clean_join: the cleaned absolute path of `rel` (rlen bytes) joined to the directory
+# `base` (blen bytes, a normalized absolute path; blen 0 = "/"), written at `dst` and NUL-terminated; its
+# length, or -1 when it would exceed CWD_MAX (refused, never cut). Lexical, as a shell's logical $PWD:
+# empty components and "." vanish, ".." removes the component before it and never climbs above "/", no
+# trailing '/' except "/" itself. A leading '/' in rel is an empty component, so an absolute rel with
+# blen 0 is just cleaned. dst must not alias base or rel. Pure.
+fn path_clean_join(base, blen, rel, rlen, dst): i64 {
+    store8(dst, 47);
+    var o = 1;                                       # bytes in dst; dst[0] is the root's '/'
+    if (blen > 1) {
+        if (blen > CWD_MAX) { return 0 - 1; }
+        memcpy(dst, base, blen);
+        o = blen;
+    }
+    var i = 0;
+    while (i < rlen) {
+        while (i < rlen) { if (load8(rel + i) != 47) { break; } i = i + 1; }
+        var s = i;
+        while (i < rlen) { if (load8(rel + i) == 47) { break; } i = i + 1; }
+        var n = i - s;
+        var skip = 0;
+        if (n == 0) { skip = 1; }
+        if (n == 1) { if (load8(rel + s) == 46) { skip = 1; } }                  # "."
+        if (n == 2) {
+            if (load8(rel + s) == 46) {
+                if (load8(rel + s + 1) == 46) {                                   # "..": drop the last component
+                    skip = 1;
+                    while (o > 1) { if (load8(dst + o - 1) == 47) { break; } o = o - 1; }
+                    if (o > 1) { o = o - 1; }                                     # and its '/', unless the root's
+                }
+            }
+        }
+        if (skip == 0) {
+            var need = o + n;
+            if (o > 1) { need = need + 1; }
+            if (need > CWD_MAX) { return 0 - 1; }
+            if (o > 1) { store8(dst + o, 47); o = o + 1; }
+            memcpy(dst + o, rel + s, n);
+            o = o + n;
+        }
+    }
+    store8(dst + o, 0);
+    return o;
+}
+
+# The kernel's sc_env_blob_ok over a supervisor copy of a #37 / #43 env blob ("KEY=V\0KEY=V\0"): 1 when it
+# ends on a NUL and every non-empty entry has '=' at index >= 1, with 1..16 such entries; else 0. Length
+# limits (1..ENV_BLOB_MAX) are the caller's. Pure.
+fn env_blob_ok(buf, len): i64 {
+    if (len < 1) { return 0; }
+    if (load8(buf + len - 1) != 0) { return 0; }
+    var entries = 0;
+    var i = 0;
+    while (i < len) {
+        var es = i;
+        while (i < len) { if (load8(buf + i) == 0) { break; } i = i + 1; }
+        if (i > es) {
+            var eq = 0;
+            var j = es + 1;
+            while (j < i) { if (load8(buf + j) == 61) { eq = 1; break; } j = j + 1; }
+            if (eq == 0) { return 0; }
+            entries = entries + 1;
+            if (entries > ENV_ENTRIES_MAX) { return 0; }
+        }
+        i = i + 1;
+    }
+    if (entries < 1) { return 0; }
+    return 1;
+}
+
+# The FIRST "PWD=" entry of an env blob (the kernel's spawn_seed_cwd looks at that one only): 1 with the
+# value's offset at out+0 and its length at out+8, or 0 when the blob has none. Pure.
+fn env_first_pwd(buf, len, out): i64 {
+    var i = 0;
+    while (i < len) {
+        var s = i;
+        while (i < len) { if (load8(buf + i) == 0) { break; } i = i + 1; }
+        var n = i - s;
+        i = i + 1;
+        if (n >= 4) {
+            if (load8(buf + s) == 80) { if (load8(buf + s + 1) == 87) { if (load8(buf + s + 2) == 68) { if (load8(buf + s + 3) == 61) {
+                store64(out, s + 4);
+                store64(out + 8, n - 4);
+                return 1;
+            } } } }
+        }
+    }
+    return 0;
+}
+
+# Whether the default env's "PWD=<cwd>" still fits the init stack's string region after `argv_bytes` of
+# argv strings and "HOME=/\0" (the kernel's loader omits the variable rather than cut it). Pure.
+fn env_pwd_fits(argv_bytes, cwd_len): i64 {
+    if (argv_bytes + 7 + 5 + cwd_len < INIT_STR_REGION) { return 1; }
+    return 0;
+}
+
+# The #43 failure code for a failed exec in a spawned grandchild (1.13.1), from the Linux return it saw
+# (-errno): -5 (SPAWN_E_NOEXEC) for an image Linux will not load, -3 for no memory, -4 (SPAWN_E_NOENT: a
+# missing, unreadable or non-regular file) for anything else. Pure.
+fn spawn_exec_code(lret): i64 {
+    if (lret == (0 - 8)) { return SPAWN_E_NOEXEC; }      # ENOEXEC
+    if (lret == (0 - 22)) { return SPAWN_E_NOEXEC; }     # EINVAL (a bad ELF interpreter / layout)
+    if (lret == (0 - 80)) { return SPAWN_E_NOEXEC; }     # ELIBBAD
+    if (lret == (0 - 12)) { return SPAWN_E_NOMEM; }      # ENOMEM
+    return SPAWN_E_NOENT;
+}
+
 fn sanitize_rootrel(buf): i64 {
     # (1.12.3) `..` is kept: every confined path now resolves through openat2 RESOLVE_IN_ROOT,
     # which clamps `..` at the root as the kernel does, instead of being refused here.

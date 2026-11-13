@@ -13,7 +13,8 @@
 ## Where things stand
 
 mirshi handles agnos# 0–63 (except the kernel-only ops), `readlink#70`, `uptime_us#95`, the 1.57.13
-band `#109–#111`, and since 1.13.0 the re-sync's cheap band (`#81`, `#99–#104`, `#106–#108`, `#115`). The
+band `#109–#111`, the re-sync's cheap band (`#81`, `#99–#104`, `#106–#108`, `#115`, 1.13.0) and the working
+directory (`#112` / `#113`, 1.13.1). The
 agnos ABI has kept growing: the kernel at agnos 1.57.19 answers numbers up to **#115**, and the cyrius
 6.7.18 stdlib issues most of them. Everything mirshi does not handle falls to `ENOSYS -> -1` with a stderr
 line. Closing that gap is the rest of the 1.13 line.
@@ -28,8 +29,9 @@ kernel has since made right on its side were dropped:
 
 The 1.12 line is done: 1.12.2 (kernel-fidelity repairs) and 1.12.3 (the P(-1) sweep, findings in
 [`../audit/2026-11-12-audit.md`](../audit/2026-11-12-audit.md)). What the sweep found and did not fix is
-filed below, each under the release it belongs to. 1.13.0 (the cheap band) shipped; its record is the
-CHANGELOG and [ADR 0019](../adr/0019-abi-resync-cheap-band-supervisor-side.md).
+filed below, each under the release it belongs to. 1.13.0 (the cheap band) and 1.13.1 (the process
+environment) shipped; their record is the CHANGELOG and ADRs [0019](../adr/0019-abi-resync-cheap-band-supervisor-side.md)
+and [0020](../adr/0020-process-environment-lexical-cwd-init-env-inherited-fds.md).
 
 **Upstream report, ready to file:** the kernel's `sigprocmask#17` writes `oldset` before it reads `set`,
 so `set == oldset` applies the old mask. mirshi keeps the POSIX order (ADR 0014, *Amendment*). The draft
@@ -43,24 +45,6 @@ The agnos numbers past mirshi's surface. For each one, read its kernel arm first
 EXECUTE (a Linux peer), EMULATE (answer it in the supervisor), or permanent ENOSYS (hardware-only,
 see 1.x).
 
-- **1.13.1 — the process environment.** It goes with `chdir#112` / `getcwd#113` (agnos 1.57.18).
-  - The kernel stages `HOME=/` and `PWD=<the cwd the child is born with>` into every init envp, and a
-    `spawn_path#43` env blob replaces that default.
-  - mirshi passes `[NULL]` for the root child, `spawn#3`, `#37` and `#43`. So `getenv("HOME")` is null
-    under mirshi, and hapi's `$HOME`-scoped verbs cannot run.
-  - Under `--root`, `PWD` and `chdir` must stay inside the rootfs.
-  - The supervisor-side path calls (1.13.0 `readdir#81` / `readdir_at#101` / `statfs#103`, and the
-    confined `_cf_*` ops) resolve a relative path from mirshi's working directory or the root; with
-    `chdir` they must resolve from the caller's.
-  - **`exec_redirect#62`**, from the sweep:
-    - Its arm is one global, where the kernel keeps a set of up to 4 pairs per process.
-    - `REDIR_ADD` (`2>&1`) and `REDIR_CLEAR` (0x200) are not decoded, and src/dst outside [0, 32)
-      are not refused.
-    - The arm is not cleared when a `#37`/`#43` returns early.
-  - **Children of `#37`/`#43` start with fds 0–2 only** (1.12.3). Without `SPAWN_F_CLEANFD` the kernel
-    hands them the caller's table instead.
-  - **`spawn_path#43`/`execwait#37` exec failures** (-4 / -5 on the kernel) answer a pid under mirshi. It
-    needs an exec-status pipe from the grandchild.
 - **1.13.2 — the process band re-sync** (from the sweep). This needs a decision first.
   - **`spawn_limits#107`** answers -1 (1.13.0) until the caps it arms are enforced on the caller's next
     child: a memory cap (`RLIMIT_AS`) and a CPU budget (`RLIMIT_CPU`) in the grandchild before exec.

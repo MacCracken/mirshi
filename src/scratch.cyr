@@ -54,11 +54,16 @@ fn pvm_write(pid, child_addr, local, len): i64 {
     return syscall(SYS_PROCESS_VM_WRITEV, pid, &iov, 1, &iov + 16, 1, 0);
 }
 
-# Stage a NUL-terminated copy of the child's [child_ptr, namelen) path into the
+# Stage a NUL-terminated copy of the child's [child_ptr, namelen) bytes into the
 # child's red zone, ENDING just below `top` (exclusive; `top` is rsp-RED_ZONE for
 # the first slot, or the previous slot's start for a second slot). Returns the
 # 8-aligned scratch address, or -1 on a bad length or a short/failed transfer.
-fn stage_at(pid, child_ptr, namelen, top): i64 {
+# stage_at stages the bytes as they are (symlink#63's target is text); stage_path (1.13.1) stages a PATH
+# the kernel's way — a relative one joined to the caller's working directory (_path_resolve, band_cwd.cyr),
+# -1 when the result exceeds CWD_MAX.
+fn stage_at(pid, child_ptr, namelen, top): i64 { return _stage(pid, child_ptr, namelen, top, 0); }
+fn stage_path(pid, child_ptr, namelen, top): i64 { return _stage(pid, child_ptr, namelen, top, 1); }
+fn _stage(pid, child_ptr, namelen, top, resolve): i64 {
     if (namelen < 1) { return 0 - 1; }                 # 1.12.3: an empty path is -1, as on the kernel
     if (namelen > PATH_MAX) { return 0 - 1; }
     _m2_init();
@@ -66,9 +71,13 @@ fn stage_at(pid, child_ptr, namelen, top): i64 {
     if (n != namelen) { return 0 - 1; }
     if (path_has_nul(_m2_pathbuf, namelen) == 1) { return 0 - 1; }   # 1.12.3: no interior NUL
     store8(_m2_pathbuf + namelen, 0);                  # NUL-terminate for the Linux call
-    var scratch = (top - (namelen + 1)) & (0 - 8);     # 8-align downward
-    var w = pvm_write(pid, scratch, _m2_pathbuf, namelen + 1);
-    if (w != (namelen + 1)) { return 0 - 1; }
+    if (resolve == 1) {
+        n = _path_resolve(_m2_pathbuf, namelen);
+        if (n < 0) { return 0 - 1; }
+    }
+    var scratch = (top - (n + 1)) & (0 - 8);           # 8-align downward
+    var w = pvm_write(pid, scratch, _m2_pathbuf, n + 1);
+    if (w != (n + 1)) { return 0 - 1; }
     return scratch;
 }
 

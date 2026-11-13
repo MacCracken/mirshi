@@ -1,0 +1,101 @@
+# band_cwd.cyr — 1.13.1: the working directory (agnos 1.57.18; included in order by src/intercept.cyr, after
+# src/band_resync.cyr and before src/dispatch.cyr).
+#
+# The kernel keeps each process's cwd as a STRING — a normalized absolute path, not an inode — and every
+# path a syscall takes comes through one ingress (sc_path_take): an absolute path is used verbatim, a
+# relative one is joined to the caller's cwd and cleaned LEXICALLY (path_clean_join: "." vanishes, ".."
+# drops the component before it and never climbs above "/"). mirshi does the same, per child record
+# (C_CWD_LEN + _child_cwd_ptr), and joins at each of its own ingress points — the red-zone staging of the
+# executed path calls (stage_path), the supervisor-side reads (_m2_read_path, readdir's window) and the
+# program path of execwait#37 / spawn_path#43 — so the child's own Linux cwd is never consulted.
+#
+#   chdir#112(path, len)   -> 0 / -1. The cleaned absolute path (a relative one joined to the cwd) must name
+#                             an existing directory — a final symlink to one counts, and the LINK's path is
+#                             stored, as a shell's logical cd keeps it. Under --root it is resolved inside the
+#                             root. -1 changes nothing.
+#   getcwd#113(buf, cap)   -> the cwd's length L (the NUL not counted) / -1. Writes L bytes and a NUL, so cap
+#                             must be at least L + 1; a smaller cap is -1 with nothing written (never cut).
+#
+# The root child starts in mirshi's own working directory (the host's cwd; unconfined, the guest's paths
+# are the host's), or at "/" under --root (the root itself). Spawned children start in their creator's;
+# a #37 / #43 env blob's valid PWD= replaces that (intercept.cyr).
+# ============================================================================
+
+var _cwd_tmp = 0;               # a second path buffer (PATH_MAX + 8), lazy-alloc-once
+
+# Resolve the n-byte path in `buf` (NUL-terminated, at most PATH_MAX bytes) the kernel's way: absolute ->
+# unchanged; relative -> joined to the calling child's (_cur_rec's) cwd, cleaned, written back into buf.
+# Its length, or -1 when the result would exceed CWD_MAX. buf must hold PATH_MAX + 8 bytes.
+fn _path_resolve(buf, n): i64 {
+    if (n < 1) { return n; }
+    if (load8(buf) == 47) { return n; }
+    if (_cwd_tmp == 0) { _cwd_tmp = alloc(PATH_MAX + 8); }
+    var r = path_clean_join(_child_cwd_ptr(_cur_rec), load64(_cur_rec + C_CWD_LEN), buf, n, _cwd_tmp);
+    if (r < 0) { return 0 - 1; }
+    memcpy(buf, _cwd_tmp, r + 1);
+    return r;
+}
+
+# 1 when the cleaned absolute path `p` (NUL-terminated) names an existing directory, following a final
+# symlink (chdir(2) does): Linux stat unconfined; under --root the path is opened inside the root
+# (openat2 O_PATH | O_DIRECTORY, RESOLVE_IN_ROOT), so a link cannot lead the cwd out of it.
+fn _cwd_is_dir(p): i64 {
+    if (_confine_active == 1) {
+        if (_cwd_tmp == 0) { _cwd_tmp = alloc(PATH_MAX + 8); }
+        memcpy(_cwd_tmp, p, strlen(p) + 1);
+        sanitize_rootrel(_cwd_tmp);
+        var fd = _cf_open_in_root(_cwd_tmp, O_DIRECTORY);
+        if (fd < 0) { return 0; }
+        syscall(HOST_CLOSE, fd);
+        return 1;
+    }
+    _m2_init();
+    if (syscall(SYS_STAT, p, _m2_linbuf) != 0) { return 0; }
+    if ((load32(_m2_linbuf + 24) & 0xF000) == 0x4000) { return 1; }
+    return 0;
+}
+
+# chdir#112(path, len) -> 0 / -1.
+fn _do_chdir(pid, regs): i64 {
+    var len = decode_arg(regs, 1);
+    if (len < 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (len > CWD_MAX) { return _net_emu(pid, regs, 0 - 1); }
+    _m2_init();
+    if (pvm_read(pid, decode_arg(regs, 0), _m2_pathbuf, len) != len) { return _net_emu(pid, regs, 0 - 1); }
+    if (path_has_nul(_m2_pathbuf, len) == 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (_cwd_tmp == 0) { _cwd_tmp = alloc(PATH_MAX + 8); }
+    var n = 0;
+    if (load8(_m2_pathbuf) == 47) {
+        n = path_clean_join(0, 0, _m2_pathbuf, len, _cwd_tmp);          # a cwd is always normalized
+    } else {
+        n = path_clean_join(_child_cwd_ptr(_cur_rec), load64(_cur_rec + C_CWD_LEN), _m2_pathbuf, len, _cwd_tmp);
+    }
+    if (n < 1) { return _net_emu(pid, regs, 0 - 1); }
+    memcpy(_m2_pathbuf, _cwd_tmp, n + 1);                               # _cwd_is_dir reuses _cwd_tmp
+    if (_cwd_is_dir(_m2_pathbuf) != 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (_child_cwd_set(_cur_rec, _m2_pathbuf, n) < 0) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, 0);
+}
+
+# getcwd#113(buf, cap) -> the length / -1.
+fn _do_getcwd(pid, regs): i64 {
+    var n = load64(_cur_rec + C_CWD_LEN);
+    var src = "/";
+    if (n == 0) { n = 1; } else { src = _child_cwd_ptr(_cur_rec); }
+    if (decode_arg(regs, 1) < n + 1) { return _net_emu(pid, regs, 0 - 1); }
+    if (pvm_write(pid, decode_arg(regs, 0), src, n + 1) != n + 1) { return _net_emu(pid, regs, 0 - 1); }
+    return _net_emu(pid, regs, n);
+}
+
+# The root child's starting directory: "/" under --root; otherwise mirshi's own (host) working directory,
+# or "/" when that cannot be read or is longer than CWD_MAX.
+fn _cwd_root_init(rec): i64 {
+    store64(rec + C_CWD_LEN, 0);
+    if (_confine_active == 1) { return 0; }
+    _m2_init();
+    var r = syscall(SYS_GETCWD, _m2_pathbuf, CWD_SLOT);
+    if (r < 2) { return 0; }                          # an error, or just "/" (+ NUL)
+    if (load8(_m2_pathbuf) != 47) { return 0; }       # "(unreachable)/..." — not a usable path
+    _child_cwd_set(rec, _m2_pathbuf, r - 1);          # r counts the NUL
+    return 0;
+}

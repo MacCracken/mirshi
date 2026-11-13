@@ -293,6 +293,13 @@ jobs:
         # python3 for the net part; same-uid ptrace requirement.
         run: bash scripts/it/resync.sh
 
+      - name: The process environment (v1.13.1)
+        # v1.13.1 (agnos 1.57.18): chdir#112 / getcwd#113 and every relative path call resolving from the cwd;
+        # the init env (HOME=/ + PWD, or a #43 env blob seeding the child's cwd); children inheriting the
+        # caller's fd table (CLEANFD, redirect sources, spawn#3); exec_redirect#62's per-process set in arm
+        # order; the exec-failure codes; the same cwd rules under --root. Same-uid ptrace requirement.
+        run: bash scripts/it/procenv.sh
+
       - name: M3 docker smoke test
         # The v1 vehicle (M3 acceptance): build the FROM-scratch agnos-mirshi
         # image, `docker run` agnos tools in a plain container (correct output,

@@ -19,8 +19,9 @@ enum MirshiChild {
     MAX_CHILDREN = 16;          # supervisor process cap — re-closes the ADR 0006 storm vector
     # that flipping spawn#3 to EMULATE reopens (deliberately NOT
     # RLIMIT_NPROC: per-uid + container-hostile, see limits.cyr).
-    CHILD_REC_SIZE = 216;       # 23 x i64 fields + a 32-byte name (v1.7.0 grew it by 3: epoll / timerfd /
-    # pipe tables; 1.12.1 by 1: the CM_NOSERIAL cell; 1.13.0 by the name)
+    CHILD_REC_SIZE = 296;       # 23 x i64 fields + a 32-byte name + 10 cells (v1.7.0 grew it by 3: epoll /
+    # timerfd / pipe tables; 1.12.1 by 1: the CM_NOSERIAL cell; 1.13.0 by the
+    # name; 1.13.1 by the cwd length + the exec_redirect#62 set)
     # --- v1.6.0 signalfd#18 constants ---
     SIGFD_BASE = 0x20000000;    # emulated signalfd id = SIGFD_BASE + slot. Bit 29 — deliberately NOT
     # bit 30 (AGNOS_SOCK_TAG = 0x40000000): the agnos userland's sys_read/
@@ -64,6 +65,12 @@ enum MirshiChild {
     # process and a spawned child starts without it. mirshi has no serial
     # mirror, so the bit changes no output — it is only reported back.
     C_NAME = 184;              # 1.13.0: the program's basename (<= 31 bytes + NUL, NUL-padded to 32), for proclist#99
+    C_CWD_LEN = 216;           # 1.13.1: the working directory's length; 0 = "/" (the string is _child_cwd_ptr's)
+    C_REDIR_N = 224;           # 1.13.1: exec_redirect#62 pairs armed for this process's next #37 / #43 child
+    C_REDIR = 232;             # ...REDIR_MAX x {i64 src, i64 dst}, in arm order (64 B)
+    REDIR_MAX = 4;             # the kernel's SPAWN_REDIR_MAX
+    REDIR_OP_ADD = 1;          # #62 a1 = src | op << 8: op 1 adds a pair (or re-points an armed src)
+    REDIR_OP_CLEAR = 2;        # op 2 (a1 exactly 0x200) empties the set
     # --- state values ---
     CS_FREE = 0;               # slot unused
     CS_RUNNING = 1;            # live, being traced
@@ -159,6 +166,84 @@ fn _child_pl_fill(rec, b, caller): i64 {
     var k = 0;
     while (k < 32) { store64(rec + 24 + k, load64(b + C_NAME + k)); k = k + 8; }
     store64(rec + 56, 0);
+    return 0;
+}
+
+# --- 1.13.1: the working directory (the kernel's proc_cwd_*: a normalized absolute path per process, a
+#     STRING, not an inode). One CWD_SLOT string per record slot, in a table allocated once; length 0 is "/"
+#     and never reads the table. ---
+var _child_cwds = 0;
+fn _child_cwd_ptr(rec): i64 {
+    if (_child_cwds == 0) { _child_cwds = alloc(MAX_CHILDREN * CWD_SLOT); }
+    return _child_cwds + ((rec - _child_tbl()) / CHILD_REC_SIZE) * CWD_SLOT;
+}
+
+# Set record `rec`'s cwd to the n bytes at `src` — a normalized absolute path (path_clean_join's output);
+# "/" stores length 0. 0, or -1 for a length outside 1..CWD_MAX (nothing changed). Pure.
+fn _child_cwd_set(rec, src, n): i64 {
+    if (n < 1) { return 0 - 1; }
+    if (n > CWD_MAX) { return 0 - 1; }
+    if (n == 1) { store64(rec + C_CWD_LEN, 0); return 0; }
+    var d = _child_cwd_ptr(rec);
+    memcpy(d, src, n);
+    store8(d + n, 0);
+    store64(rec + C_CWD_LEN, n);
+    return 0;
+}
+
+# A new process starts in its creator's directory (the kernel's proc_cwd_inherit). Pure.
+fn _child_cwd_inherit(child, parent): i64 {
+    var n = load64(parent + C_CWD_LEN);
+    if (n > 0) { memcpy(_child_cwd_ptr(child), _child_cwd_ptr(parent), n + 1); }
+    store64(child + C_CWD_LEN, n);
+    return 0;
+}
+
+# --- 1.13.1: exec_redirect#62's per-process set (the kernel's redir_*: up to REDIR_MAX {src, dst} pairs, in
+#     arm order, consumed — cleared — by every #37 / #43 return). ---
+fn _child_redir_clear(rec): i64 { store64(rec + C_REDIR_N, 0); return 0; }
+fn _child_redir_src(rec, i): i64 { return load64(rec + C_REDIR + i * 16); }
+fn _child_redir_dst(rec, i): i64 { return load64(rec + C_REDIR + i * 16 + 8); }
+fn _child_redir_is_src(rec, fd): i64 {
+    var n = load64(rec + C_REDIR_N);
+    var i = 0;
+    while (i < n) { if (_child_redir_src(rec, i) == fd) { return 1; } i = i + 1; }
+    return 0;
+}
+
+# exec_redirect#62(src | op << 8, dst) -> 0 / -1 over the caller's record (the kernel's arm):
+#   op 0 (a1 in [0, 32)) replaces the set with this one pair;
+#   op 1 (REDIR_ADD | src) adds a pair, or re-points an armed src; -1 when REDIR_MAX are armed;
+#   op 2 (a1 exactly 0x200; dst ignored) empties the set;
+#   anything else, src >= 32, or dst outside [0, 32) is -1 with the set unchanged. Pure.
+fn _child_redir_op(rec, a1, a2): i64 {
+    if (a1 < 0) { return 0 - 1; }
+    var op = a1 >> 8;
+    var src = a1 & 0xFF;
+    if (op == REDIR_OP_CLEAR) {
+        if (src != 0) { return 0 - 1; }
+        return _child_redir_clear(rec);
+    }
+    if (op > REDIR_OP_ADD) { return 0 - 1; }
+    if (src >= 32) { return 0 - 1; }
+    if (a2 < 0) { return 0 - 1; }
+    if (a2 >= 32) { return 0 - 1; }
+    if (op == 0) {
+        store64(rec + C_REDIR, src);
+        store64(rec + C_REDIR + 8, a2);
+        store64(rec + C_REDIR_N, 1);
+        return 0;
+    }
+    var n = load64(rec + C_REDIR_N);
+    var i = 0;
+    while (i < n) {
+        if (_child_redir_src(rec, i) == src) { store64(rec + C_REDIR + i * 16 + 8, a2); return 0; }
+        i = i + 1;
+    }
+    if (n >= REDIR_MAX) { return 0 - 1; }
+    store64(rec + C_REDIR + n * 16, src);
+    store64(rec + C_REDIR + n * 16 + 8, a2);
+    store64(rec + C_REDIR_N, n + 1);
     return 0;
 }
 
@@ -316,6 +401,7 @@ fn _child_tbl(): i64 {
 # table is abandoned to the bump allocator, which never frees — fine for a hermetic test).
 fn _child_reset(): i64 {
     _children = 0;
+    _child_cwds = 0;
     _next_agnos_pid = 1;
     return 0;
 }
@@ -381,6 +467,8 @@ fn _child_alloc(hpid, parent_apid): i64 {
             store64(b + C_CON_NOSER, 0);        # 1.12.1: a new process starts without CM_NOSERIAL
             var nz = 0;
             while (nz < 32) { store64(b + C_NAME + nz, 0); nz = nz + 8; }   # 1.13.0: no name until one is set
+            store64(b + C_CWD_LEN, 0);          # 1.13.1: "/" until the creator's cwd is copied in
+            store64(b + C_REDIR_N, 0);          # 1.13.1: no redirects armed
             return b;
         }
         i = i + 1;

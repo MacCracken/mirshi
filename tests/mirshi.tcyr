@@ -721,7 +721,9 @@ fn main() {
     assert_eq(cm_noser_next(1, CM_NOECHO, 0), 1, "other bits leave it alone");
     # the per-process cell lives in the child record and starts clear in every new process
     assert_eq(C_CON_NOSER + 8, C_NAME, "the name follows C_CON_NOSER (1.13.0)");
-    assert_eq(C_NAME + 32, CHILD_REC_SIZE, "the 32-byte name is the record's last field");
+    assert_eq(C_NAME + 32, C_CWD_LEN, "the cwd length follows the 32-byte name (1.13.1)");
+    assert_eq(C_REDIR_N + 8, C_REDIR, "the redirect pairs follow their count");
+    assert_eq(C_REDIR + REDIR_MAX * 16, CHILD_REC_SIZE, "the redirect pairs are the record's last field");
     _child_reset();
     var cmt = _child_tbl();
     store64(cmt + C_CON_NOSER, 1);                  # a stale cell in a FREE slot
@@ -807,6 +809,118 @@ fn main() {
     store64(pr1 + C_STATE, CS_EXITED);
     assert_eq(_child_yield_ok(pr2, 1), 0, "an exited parent -> refused");
     _child_reset();
+
+    test_group("procenv-1.13.1");
+    # path_clean_join: the kernel's lexical join of a relative path to a cwd
+    var pj = alloc(4200);
+    assert_eq(path_clean_join(0, 0, "a", 1, pj), 2, "\"a\" from / -> /a");
+    assert_streq(pj, "/a", "...the string");
+    assert_eq(path_clean_join("/x/y", 4, "../z", 4, pj), 4, "../z from /x/y -> /x/z");
+    assert_streq(pj, "/x/z", "...the string");
+    assert_eq(path_clean_join("/x", 2, "../../..", 8, pj), 1, ".. never climbs above /");
+    assert_streq(pj, "/", "...the root");
+    assert_eq(path_clean_join("/x", 2, "./a//b/.", 8, pj), 6, ". and empty components vanish");
+    assert_streq(pj, "/x/a/b", "...the string");
+    assert_eq(path_clean_join(0, 0, "/a/../b", 7, pj), 2, "an absolute path with base 0 is just cleaned");
+    assert_streq(pj, "/b", "...the string");
+    assert_eq(path_clean_join(0, 0, "a/b/", 4, pj), 4, "no trailing /");
+    assert_eq(path_clean_join("/a", 2, "", 0, pj), 2, "an empty rel is the base itself");
+    var longb = alloc(4100);
+    store8(longb, 47);
+    var lbi = 1;
+    while (lbi < 4000) { store8(longb + lbi, 97); lbi = lbi + 1; }
+    assert_eq(path_clean_join(longb, 4000, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 100, pj), 0 - 1, "a join past CWD_MAX is refused, never cut");
+    assert_eq(path_clean_join(longb, 4000, "..", 2, pj), 1, "...but .. out of a long base is fine");
+    # env_blob_ok: the kernel's sc_env_blob_ok
+    assert_eq(env_blob_ok("A=1\0B=2\0", 8), 1, "two entries");
+    assert_eq(env_blob_ok("A=1\0B=2", 7), 0, "must end on a NUL");
+    assert_eq(env_blob_ok("A=1\0B\0", 6), 0, "an entry without = is refused");
+    assert_eq(env_blob_ok("=x\0", 3), 0, "= at index 0 (no key) is refused");
+    assert_eq(env_blob_ok("\0", 1), 0, "no entries is refused");
+    assert_eq(env_blob_ok("A=1\0\0B=2\0", 9), 1, "empty entries are skipped");
+    var eb = alloc(80);
+    var ei = 0;
+    while (ei < 17) { store8(eb + ei * 4, 65 + ei); store8(eb + ei * 4 + 1, 61); store8(eb + ei * 4 + 2, 49); store8(eb + ei * 4 + 3, 0); ei = ei + 1; }
+    assert_eq(env_blob_ok(eb, 64), 1, "16 entries are accepted");
+    assert_eq(env_blob_ok(eb, 68), 0, "17 entries are refused");
+    # env_first_pwd: the first PWD= entry only
+    var po = alloc(16);
+    assert_eq(env_first_pwd("X=1\0PWD=/a\0PWD=/b\0", 19, po), 1, "the first PWD= is found");
+    assert_eq(load64(po), 8, "...its value offset");
+    assert_eq(load64(po + 8), 2, "...its value length");
+    assert_eq(env_first_pwd("X=1\0PWDX=/a\0", 12, po), 0, "PWDX= is not PWD=");
+    assert_eq(env_first_pwd("PWD=\0", 5, po), 1, "an empty PWD= is still the first (and invalid)");
+    assert_eq(load64(po + 8), 0, "...of length 0");
+    # env_pwd_fits: the init stack's 3584-byte string region
+    assert_eq(env_pwd_fits(0, 1), 1, "PWD=/ fits with no argv");
+    assert_eq(env_pwd_fits(3570, 1), 1, "the last byte that fits");
+    assert_eq(env_pwd_fits(3571, 1), 0, "one byte more: PWD is omitted, never cut");
+    # spawn_exec_code: a failed exec -> the #43 code
+    assert_eq(spawn_exec_code(0 - 2), SPAWN_E_NOENT, "ENOENT -> -4");
+    assert_eq(spawn_exec_code(0 - 13), SPAWN_E_NOENT, "EACCES (not executable / not a file) -> -4");
+    assert_eq(spawn_exec_code(0 - 20), SPAWN_E_NOENT, "ENOTDIR -> -4");
+    assert_eq(spawn_exec_code(0 - 8), SPAWN_E_NOEXEC, "ENOEXEC -> -5");
+    assert_eq(spawn_exec_code(0 - 22), SPAWN_E_NOEXEC, "EINVAL -> -5");
+    assert_eq(spawn_exec_code(0 - 12), SPAWN_E_NOMEM, "ENOMEM -> -3");
+    # the per-process cwd
+    _child_reset();
+    var cw1 = _child_alloc(6001, 0);
+    var cw2 = _child_alloc(6002, 1);
+    assert_eq(load64(cw1 + C_CWD_LEN), 0, "a new process is at /");
+    assert_eq(_child_cwd_set(cw1, "/a/b", 4), 0, "set /a/b");
+    assert_eq(load64(cw1 + C_CWD_LEN), 4, "...length 4");
+    assert_streq(_child_cwd_ptr(cw1), "/a/b", "...the string");
+    assert_eq(_child_cwd_set(cw1, "/", 1), 0, "set /");
+    assert_eq(load64(cw1 + C_CWD_LEN), 0, "/ is stored as length 0");
+    _child_cwd_set(cw1, "/srv", 4);
+    _child_cwd_inherit(cw2, cw1);
+    assert_streq(_child_cwd_ptr(cw2), "/srv", "a child inherits its creator's cwd");
+    _child_cwd_set(cw2, "/tmp/x", 6);
+    assert_streq(_child_cwd_ptr(cw1), "/srv", "...in its own slot");
+    assert_eq(_child_cwd_set(cw1, "/a", 0), 0 - 1, "length 0 is refused");
+    assert_eq(_child_cwd_set(cw1, "/a", 4096), 0 - 1, "a length past CWD_MAX is refused");
+    assert_eq(load64(cw1 + C_CWD_LEN), 4, "...and nothing changed");
+    # exec_redirect#62's per-process set
+    assert_eq(_child_redir_op(cw1, 1, 5), 0, "op 0: (1 <- 5)");
+    assert_eq(load64(cw1 + C_REDIR_N), 1, "...one pair");
+    assert_eq(_child_redir_op(cw1, 0x100 | 2, 1), 0, "REDIR_ADD: (2 <- 1)");
+    assert_eq(load64(cw1 + C_REDIR_N), 2, "...two pairs");
+    assert_eq(_child_redir_src(cw1, 1), 2, "...in arm order");
+    assert_eq(_child_redir_op(cw1, 0x100 | 1, 7), 0, "ADD of an armed src re-points it");
+    assert_eq(load64(cw1 + C_REDIR_N), 2, "...still two pairs");
+    assert_eq(_child_redir_dst(cw1, 0), 7, "...its dst replaced in place");
+    assert_eq(_child_redir_is_src(cw1, 2), 1, "fd 2 is a redirect source");
+    assert_eq(_child_redir_is_src(cw1, 3), 0, "fd 3 is not");
+    _child_redir_op(cw1, 0x100 | 3, 1);
+    _child_redir_op(cw1, 0x100 | 4, 1);
+    assert_eq(_child_redir_op(cw1, 0x100 | 5, 1), 0 - 1, "a fifth pair is refused (max 4)");
+    assert_eq(load64(cw1 + C_REDIR_N), 4, "...the set unchanged");
+    assert_eq(_child_redir_op(cw1, 0x201, 0), 0 - 1, "CLEAR must be exactly 0x200");
+    assert_eq(_child_redir_op(cw1, 0x300, 0), 0 - 1, "an unknown op is refused");
+    assert_eq(_child_redir_op(cw1, 32, 1), 0 - 1, "src >= 32 is refused");
+    assert_eq(_child_redir_op(cw1, 1, 32), 0 - 1, "dst >= 32 is refused");
+    assert_eq(_child_redir_op(cw1, 1, 0 - 1), 0 - 1, "dst < 0 is refused");
+    assert_eq(_child_redir_op(cw1, 0 - 1, 1), 0 - 1, "a1 < 0 is refused");
+    assert_eq(load64(cw1 + C_REDIR_N), 4, "...none of them touched the set");
+    assert_eq(_child_redir_op(cw1, 0x200, 99), 0, "CLEAR (dst ignored)");
+    assert_eq(load64(cw1 + C_REDIR_N), 0, "...empties the set");
+    _child_redir_op(cw1, 1, 5);
+    _child_redir_op(cw1, 0, 6);
+    assert_eq(load64(cw1 + C_REDIR_N), 1, "op 0 replaces the whole set");
+    assert_eq(_child_redir_src(cw1, 0), 0, "...with its one pair");
+    _child_free(cw1);
+    var cw3 = _child_alloc(6003, 0);
+    assert_eq(load64(cw3 + C_CWD_LEN), 0, "a reused slot starts at /");
+    assert_eq(load64(cw3 + C_REDIR_N), 0, "...with no redirects armed");
+    _child_reset();
+    assert_streq(agnos_nr_name(112), "chdir", "nr 112 = chdir (NOT Linux setsid)");
+    assert_streq(agnos_nr_name(113), "getcwd", "nr 113 = getcwd (NOT Linux setreuid)");
+    assert_eq(agnos_argc(112), 2, "chdir arity 2");
+    assert_eq(agnos_argc(113), 2, "getcwd arity 2");
+    assert_eq(agnos_ptrmask(112), 1, "chdir path is arg0");
+    assert_eq(agnos_ptrmask(113), 1, "getcwd buf is arg0");
+    assert_eq(agnos_to_linux_nr(112), 0 - 1, "chdir#112 -> no peer (EMULATE; Linux #112 is setsid)");
+    assert_eq(agnos_to_linux_nr(113), 0 - 1, "getcwd#113 -> no peer (EMULATE; Linux #113 is setreuid)");
 
     test_group("send-dl");
     assert_eq(SEND_DL_D6_US, 8000000, "the D6 window is the kernel's TCP_PROGRESS_US (8 s)");

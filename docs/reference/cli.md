@@ -15,9 +15,14 @@ mirshi [--selftest-trace] [--no-seccomp] [--root <dir>] [--net | --net-allow <ci
 
 Runs `<agnos-elf>` (an agnos-target static ELF) as a native Linux process by trapping +
 translating its agnos-ABI syscalls — no QEMU, shared host kernel. **Flags must precede
-`<agnos-elf>`**; parsing stops at the first non-flag argument (which is the target). Any
-arguments after the target are ignored (the agnos child is run with a fixed `argv` —
-mirshi does not forward a child argv in v1).
+`<agnos-elf>`**; parsing stops at the first non-flag argument (which is the target). The
+arguments after the target are the agnos program's own: its `argv` is `[<agnos-elf>, args…]`
+(v1.10.0).
+
+The program starts in mirshi's working directory — at `/`, the root itself, under `--root` — with the
+agnos kernel's default environment, `HOME=/` and `PWD=<that directory>` (v1.13.1). mirshi's own
+environment is never passed on. A relative path the program uses resolves from its working directory,
+which `chdir#112` changes.
 
 ## Flags
 

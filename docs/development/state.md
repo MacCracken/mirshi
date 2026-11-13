@@ -5,6 +5,17 @@
 
 ## Version
 
+**1.13.1** — 2026-11-12. **The process environment** (agnos 1.57.18,
+[ADR 0020](../adr/0020-process-environment-lexical-cwd-init-env-inherited-fds.md)):
+- **The working directory:** `chdir#112` / `getcwd#113`, a per-process string; every relative path is joined to
+  it and cleaned lexically (the kernel's `path_clean_join`). The root child starts in mirshi's directory (`/`
+  under `--root`).
+- **The init env:** `HOME=/` + `PWD=<cwd>`, or a #37 / #43 env blob, whose `PWD=` seeds the child's cwd.
+- **What a child is born with:** its creator's fds 0..31 (spawn#3 too), the creator's `exec_redirect#62` set
+  (the kernel's per-process pairs, consumed by every #37 / #43 return), `CLEANFD`; a failed exec is #43's -4 /
+  -5 (#37 / #3: -1) through a status pipe.
+
+`cyrius test` 616/0; 33 `scripts/it/*` gates (new: `procenv.sh`) and `docker/smoke.sh` green.
 **1.13.0** — 2026-11-12. **The agnos ABI re-sync, the cheap band** ([ADR 0019](../adr/0019-abi-resync-cheap-band-supervisor-side.md)):
 thirteen numbers that fell to ENOSYS now answer as the kernel at agnos `aef48206` (1.57.19) does.
 - **Filesystem:** `readdir#81` / `readdir_at#101` (supervisor-side `getdents64` into the kernel's 64-byte
@@ -239,7 +250,10 @@ trap-log mode.
   - `src/band_kbscan.cyr`, `src/band_fdkind.cyr`, `src/band_console.cyr`;
   - `src/band_resync.cyr` (1.13.0): klug, sched_yield / sched_yield_to, readdir / readdir_at, proclist,
     statfs, mountlist, spawn_limits, fsync (`lstat` sits with `stat` in `band_fs.cyr`, `icmp_echo_ex` /
-    `sock_peer` in `band_net.cyr`).
+    `sock_peer` in `band_net.cyr`);
+  - `src/band_cwd.cyr` (1.13.1): the working directory — `_path_resolve` (every relative path's join),
+    chdir#112, getcwd#113, the root child's starting directory. The spawn-side environment (init env, fd
+    inheritance, redirects, the exec-status pipe) is in `src/intercept.cyr`.
 - `src/seccomp.cyr` — M3 bounding seccomp: a classic-BPF allowlist of the
   translation's output syscalls, installed on the child (default-on in run mode).
 - `src/limits.cyr` — 0.6.0 host-resource bounds: kernel-enforced child rlimits
@@ -314,7 +328,8 @@ paths in the child red zone + repack output structs at the exit stop
   the multi-process record table / storm bound / ELF-size bounds (1.5.0) + the pure signal mask helpers
   (`signal-mask`, 1.6.0) + the I/O-mux tag ladder / `_emu_classify` / `_timer_ticks` (`iomux-tags`, 1.7.0);
   the 1.13.0 re-sync helpers (`resync-1.13.0`: `rd_name_keep`, `icmp_ex_timeout_ms`, the process name, the
-  proclist record, the yield authority); **533 assertions**, hermetic)
+  proclist record, the yield authority) + the 1.13.1 process environment (`procenv-1.13.1`: `path_clean_join`,
+  the env-blob rules, the exec-failure codes, the cwd slots, the redirect set); **616 assertions**, hermetic)
 - `scripts/it/m0_trap.sh` — M0 integration test: the real fork+ptrace trap path over
   `tests/fixtures/hi.cyr` vs the golden `tests/fixtures/hi.expected.log`.
 - `scripts/it/m1_run.sh` — M1 integration test: agnos `hello`/`cat`/`exit42`/`heapuser`
@@ -417,6 +432,12 @@ paths in the child red zone + repack output structs at the exit stop
   - Under `--root`: `..`, an absolute symlink and an escape link clamped for the listings, `lstat` / `stat`
     and `statfs`.
   - Under `--net`: `sock_peer`, and `icmp_echo_ex` (SKIPs without unprivileged ICMP).
+- `scripts/it/procenv.sh` — 1.13.1 process-environment gate (after resync):
+  - The root child's cwd and env; `chdir` / `getcwd`; every relative path call from the cwd.
+  - spawn_path#43's env and cwd rules; the exec-failure codes (-4 / -5 / -6, -1 from #37 and #3).
+  - The inherited fd table (CLEANFD, a redirect source, spawn#3); the redirect set in arm order, consumed by
+    every #43 return.
+  - The same cwd rules under `--root`.
 - `tests/mirshi.bcyr` — benchmark stub (no-op)
 - `tests/mirshi.fcyr` — fuzz stub
 

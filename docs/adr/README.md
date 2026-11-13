@@ -38,3 +38,4 @@ Decisions about mirshi — what we chose, the context, and the consequences we a
 - [0017 — winsize supervisor-emulated from TIOCGWINSZ (the whole direction-1 graphics surface)](0017-winsize-emulated-tiocgwinsz.md) — *Accepted*
 - [0018 — The agnos 1.57.13 band: fd_kind, console_mode and sock_send_dl, supervisor-emulated](0018-agnos-1-57-13-band-fd-kind-console-mode-send-dl.md) — *Accepted*
 - [0019 — The 1.13.0 re-sync band: supervisor-side listings, an opaque readdir cursor, synthesized tables](0019-abi-resync-cheap-band-supervisor-side.md) — *Accepted*
+- [0020 — The process environment: a lexical cwd per process, the kernel's init env, inherited fd tables, an exec-status pipe](0020-process-environment-lexical-cwd-init-env-inherited-fds.md) — *Accepted*

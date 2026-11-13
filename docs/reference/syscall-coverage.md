@@ -33,7 +33,7 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 0 | exit | EXIT | `exit_group` (231) | code in a1; terminates, no exit stop |
 | 1 | write | EXECUTE | `write` (1) | `(fd,buf,len)` identical; err→`-1` |
 | 2 | getpid | EMULATE ³ | — | multi-process (v1.5.0): returns the caller's **coined agnos pid** (root=1), not host `getpid`(39) — else children would see clashing host pids; loop-supplied `_cur_rec` |
-| 3 | spawn | EMULATE ³ | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` |
+| 3 | spawn | EMULATE ³ ¹⁰ | — | multi-process (v1.5.0): supervisor forks a **traced** grandchild from the in-memory ELF (memfd + `execveat`), returns a coined agnos pid; handled at the loop level, not `agnos_to_linux_nr` **v1.13.1:** the child inherits the caller's fds 0..31 and cwd (no env, as on the kernel); an image Linux will not run → −1 |
 | 4 | waitpid | EMULATE ³ | — | multi-process (v1.5.0): blocks on the target agnos pid (parks the caller stopped — not the supervisor — until it exits), returns its exit code directly; loop-level, not `agnos_to_linux_nr` |
 | 5 | read | EXECUTE | `read` (0) | number differs; EOF `0` passes |
 | 6 | close | EXECUTE | `close` (3) | **v1.12.3:** fd < 0 or ≥ 32 → −1 (the kernel's table); a free fd < 32 → 0, not EBADF; a closed emulated fd → 0. |
@@ -67,12 +67,12 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 34 | uname | EMULATE ⁶ | — | info getters (v1.8.0): synthesized agnos-native 64 B struct (4×16 = sysname=AGNOS/nodename=agnos/release=mirshi/machine=x86_64); `len<64`→−1 |
 | 35 | sysinfo | EMULATE ⁶ | — | info getters (v1.8.0): agnos-native 40 B struct (5×u64 = uptime/totalram/freeram/procs/cpus) from live host values; `len<40`→−1. **v1.11.3:** the kernel's length tiers — writes exactly 40 / 104 (+per-core user/kernel ticks at +40, host `/proc/stat`) / 200 (+BLK-tag sectors at +104, zero) / 208 (+`sched_kicks` at +200, zero) bytes |
 | 36 | klug | EMULATE ⁹ | — | **v1.13.0:** 0 bytes — mirshi keeps no agnos kernel log, and the host's (dmesg) is never read; `len` < 0 → −1. ⚠ Linux #36 is `getitimer` |
-| 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path |
+| 37 | execwait | EMULATE | — | **exec band (v1.10.0):** load a static ELF from a PATH + run to completion, return its exit code (agnsh's `run`). Loop-level: fork a traced grandchild that execve's the path token via `_child_exec` (the top-level program's path), then park the caller on the coined pid until it exits — the `spawn#3` + `waitpid#4` fusion. cmdline `"PATH args.."` space-tokenized, argv[0]=path **v1.13.1:** a relative path from the caller's cwd; the env blob in a3/a4 (or HOME=/ + PWD); the caller's fd table + redirects; every failure → −1 |
 | 38–39 | fbinfo / blit | ENOSYS | — | the framebuffer pair, left out of the 1.13 re-sync on purpose: a hardware band, so permanent ENOSYS or a headless emulation is an open decision ([roadmap](../development/roadmap.md) 1.x). `winsize#60` is the graphics surface mirshi answers |
 | 40 | uptime_ms | EMULATE | — | `CLOCK_MONOTONIC` in the supervisor → ms |
 | 41 | sleep_ms | EMULATE | — | `nanosleep` in the supervisor; 0 → 0, **negative → −1** (v1.12.3, the kernel); cap 1 h |
 | 42 | kbscan | EMULATE | — | **v1.11.0:** the raw Set-1 scancode drain, synthesized from mirshi's stdin (the tty armed raw + non-blocking on the first call; a pipe works too) — cyim's per-key channel |
-| 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) **v1.12.3:** `a2 = len | flags` decoded — `SPAWN_F_ARGV` (bit 16, a NUL-separated argv blob, 2..1024 B, 1..16 entries) and `SPAWN_F_CLEANFD` (bit 17); −2 table full, −6 bad arguments or more than 16 tokens; under `--root` the path resolves inside the root. |
+| 43 | spawn_path | EMULATE | — | **exec band (v1.10.1):** NON-blocking from-disk spawn — fork a traced grandchild that execve's the path (the `_spawn_from_path` core, shared with execwait#37), inject the coined agnos pid NOW; the caller reaps it via `waitpid#4`. The cyrius stdlib `exec_*` path (`_agnos_spawn_path` + `sys_waitpid`) **v1.12.3:** `a2 = len | flags` decoded — `SPAWN_F_ARGV` (bit 16, a NUL-separated argv blob, 2..1024 B, 1..16 entries) and `SPAWN_F_CLEANFD` (bit 17); −2 table full, −6 bad arguments or more than 16 tokens; under `--root` the path resolves inside the root. **v1.13.1** (footnote ¹⁰): a relative path from the caller's cwd (≤ 255 bytes resolved, else −6); the env blob in a3/a4 replaces HOME=/ + PWD=<cwd> (a bad one: the default, or −6 when flagged), its PWD= seeds the child's cwd; the caller's fd table, its redirects, `CLEANFD`; −4 / −5 when the exec fails. |
 | 44 | sched_yield | EMULATE ⁹ | — | **v1.13.0:** 0 (the ptrace stop is already a scheduling point). ⚠ Linux #44 is `sendto` |
 | 45 | getrandom | EXECUTE | `getrandom` (318) | `(buf,len,flags)` identical; number differs **v1.12.3:** a length ≤ 0 → 0 and the flags are ignored, as on the kernel (EMULATE for that case). |
 | 46 | time_unix | EXECUTE | `time` (201) | a1 forced NULL (seconds in rax); fail→`0` |
@@ -91,8 +91,8 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 59 | flock | EXECUTE ⁶ | `flock` (73) | advisory locks (v1.8.0): execute-in-child, op codes identical (SH/EX/UN/+NB); the sole child-bound delta. **v1.12.2:** an fd that is not a file or a directory, or outside [0, 32), is −1 before the EXECUTE, as on the kernel |
 | 60 | winsize | EMULATE ⁷ | — | tty sizing (v1.9.0): `(cols<<16)\|rows` from the controlling terminal's `TIOCGWINSZ` (80×24 default if no tty); the whole direction-1 graphics surface |
 | 61 | net_config | EMULATE ² | — | net band (v1.3.0): reads the real netns gateway/DNS/host-IP (field 1 netmask 0-unset) **v1.12.3:** fields 4..11 (the kernel's counters) → 0. |
-| 62 | exec_redirect | EMULATE | — | **exec band (v1.10.2):** one-shot ARM — the next from-path exec (execwait#37 / spawn_path#43) routes the child's src_fd (e.g. 1=stdout) to the CALLER's dst_fd. Consumed in `_spawn_from_path`: **steal dst_fd from the caller via `pidfd_getfd`** (files AND pipes) + `dup3` onto src_fd in the grandchild. No restore — mirshi's child is a separate process |
-| 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path) |
+| 62 | exec_redirect | EMULATE ¹⁰ | — | **exec band (v1.10.2):** an ARM for the next from-path exec (execwait#37 / spawn_path#43): the child's src fd becomes a copy of its dst fd. **v1.13.1:** the kernel's per-process set — op 0 replaces it with one pair, `REDIR_ADD` (0x100 \| src) adds or re-points one (max 4), `REDIR_CLEAR` (0x200) empties it; src/dst outside [0, 32), or any other op → −1. Pairs apply in arm order against the inherited table (`2>&1`); every #37 / #43 return clears the set; spawn#3 consumes none |
+| 63 | symlink | EXECUTE | `symlink` (88) | **exec band (v1.10.2):** two paths staged; target is a **literal string**, linkpath a real path (same `(path,len,path,len)` shape as `link#32`). `--root` deferred (a raw target isn't a confinable path). **v1.13.1:** a relative linkpath resolves from the cwd; the target is never rewritten |
 
 | 81 | readdir | EMULATE ⁹ ¹ | — | **v1.13.0:** `(path, buf, max)` → records. The path is a NUL-terminated string in a 256-byte window (all of it readable and a NUL inside, else −1); then `max` ≤ 0 → 0, > 16777216 → −1; not found (the empty path included) → −2, not a directory → −4. 64-byte records: the name (≤ 62 bytes, cut on a UTF-8 boundary) + NUL, zero-filled, byte 63 = `RD_DIR` 1 \| `RD_CUT` 2; `.`/`..` skipped; always from the top. The supervisor opens and walks the directory (`getdents64`; a `DT_UNKNOWN` entry is asked with `newfstatat` no-follow). ⚠ Linux #81 is `fchdir` |
 | 95 | uptime_us | EMULATE | — | **v1.11.3:** `CLOCK_MONOTONIC` in the supervisor → µs, the same epoch as `uptime_ms#40` (never −1: the host clock always works). ⚠ Linux #95 is `umask` — the skip keeps it from running in the child |
@@ -108,9 +108,11 @@ time_unix#46 use `0`); the exit stop maps Linux `-errno` accordingly
 | 109 | sock_send_dl | EMULATE ² ⁸ | — | **v1.12.1 (agnos 1.57.13):** `sock_send#48` with a caller ceiling. Conn checked first (−1 even for len ≤ 0), len ≤ 0 → 0; `timeout_us` 0 = exactly #48, < 0 = one non-blocking attempt, > 0 = wait ≤ min(ceiling, 8 s) for space; an expired wait → **0** (committed count), not −1. ⚠ Linux #109 is `setpgid` |
 | 110 | console_mode | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** `(set, clear)` → the console's previous flags / −1. `CM_NOECHO` hides echo on the host tty and **dies with its holder**, `CM_FLUSH` = `tcflush(TCIFLUSH)`, `CM_NOSERIAL` per process (reported only). Unknown bits → −1 with nothing changed. ⚠ Linux #110 is `getppid` |
 | 111 | fd_kind | EMULATE ⁸ | — | **v1.12.1 (agnos 1.57.13):** fd → `FdKind` (1 CONSOLE … 10 DEVICE) / −1. Emulated event fds by slot; a real fd via `pidfd_getfd` + `fstat` + `TCGETS` in the supervisor; fd < 0, ≥ 32 or closed → −1. ⚠ Linux #111 is `getpgrp` |
+| 112 | chdir | EMULATE ¹⁰ | — | **v1.13.1 (agnos 1.57.18):** `(path, len)` → 0 / −1. The cleaned absolute path (a relative one joined to the cwd, lexically) must name a directory; a final symlink counts and its own path is stored. len < 1 or > 4095, an interior NUL, a missing path or a file → −1, the cwd unchanged. Under `--root`, resolved inside the root. ⚠ Linux #112 is `setsid` |
+| 113 | getcwd | EMULATE ¹⁰ | — | **v1.13.1 (agnos 1.57.18):** `(buf, cap)` → the cwd's length L / −1; writes L bytes + NUL, so cap < L + 1 → −1 with nothing written. ⚠ Linux #113 is `setreuid` |
 | 115 | fsync | EXECUTE ⁹ | `fsync` (74) | **v1.13.0:** fd < 0 or ≥ 32 → −1 without a call; otherwise Linux `fsync` on the child's fd, its errors → −1 (a pipe or a terminal is EINVAL there, as the kernel refuses what is not a file or a directory). ⚠ Linux #115 is `getgroups` |
 
-**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3), the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸), and the 1.13.0 re-sync band `#81` / `#99`–`#104` / `#106`–`#108` / `#115` (footnote ⁹). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
+**#62 exec_redirect + #63 symlink are handled** (the exec-band re-sync, v1.10.x), as are `uptime_us#95` (v1.11.3), the agnos 1.57.13 band `sock_send_dl#109` / `console_mode#110` / `fd_kind#111` (v1.12.1 — footnote ⁸), the 1.13.0 re-sync band `#81` / `#99`–`#104` / `#106`–`#108` / `#115` (footnote ⁹), and the 1.13.1 working directory `chdir#112` / `getcwd#113` (footnote ¹⁰). Any other number > 63 (and the undefined 0–61 gaps) → **ENOSYS**.
 
 ¹ **Under `--root`** ([ADR 0009](../adr/0009-rootfs-confinement-openat2-in-child.md), amended v1.12.3):
 `open#7` runs in the child as `openat2(ROOTFD, path, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`. Since v1.12.3
@@ -120,7 +122,8 @@ its parent directory with the same `openat2` flags on a supervisor-held root fd,
 `lstat#102` the same with `O_NOFOLLOW`, so a final symlink is described, not followed). `..`
 clamps at the root, as on the kernel. The v1.13.0 supervisor-side path calls resolve the same way:
 `readdir#81` / `readdir_at#101` open the directory with `openat2(O_DIRECTORY, RESOLVE_IN_ROOT |
-RESOLVE_NO_MAGICLINKS)`, and `statfs#103` `fstatfs`es the path opened inside the root. The fd-based ops (`read`/`write`/`lseek`/`close`/`getdents`) ride
+RESOLVE_NO_MAGICLINKS)`, and `statfs#103` `fstatfs`es the path opened inside the root. Since v1.13.1 a
+relative path is first joined to the caller's cwd, a root-relative string (footnote ¹⁰). The fd-based ops (`read`/`write`/`lseek`/`close`/`getdents`) ride
 fds from a confined `open`, and the child holds no other fd: it starts with 0–2 and ROOTFD only. Without
 `--root`, the peers in the table above apply (transparent pass-through).
 
@@ -262,6 +265,24 @@ supervisor or renumbered — never passed through. The handlers are in `src/band
   "this kernel cannot cap a child".
 - **`sched_yield#44` / `sched_yield_to#108`** do not yield the host CPU: the child is already stopped in ptrace.
   `#108`'s authority is the kernel's: self, a live direct child, or the live direct parent.
+
+¹⁰ **The process environment (v1.13.1, agnos 1.57.18).** [ADR 0020](../adr/0020-process-environment-lexical-cwd-init-env-inherited-fds.md).
+- **The working directory** is a per-process string. Every path argument mirshi takes — the staged
+  executed calls, the supervisor-side ones (`readdir`, `statfs`, the confined `_cf_*` ops) and the program
+  path of `#37` / `#43` — is used verbatim when absolute, and joined to the caller's cwd and cleaned
+  **lexically** when relative (the kernel's `path_clean_join`: `..` drops the previous component and never
+  climbs above `/`; a result over 4095 bytes → −1). `symlink#63`'s target is text and is never rewritten.
+  The root child starts in mirshi's own working directory (at `/` under `--root`); a spawned child starts
+  in its creator's, or (#37 / #43) at a valid `PWD=` from its env blob.
+- **The init env:** the root child and a #37 / #43 child without a usable blob get the kernel loader's
+  default, `HOME=/` and `PWD=<the creator's cwd>` (PWD omitted when it would not fit the init stack's
+  3584-byte string region). A blob in a3 / a4 (1..1024 bytes ending in a NUL, 1..16 `KEY=V` entries)
+  replaces it; spawn#3 gets none. mirshi's own environment is never passed on.
+- **Fds:** a child (spawn#3, #37, #43) inherits its creator's fds 0..31, then the creator's redirect
+  pairs apply in arm order and `SPAWN_F_CLEANFD` closes 3..31 except the redirect sources. mirshi's
+  emulated signalfd / timerfd / epoll ids are not fds and are not inherited.
+- **Exec failures** come back through a status pipe: `#43` answers −4 (missing, unreadable, not
+  executable — Linux's exec permission applies) or −5 (not an image Linux will load), `#37` and `#3` −1.
 
 ## The runnable surface (v1)
 

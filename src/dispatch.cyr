@@ -58,6 +58,10 @@ fn translate_dispatch(pid, regs): i64 {
     if (nr == 107) { return _net_emu(pid, regs, 0 - 1); }      # spawn_limits -> -1 (not supported yet: 1.13.2)
     if (nr == 115) { return _do_fsync(pid, regs); }            # fsync -> Linux fsync (74) in the child / -1
 
+    # 1.13.1 — the working directory (src/band_cwd.cyr). ⚠ Linux #112 / #113 are setsid / setreuid.
+    if (nr == 112) { return _do_chdir(pid, regs); }            # chdir -> 0 / -1
+    if (nr == 113) { return _do_getcwd(pid, regs); }           # getcwd -> length / -1
+
     # uptime_ms#40 -> supervisor-emulate. The monotonic clock is shared across the
     # host kernel, so read it in the supervisor (no child buffer needed), convert
     # to ms, skip the kernel syscall, stash the result. No fault surface.
@@ -140,7 +144,7 @@ fn translate_dispatch(pid, regs): i64 {
         var cmode = ao_create_mode(aflags);            # 1.12.3: AO_MODE's bits 32..63
         if (cmode == (0 - 2)) { return _net_emu(pid, regs, 0 - 1); }   # a mode above 07777: refused, nothing created
         if (cmode < 0) { cmode = open_create_mode(); }
-        var sc7 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+        var sc7 = stage_path(pid, decode_arg(regs, 0), decode_arg(regs, 1),
           load64(regs + REG_RSP) - RED_ZONE);
         if (sc7 < 0) { return _m2_fail(pid, regs); }
         if (_confine_active == 1) {
@@ -189,7 +193,7 @@ fn translate_dispatch(pid, regs): i64 {
 
     if (nr == 9) {
         # mkdir(path,pathlen) -> Linux mkdir(path, mode 0777).
-        var sc9 = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+        var sc9 = stage_path(pid, decode_arg(regs, 0), decode_arg(regs, 1),
           load64(regs + REG_RSP) - RED_ZONE);
         if (sc9 < 0) { return _m2_fail(pid, regs); }
         store64(regs + REG_RDI, sc9);
@@ -215,7 +219,7 @@ fn translate_dispatch(pid, regs): i64 {
         # matching agnos readlink#70's -1-on-any-error contract. readlink is inherently
         # no-follow on the final component, so it mirrors agnos #70 with no extra flag.
         # (The --root confined variant, _cf_readlink -> readlinkat#267, is handled above.)
-        var srl = stage_at(pid, decode_arg(regs, 0), decode_arg(regs, 1),
+        var srl = stage_path(pid, decode_arg(regs, 0), decode_arg(regs, 1),
           load64(regs + REG_RSP) - RED_ZONE);
         if (srl < 0) { return _m2_fail(pid, regs); }
         store64(regs + REG_RDI, srl);                   # path (NUL-terminated scratch)

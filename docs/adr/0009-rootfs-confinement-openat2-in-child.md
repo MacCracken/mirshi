@@ -1,6 +1,6 @@
 # 0009 — Rootfs confinement via openat2 RESOLVE_IN_ROOT in the child
 
-**Status**: Accepted; **amended v1.12.3** (see *Amendment* below)
+**Status**: Accepted; **amended v1.12.3** and **v1.13.1** (see the *Amendments* below)
 **Date**: 2026-06-30
 
 ## Context
@@ -137,3 +137,14 @@ The P(-1) sweep ([2026-11-12 audit](../audit/2026-11-12-audit.md)) changed three
   size, so ROOTFD cannot be closed, and `dup#8` is the kernel's identity.
 - **`execwait#37` / `spawn_path#43` resolve their path inside the root** (`openat2(ROOTFD, …,
   RESOLVE_IN_ROOT)` + `execveat`). The operator's own target on the command line is still a host path.
+
+## Amendment (v1.13.1)
+
+[ADR 0020](0020-process-environment-lexical-cwd-init-env-inherited-fds.md) gives each process a working
+directory and its creator's fd table.
+- **A spawned child inherits its creator's fds 0..31** (`pidfd_getfd`, before the fork), as on the kernel.
+  The root child still starts with 0–2 and ROOTFD. The premise now reads: every fd a child holds came from
+  a confined open by it or by its creator, or is ROOTFD. The supervisor's own fds never reach a child.
+- **A relative path is joined to the caller's cwd before it is resolved in the root.** The cwd is a
+  root-relative string that `chdir#112` only accepts after resolving it inside the root, so a link cannot
+  lead it out.

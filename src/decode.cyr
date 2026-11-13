@@ -134,6 +134,8 @@ fn agnos_nr_name(nr): cstring {
     if (nr == 109) { return "sock_send_dl"; }
     if (nr == 110) { return "console_mode"; }
     if (nr == 111) { return "fd_kind"; }
+    if (nr == 112) { return "chdir"; }
+    if (nr == 113) { return "getcwd"; }
     if (nr == 115) { return "fsync"; }
     return "unknown";
 }
@@ -213,6 +215,8 @@ fn agnos_argc(nr): i64 {
     if (nr == 109) { return 4; }  # sock_send_dl(conn_id, buf, len, timeout_us)  -- a4=r10
     if (nr == 110) { return 2; }  # console_mode(set, clear)
     if (nr == 111) { return 1; }  # fd_kind(fd)
+    if (nr == 112) { return 2; }  # chdir(path, pathlen)
+    if (nr == 113) { return 2; }  # getcwd(buf, cap)
     if (nr == 115) { return 1; }  # fsync(fd)
     return 0;
 }
@@ -255,6 +259,8 @@ fn agnos_ptrmask(nr): i64 {
     if (nr == 103) { return 5; }  # statfs: path (arg0) + buf (arg2)
     if (nr == 104) { return 1; }  # mountlist: buf (arg0)
     if (nr == 109) { return 2; }  # sock_send_dl: buf (arg1)
+    if (nr == 112) { return 1; }  # chdir: path (arg0)
+    if (nr == 113) { return 1; }  # getcwd: buf (arg0)
     return 0;
 }
 
